@@ -1,0 +1,33 @@
+name: Build IntelBTUnified AX201
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main, ax201]
+
+jobs:
+  build:
+    runs-on: macos-15-intel
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Build (AX201 firmware only)
+        run: |
+          make deps
+          make clean
+          make FW="ibt-17-* ibt-18-*"
+
+      - name: Package
+        run: |
+          cd build
+          ls -la IntelBTUnified.kext/Contents
+          file IntelBTUnified.kext/Contents/MacOS/IntelBTUnified
+          zip -qry IntelBTUnified-1.1.0-AX201.zip IntelBTUnified.kext
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: IntelBTUnified-AX201
+          path: build/IntelBTUnified-1.1.0-AX201.zip
+          if-no-files-found: error
