@@ -272,6 +272,7 @@ downloadFirmware(IntelVersionTLV *ver, uint32_t *bootParams)
     
     fwData = requestFirmwareData(fwname, true);
     if (!fwData) {
+        XYLog("Firmware file %s unavailable (firmwareMode=%d)\n", fwname, firmwareMode ? 1 : 0);
         if (firmwareMode) {
             /* Firmware has already been loaded */
             return true;

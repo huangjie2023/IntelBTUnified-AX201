@@ -12,9 +12,13 @@ requestFirmwareData(const char *fwName, bool noWarn)
 {
     const FwDesc *desc = findFwByName(fwName);
     if (!desc) {
-        if (!noWarn)
-            XYLog("Firmware: %s Not found!\n", fwName);
-        return NULL;
+        desc = findFwBestMatch(fwName);
+        if (desc) {
+            XYLog("Firmware: %s not found, using fallback %s\n", fwName, desc->name);
+        } else {
+            XYLog("Firmware: %s NOT PRESENT in kext\n", fwName);
+            return NULL;
+        }
     }
     XYLog("Found device firmware %s \n", fwName);
     // El tamano real se guarda al empaquetar: ya no se estima como 4x el comprimido.

@@ -36,6 +36,69 @@ static inline const FwDesc *findFwByName(const char *name) {
     return NULL;
 }
 
+/*
+ * Búsqueda tolerante: si el nombre exacto no está, se recortan uno o dos
+ * grupos numéricos del nombre y se busca por prefijo, quedándose con el
+ * firmware de mayor tamaño (el más reciente) de esa familia.
+ *
+ * Motivo: el bootloader puede reportar una revisión distinta a la del
+ * fichero distribuido (p. ej. ibt-17-16-0.sfi frente a ibt-17-16-1.sfi).
+ * Con la búsqueda exacta el arranque en frío fallaba en silencio y el
+ * controlador quedaba sin firmware.
+ */
+static inline const FwDesc *findFwBestMatch(const char *name) {
+    const FwDesc *exact = findFwByName(name);
+    if (exact)
+        return exact;
+
+    size_t len = strlen(name);
+    size_t extLen = 0;
+    for (size_t i = len; i > 0; i--) {
+        if (name[i - 1] == '.') {
+            extLen = len - (i - 1);
+            break;
+        }
+    }
+    if (!extLen || extLen >= len)
+        return NULL;
+
+    const size_t baseLen = len - extLen;
+
+    for (int cut = 1; cut <= 2; cut++) {
+        size_t p = baseLen;
+        int dashes = 0;
+        size_t prefixLen = 0;
+        while (p > 0) {
+            if (name[p - 1] == '-') {
+                if (++dashes == cut) {
+                    prefixLen = p;
+                    break;
+                }
+            }
+            p--;
+        }
+        if (!prefixLen)
+            break;
+
+        const FwDesc *best = NULL;
+        for (int i = 0; i < fwNumber; i++) {
+            const char *n = fwList[i].name;
+            if (strncmp(n, name, prefixLen) != 0)
+                continue;
+            size_t nl = strlen(n);
+            if (nl < extLen)
+                continue;
+            if (memcmp(n + nl - extLen, name + baseLen, extLen) != 0)
+                continue;
+            if (!best || fwList[i].rawSize > best->rawSize)
+                best = &fwList[i];
+        }
+        if (best)
+            return best;
+    }
+    return NULL;
+}
+
 static inline bool uncompressFirmware(unsigned char *dest, uint *destLen, unsigned char *source, uint sourceLen)
 {
     z_stream stream;

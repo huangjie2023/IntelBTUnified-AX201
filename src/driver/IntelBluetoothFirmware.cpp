@@ -83,9 +83,17 @@ bool IntelBluetoothFirmware::start(IOService *provider)
         XYLog("start fail, can not open device\n");
         return fail();
     }
+    // AX201 (0x0026) es Gen2: debe usar la ruta Gen2 original de IntelBluetoothFirmware.
+    // Si se le fuerza la ruta Gen3, el nombre de firmware y el flujo de bootloader
+    // no coinciden con lo que espera el chip en arranque en frio (sin firmware).
     if (currentType == kTypeGen1) {
+        XYLog("Selected ops: Gen1\n");
         m_pBTIntel = new IntelBluetoothOpsGen1();
+    } else if (currentType == kTypeGen2) {
+        XYLog("Selected ops: Gen2\n");
+        m_pBTIntel = new IntelBluetoothOpsGen2();
     } else {
+        XYLog("Selected ops: Gen3\n");
         m_pBTIntel = new IntelBluetoothOpsGen3();
     }
     if (!m_pBTIntel || !m_pBTIntel->initWithDevice(this, m_pDevice)) {
