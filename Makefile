@@ -1,12 +1,12 @@
 # Compila IntelBTUnified.kext solo con las Command Line Tools (sin Xcode).
 #   make deps      clona MacKernelSDK y Lilu (versiones fijadas)
 #   make           compila build/IntelBTUnified.kext (todos los firmwares)
-#   make FW="ibt-0041-*"  incluye solo los firmwares que coincidan (p.ej. AX201: ~1 MB en vez de ~11 MB)
+#   make FW="ibt-19-*"  incluye solo los firmwares que coincidan (AX201: ~7 MB en vez de ~28 MB)
 #   make DEBUG=1   build de depuracion (DBGLOG activo)
 #   make dist      genera dist/IntelBTUnified-<version>-{AX210,full}.zip (para subir a GitHub Releases)
 
 NAME       := IntelBTUnified
-VERSION    := 1.3.0
+VERSION    := 1.4.0
 BUNDLE_ID  := local.$(NAME)
 FW         ?= *
 
@@ -98,10 +98,11 @@ $(KEXT): $(BUILD)/$(NAME) $(BUILD)/Info.plist
 	cp $(BUILD)/Info.plist $@/Contents/Info.plist
 	@echo "OK: $@"
 
-# Un solo paquete: solo AX201 (firmware ibt-17-*/ibt-18-*, ~0.2 MB).
+# Un solo paquete: solo AX201. hw_variant 0x13 (HrP) usa ibt-19-*,
+# NO ibt-17-* (JfP/AX200) ni ibt-18-* (ThP).
 dist:
 	rm -rf dist && mkdir -p dist
-	$(MAKE) clean && $(MAKE) FW="ibt-17-* ibt-18-*"
+	$(MAKE) clean && $(MAKE) FW="ibt-19-*"
 	cd $(BUILD) && zip -qry ../dist/$(NAME)-$(VERSION)-AX201.zip $(NAME).kext
 	$(MAKE) clean
 	@ls -la dist

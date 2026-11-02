@@ -1,6 +1,6 @@
 # IntelBTUnified AX201
 
-单 kext Intel 蓝牙驱动（Lilu 插件 + 固件加载驱动合一），**仅支持 AX201（USB 8087:0026）**，面向 macOS Tahoe 26.x 黑苹果 + OpenCore。
+单 kext Intel 蓝牙驱动（Lilu 插件 + 固件加载驱动 + bluetoothd 补丁合一），**仅支持 AX201（USB 8087:0026）**，面向 macOS Tahoe 26.x 黑苹果 + OpenCore。
 
 替代 `IntelBluetoothFirmware.kext` + `IntelBTPatcher.kext` + `BlueToolFixup.kext` 三个驱动（以及各类 1.0.12 老合体包）。
 
@@ -11,42 +11,65 @@
   - LE Read Remote Features Complete 事件三段改写：假 PHY Update Complete + 假 LE Data Length Change，解开 bluetoothd 的 `LE_READY_WAIT_FOR_LENGTH` 卡死（#514）
   - 钩住 `IOUSBHostPipe::io` 与 `initWithDescriptorsAndOwners`（含 macOS 26.5+ 签名变化）
 - **OTA 修复（process-scoped 补丁）**：bluetoothd/BlueTool 的内存补丁只在**该进程自身加载页面时**才应用。`softwareupdated` 等更新进程校验的是原始二进制，OTA 增量升级不再报 `bluetoothd does not verify / FullReplacementRequired`
-- 固件与 IBT 全量包一致：`ibt-17-*` / `ibt-18-*` 直接取自 lshbluesky v2.5.2（`ibt-17-16-1.sfi` = 675500 B）
+- 固件取自 lshbluesky v2.5.2 的 `ibt-19-*` 全系列
 - 保留上游改进：随机 BLE 地址每次开机生成、长度校验、原子状态、补丁应用日志
 
-> 上游 FAQ 明确：**macOS Monterey 及以后不要使用 `IntelBluetoothInjector.kext`**（"Do NOT use this Kext on macOS Monterey and newer"）。Monterey+ 靠的是驱动把 USB 设备改名为 `Bluetooth USB Host Controller` 来绕过 bluetoothd/BlueTool 的 board-id 检查，所以单 kext 里**不该**有那条 Broadcom transport 注入personality。本包结构与全量包一一对应：`IntelBluetoothFirmware` + `IntelBTPatcher` + `BlueToolFixup`，不含 Injector。
+> 上游 FAQ 明确：**macOS Monterey 及以后不要使用 `IntelBluetoothInjector.kext`**（"Do NOT use this Kext on macOS Monterey and newer"）。Monterey+ 靠的是驱动把 USB 设备改名为 `Bluetooth USB Host Controller` 来绕过 bluetoothd/BlueTool 的 board-id 检查，所以单 kext 里**不该**有那条 Broadcom transport 注入 personality。本包结构对应全量包的 `IntelBluetoothFirmware` + `IntelBTPatcher` + `BlueToolFixup`，不含 Injector。
 
-## 1.3.0 修复（对照全量包后定位）
+## 1.4.0 关键修复：AX201 用的是 `ibt-19-*`，不是 `ibt-17/18`
 
-| 问题 | 说明 | 修复 |
+1.3.0 冷启动直接进不了系统，内核日志给出了完整答案：
+
+```
+IntelFirmware: Driver Start()
+IntelFirmware: Selected ops: Gen2
+IntelFirmware: Bootloader revision 0.4 build 0 week 11 2017
+IntelFirmware: Device revision is 2
+IntelFirmware: Firmware: ibt-19-32-4.sfi NOT PRESENT in kext
+IntelFirmware: ibt-19-2.sfi not found, using fallback ibt-17-16-1.sfi
+IntelFirmware: Intel boot failed
+```
+
+- `getFirmware()` 按 `ibt-<hw_variant>-<hw_revision>-<fw_revision>.sfi` 拼名。AX201 的 `hw_variant = 0x13 = 19`（源码注释里的 **HrP**，Harrion Peak），因此要的是 **`ibt-19-32-4.sfi`**。
+- `0x11` = JfP（AX200，`ibt-17-*`）、`0x12` = ThP（`ibt-18-*`）、`0x14` = CcP。**17/18 从来不是 AX201 的固件**。laguillo 仓库默认 `FW="ibt-17-* ibt-18-*"` 这个假设是错的，热重启时芯片残留固件走 `-EALREADY` 跳过下载，所以一直没暴露。
+- `ibt-19-2.sfi` 是"老命名格式"（`ibt-<variant>-<dev_revid>`），19 系列根本没有这个文件；而当时实现的 `findFwBestMatch()` 会跨变体做前缀回退，把 **AX200 的 `ibt-17-16-1.sfi` 灌给了 AX201** → RSA 校验/启动失败 → `Intel boot failed` → probe 失败 → IOKit 反复重试，于是开机疯狂刷日志、进不了系统。
+
+1.4.0 的修法：
+
+| 项 | 处理 |
+|---|---|
+| 固件集 | 只打包 `ibt-19-*`（20 个文件，`ibt-19-32-4.sfi` = 729372 B），`ibt-17/18-*` 全部移除 |
+| 跨变体错配 | `findFwBestMatch()` 重写为**只在同 `hw_variant` 内回退**：解析 `ibt-<variant>-<rev>[-<build>]`，variant 不同直接跳过；同 variant 内优先同 revision，其次 build 高者 |
+| 无效回退 | 删除 `getFirmwareLegacy()`（生成的 `ibt-19-2.sfi` 必然不存在，只是白跑一次） |
+| 构建脚本 | CI 的 `make FW=` 参数与 Makefile `dist` 目标同步改为 `ibt-19-*`（改 Makefile 但漏改 workflow 是 1.3.0 仍打包 17/18 的原因之一） |
+
+## 1.3.0 / 1.2.0 的历史修复（保留记录）
+
+| 版本 | 问题 | 修复 |
 |---|---|---|
-| 固件被换成了旧修订 | 1.2.0 把 `ibt-17-16-1.sfi` 换成 laguillo 仓库里的 664592 B 版本 —— 实测它与 v2.5.2 的 `ibt-17-2.sfi` **逐字节相同**，即"旧固件顶了新文件名"；上游同名文件是 675500 B、`ddc` 也由 14 B 变为 9 B | `fw/` 整体恢复为 v2.5.2 全量包 |
-| 固件名不在 kext 内时直接失败 | 芯片 bootloader 报的 revision 与打包文件不一致时，冷启动无固件可灌 | 新增 `getFirmwareLegacy()`，按 `ibt-<variant>-2.sfi` 回退（日志 `Using fallback firmware`） |
-| 冷启动首次下载失败无重试 | 冷启动时控制器还在枚举，首次 `downloadFirmwareData` 容易失败，原代码直接放弃 | 回 bootloader → 等待 1 s → 整轮重试一次（`retry succeeded/failed` 日志） |
+| 1.3.0 | 冷启动首次 `downloadFirmwareData` 失败后直接放弃 | 回 bootloader → 等待 1 s → 重试一次 |
+| 1.2.0 | AX201 被强制走 Gen3 路径（`start()` 只区分 Gen1 / 其它） | `kTypeGen2` 直接实例化 `IntelBluetoothOpsGen2` |
+| 1.2.0 | 固件查找失败时在 `firmwareMode` 下静默 `return true`，驱动显示"已加载"但芯片仍在 bootloader | 区分 `NOT PRESENT in kext` 与真正加载成功，补 `fw_name` 属性 |
+| 1.2.0 | 缺少定位日志 | 增加 `Selected ops: Gen2`、`Firmware file ... unavailable` 等 |
 
-## 1.2.0 修复（冷启动后蓝牙打不开）
-
-| 问题 | 说明 | 修复 |
-|---|---|---|
-| AX201 被强制走 Gen3 路径 | `start()` 只区分 Gen1 / 其它，gen2 芯片（AX201）落入 Gen3 的 legacy 兼容分支 | `kTypeGen2` 现在直接实例化 `IntelBluetoothOpsGen2`，与上游 IntelBluetoothFirmware 的 AX201 路径一致 |
-| 固件被替换成 lshbluesky 新版 | `ibt-17-16-1.sfi` 由 664592 B 换成 675500 B，与本驱动的下载/bootloader 流程不配套；热重启时芯片里残留旧固件掩盖了问题，**冷启动必须重灌时才暴露** | 恢复 laguillo 原版 `ibt-17-*` / `ibt-18-*` |
-| 固件名不匹配时静默成功 | 精确查找失败后，`firmwareMode` 为真会直接 `return true`，驱动显示"已加载"但芯片仍在 bootloader | 新增 `findFwBestMatch()` 前缀回退（`ibt-17-16-0` → `ibt-17-*` 最新版），失败时打印 `NOT PRESENT in kext` |
-| 无固件来源日志 | 出错时只有一行模糊日志 | 增加 `Selected ops: Gen2`、`Firmware file ... unavailable (firmwareMode=x)` 等日志 |
-
-> 冷启动失败的典型链条：冷启动 → 芯片无固件 → 驱动找不到/灌不进对应固件 → 芯片停在 bootloader → bluetoothd 的 HCI 命令全部失败 → `EXC_GUARD` 自杀循环、蓝牙开关打不开。热重启时芯片仍带着上一次的固件，所以看起来"正常"。
+> 冷启动失败的典型链条：冷启动 → 芯片无正确固件 → 芯片停在 bootloader → bluetoothd 的 HCI 命令全部失败 → `EXC_GUARD` 自杀 / 驱动反复 probe。热重启时芯片仍带着上一次的固件，看起来"正常"，会掩盖问题。
 
 ## 安装（OpenCore）
 
-1. 从 Actions 构建产物下载 `IntelBTUnified-1.3.0-AX201.zip`
+1. 取 Actions 构建产物 `IntelBTUnified-1.4.0-AX201.zip`
 2. 删除 EFI 里的：`IntelBluetoothFirmware.kext`、`IntelBTPatcher.kext`、`BlueToolFixup.kext`、`IntelBluetoothInjector.kext`、`IntelBluetoothBundle.kext`（以及任何合体版）
 3. 把 `IntelBTUnified.kext` 放入 `EFI/OC/Kexts/`，在 `config.plist → Kernel → Add` 中**放在 Lilu 之后**
 4. NVRAM 建议注入（Tahoe 蓝牙重新初始化）：
    - `bluetoothInternalControllerInfo` = 28 字节 0
    - `bluetoothExternalDongleFailed` = `00`
-5. 重启验证：
-   - `ioreg -rc IntelBluetoothFirmware | grep fw_name` → 应显示 ibt-17-* 或 ibt-18-*（热重启后显示 `(already running)` 属正常）
+5. 冷启动验证：
+   - `sudo dmesg | grep IntelFirmware` → 应看到
+     `Found device firmware ibt-19-32-4.sfi` → `send firmware payload done` → `Notify: Firmware download done`
+   - `ioreg -l -rc IntelBluetoothFirmware | grep fw_name` → `ibt-19-32-4.sfi`（热重启后显示 `(already running)` 属正常）
    - `system_profiler SPBluetoothDataType` → State: On
    - OTA 升级：系统设置里直接检查软件更新应能正常验证
+
+若日志出现 `Intel boot failed` 且刷屏，说明灌进去的固件与芯片不符：立刻移除本 kext，把 `dmesg` 里 `Bootloader revision` / `Firmware:` 那几行贴出来。
 
 ## Boot-args
 
@@ -59,7 +82,7 @@
 | `-ibtplegacy` | 恢复老式无条件补丁（等价 BlueToolFixup，会破坏 OTA 校验） |
 | `-btlfxboardid` / `-btlfxallowanyaddr` / `-btlfxnvramcheck` | 同 BlueToolFixup 原有开关 |
 
-内核日志只出现在 `sudo dmesg`（`log show` 看不到），可加 `msgbuf=1048576` 扩大缓冲区。关注 `ibtp`、`btlfx` 前缀。
+内核日志只出现在 `sudo dmesg`（`log show` 看不到），可加 `msgbuf=1048576` 扩大缓冲区。
 
 ## 构建
 
@@ -67,7 +90,7 @@ GitHub Actions 自动构建（macos-15-intel）。本地构建需要 macOS + Com
 
 ```
 make deps                          # 克隆 MacKernelSDK + Lilu（版本固定）
-make clean && make FW="ibt-17-* ibt-18-*"
+make clean && make FW="ibt-19-*"
 ```
 
 ## 许可

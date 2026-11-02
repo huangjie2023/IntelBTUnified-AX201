@@ -36,20 +36,67 @@ static inline const FwDesc *findFwByName(const char *name) {
     return NULL;
 }
 
+/* Clave de un nombre ibt-<variant>[-<revision>[-<build>]].<ext>. */
+struct FwKey {
+    int variant;
+    int revision;
+    int build;
+};
+
+static inline bool fwKeyFromName(const char *name, FwKey *k) {
+    k->variant = -1;
+    k->revision = -1;
+    k->build = -1;
+
+    if (strncmp(name, "ibt-", 4) != 0)
+        return false;
+
+    const char *p = name + 4;
+    int field = 0;
+    while (*p && *p != '.') {
+        if (*p >= '0' && *p <= '9') {
+            int v = 0;
+            while (*p >= '0' && *p <= '9') {
+                v = v * 10 + (*p - '0');
+                p++;
+            }
+            if (field == 0)
+                k->variant = v;
+            else if (field == 1)
+                k->revision = v;
+            else if (field == 2)
+                k->build = v;
+            field++;
+        } else if (*p == '-') {
+            p++;
+        } else {
+            /* ibt-hw-37.7... (BSEQ) u otro formato no soportado */
+            return false;
+        }
+    }
+    return field >= 1;
+}
+
 /*
- * Búsqueda tolerante: si el nombre exacto no está, se recortan uno o dos
- * grupos numéricos del nombre y se busca por prefijo, quedándose con el
- * firmware de mayor tamaño (el más reciente) de esa familia.
+ * Búsqueda tolerante SOLO dentro del mismo hw_variant.
  *
- * Motivo: el bootloader puede reportar una revisión distinta a la del
- * fichero distribuido (p. ej. ibt-17-16-0.sfi frente a ibt-17-16-1.sfi).
- * Con la búsqueda exacta el arranque en frío fallaba en silencio y el
- * controlador quedaba sin firmware.
+ * El bootloader puede pedir una revision algo distinta a la distribuida
+ * (ibt-19-32-4.sfi frente a ibt-19-32-1.sfi), pero variant distinto es otro
+ * chip: 0x11 JfP (AX200), 0x12 ThP, 0x13 HrP (AX201), 0x14 CcP. Servir
+ * p.ej. un ibt-17-* a un AX201 hace que la descarga acabe en "Intel boot
+ * failed" y el controlador se queda sin firmware (bucle de arranque).
+ *
+ * Regla: misma variante + misma extension; se puntua mas alto la revision
+ * coincidente y, a igualdad, el build mas alto.
  */
 static inline const FwDesc *findFwBestMatch(const char *name) {
     const FwDesc *exact = findFwByName(name);
     if (exact)
         return exact;
+
+    FwKey want;
+    if (!fwKeyFromName(name, &want) || want.variant < 0)
+        return NULL;
 
     size_t len = strlen(name);
     size_t extLen = 0;
@@ -62,41 +109,30 @@ static inline const FwDesc *findFwBestMatch(const char *name) {
     if (!extLen || extLen >= len)
         return NULL;
 
-    const size_t baseLen = len - extLen;
+    const FwDesc *best = NULL;
+    int bestScore = -1;
 
-    for (int cut = 1; cut <= 2; cut++) {
-        size_t p = baseLen;
-        int dashes = 0;
-        size_t prefixLen = 0;
-        while (p > 0) {
-            if (name[p - 1] == '-') {
-                if (++dashes == cut) {
-                    prefixLen = p;
-                    break;
-                }
-            }
-            p--;
-        }
-        if (!prefixLen)
-            break;
+    for (int i = 0; i < fwNumber; i++) {
+        const char *n = fwList[i].name;
+        size_t nl = strlen(n);
+        if (nl < extLen)
+            continue;
+        if (memcmp(n + nl - extLen, name + len - extLen, extLen) != 0)
+            continue;
 
-        const FwDesc *best = NULL;
-        for (int i = 0; i < fwNumber; i++) {
-            const char *n = fwList[i].name;
-            if (strncmp(n, name, prefixLen) != 0)
-                continue;
-            size_t nl = strlen(n);
-            if (nl < extLen)
-                continue;
-            if (memcmp(n + nl - extLen, name + baseLen, extLen) != 0)
-                continue;
-            if (!best || fwList[i].rawSize > best->rawSize)
-                best = &fwList[i];
+        FwKey k;
+        if (!fwKeyFromName(n, &k) || k.variant != want.variant)
+            continue;
+
+        int score = (k.revision == want.revision) ? 1000 : 0;
+        if (k.build > 0)
+            score += k.build;
+        if (score > bestScore) {
+            bestScore = score;
+            best = &fwList[i];
         }
-        if (best)
-            return best;
     }
-    return NULL;
+    return best;
 }
 
 static inline bool uncompressFirmware(unsigned char *dest, uint *destLen, unsigned char *source, uint sourceLen)
