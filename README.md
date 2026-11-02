@@ -16,6 +16,19 @@
 
 > 上游 FAQ 明确：**macOS Monterey 及以后不要使用 `IntelBluetoothInjector.kext`**（"Do NOT use this Kext on macOS Monterey and newer"）。Monterey+ 靠的是驱动把 USB 设备改名为 `Bluetooth USB Host Controller` 来绕过 bluetoothd/BlueTool 的 board-id 检查，所以单 kext 里**不该**有那条 Broadcom transport 注入 personality。本包结构对应全量包的 `IntelBluetoothFirmware` + `IntelBTPatcher` + `BlueToolFixup`，不含 Injector。
 
+## 1.5.0 瘦身（只针对这一台 AX201）
+
+目标机器固定为内置 AX201（USB 8087:0026，hw_variant 0x13，revision 32），不做通用化：
+
+| 项 | 1.4.x | 1.5.0 |
+|---|---|---|
+| 固件 | `ibt-19-*` 全 20 个文件 | `ibt-19-32-{0,1,4}.sfi` + `.ddc` 共 6 个（内容去重后仅 2 个 blob） |
+| 固件压缩体积 | 1,539,896 B | **482,220 B** |
+| 驱动代码 | 含 Gen1/Gen3 死代码 | 只编 Gen2；`IntelBluetoothOpsGen1/Gen3` 已删除 |
+| kext 二进制 | 1,636,568 B | 约 578,000 B |
+
+`start()` 不再判断代际，直接实例化 `IntelBluetoothOpsGen2`，日志固定打印 `Selected ops: Gen2 (AX201 only)`。留 `ibt-19-32-0/1` 两个旧 build 只是为了让 `findFwBestMatch` 在芯片报 0 或 1 时仍能命中（它们与 `-4` 逐字节相同，不占额外空间）。
+
 ## 1.4.0 关键修复：AX201 用的是 `ibt-19-*`，不是 `ibt-17/18`
 
 1.3.0 冷启动直接进不了系统，内核日志给出了完整答案：
@@ -57,7 +70,7 @@ IntelFirmware: Intel boot failed
 
 ## 安装（OpenCore）
 
-1. 取 Actions 构建产物 `IntelBTUnified-1.4.1-AX201.zip`
+1. 取 Actions 构建产物 `IntelBTUnified-1.5.0-AX201.zip`
 2. 删除 EFI 里的：`IntelBluetoothFirmware.kext`、`IntelBTPatcher.kext`、`BlueToolFixup.kext`、`IntelBluetoothInjector.kext`、`IntelBluetoothBundle.kext`（以及任何合体版）
 3. 把 `IntelBTUnified.kext` 放入 `EFI/OC/Kexts/`，在 `config.plist → Kernel → Add` 中**放在 Lilu 之后**
 4. NVRAM 建议注入（Tahoe 蓝牙重新初始化）：
@@ -91,7 +104,7 @@ GitHub Actions 自动构建（macos-15-intel）。本地构建需要 macOS + Com
 
 ```
 make deps                          # 克隆 MacKernelSDK + Lilu（版本固定）
-make clean && make FW="ibt-19-*"
+make clean && make FW="ibt-19-32-*"
 ```
 
 ## 许可

@@ -19,9 +19,7 @@
 #include "Log.h"
 #include "Devices.h"
 
-#include "IntelBluetoothOpsGen1.hpp"
 #include "IntelBluetoothOpsGen2.hpp"
-#include "IntelBluetoothOpsGen3.hpp"
 
 #define super IOService
 OSDefineMetaClassAndStructors(IntelBluetoothFirmware, IOService)
@@ -95,19 +93,10 @@ bool IntelBluetoothFirmware::start(IOService *provider)
         XYLog("start fail, can not open device\n");
         return fail();
     }
-    // AX201 (0x0026) es Gen2: debe usar la ruta Gen2 original de IntelBluetoothFirmware.
-    // Si se le fuerza la ruta Gen3, el nombre de firmware y el flujo de bootloader
-    // no coinciden con lo que espera el chip en arranque en frio (sin firmware).
-    if (currentType == kTypeGen1) {
-        XYLog("Selected ops: Gen1\n");
-        m_pBTIntel = new IntelBluetoothOpsGen1();
-    } else if (currentType == kTypeGen2) {
-        XYLog("Selected ops: Gen2\n");
-        m_pBTIntel = new IntelBluetoothOpsGen2();
-    } else {
-        XYLog("Selected ops: Gen3\n");
-        m_pBTIntel = new IntelBluetoothOpsGen3();
-    }
+    // Esta build solo soporta AX201 (0x0026), que es gen2. Se instancia Gen2
+    // de forma fija: las rutas Gen1/Gen3 no se compilan, no hay nada que elegir.
+    XYLog("Selected ops: Gen2 (AX201 only)\n");
+    m_pBTIntel = new IntelBluetoothOpsGen2();
     if (!m_pBTIntel || !m_pBTIntel->initWithDevice(this, m_pDevice)) {
         XYLog("start fail, can not init device\n");
         return fail();

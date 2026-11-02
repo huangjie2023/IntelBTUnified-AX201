@@ -1,2 +1,2 @@
 # idProduct  generation  nombre            (vendor siempre 0x8087)
-0x0026  gen2  AX201
+0x0026  gen2  AX201   # hw_variant 0x13 (HrP) -> firmware ibt-19-32-*
