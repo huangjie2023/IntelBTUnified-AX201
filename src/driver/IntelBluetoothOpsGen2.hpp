@@ -44,6 +44,10 @@ private:
     
     bool getFirmware(IntelVersion *ver, IntelBootParams *params, char *name, size_t len, const char *suffix);
     
+    // Revision anterior del mismo hw_variant (p. ej. ibt-17-2.sfi frente a
+    // ibt-17-16-1.sfi). Se usa solo como respaldo si la principal falla.
+    bool getFirmwareLegacy(IntelVersion *ver, char *name, size_t len, const char *suffix);
+    
     IOReturn downloadFirmwareData(IntelVersion *ver, OSData *fwData, uint32_t *bootParams);
     
     bool downloadFirmware(IntelVersion *ver, IntelBootParams *params, uint32_t *bootParams);

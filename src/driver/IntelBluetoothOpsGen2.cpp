@@ -198,8 +198,25 @@ download:
             /* Firmware has already been loaded */
             return true;
         }
-        XYLog("Failed to load Intel firmware file %s\n", fwname);
-        return false;
+        /* La revision que pide el bootloader no esta en el kext: probar la
+         * revision anterior del mismo hw_variant (ibt-17-2.sfi, ibt-18-2.sfi).
+         * Sin esto el arranque en frio se queda sin firmware y bluetoothd
+         * no llega a arrancar el controlador.
+         */
+        char altname[64];
+        if (getFirmwareLegacy(ver, altname, sizeof(altname), "sfi")) {
+            fwData = requestFirmwareData(altname, true);
+            if (fwData) {
+                XYLog("Using fallback firmware %s\n", altname);
+                strncpy(fwname, altname, sizeof(fwname) - 1);
+                fwname[sizeof(fwname) - 1] = 0;
+                strncpy(this->loadedFirmwareName, fwname, sizeof(this->loadedFirmwareName) - 1);
+            }
+        }
+        if (!fwData) {
+            XYLog("Failed to load Intel firmware file %s\n", fwname);
+            return false;
+        }
     }
     
     if (fwData->getLength() < 644) {
@@ -210,18 +227,31 @@ download:
     }
     
     /* Start firmware downloading and get boot parameter */
-    if ((ior = downloadFirmwareData(ver, fwData, bootParams)) != kIOReturnSuccess) {
+    ior = downloadFirmwareData(ver, fwData, bootParams);
+    if (ior == -EALREADY) {
+        /* Firmware has already been loaded */
+        ret = true;
+        goto done;
+    }
+    if (ior != kIOReturnSuccess) {
+        /* En arranque en frio el primer intento puede fallar mientras el
+         * controlador termina de enumerar. Se vuelve al bootloader, se le da
+         * un segundo para asentarse y se reintenta una sola vez.
+         */
+        XYLog("Firmware download failed (%d), reset to bootloader and retry\n", ior);
+        resetToBootloader();
+        IOSleep(1000);
+        ior = downloadFirmwareData(ver, fwData, bootParams);
         if (ior == -EALREADY) {
-            /* Firmware has already been loaded */
             ret = true;
             goto done;
         }
-        
-        /* When FW download fails, send Intel Reset to retry
-         * FW download.
-         */
-        resetToBootloader();
-        goto done;
+        if (ior != kIOReturnSuccess) {
+            XYLog("Firmware download retry failed (%d)\n", ior);
+            resetToBootloader();
+            goto done;
+        }
+        XYLog("Firmware download retry succeeded\n");
     }
     
     /* Before switching the device into operational mode and with that
@@ -329,6 +359,26 @@ getFirmware(IntelVersion *ver, IntelBootParams *params,
     }
     
     return true;
+}
+
+bool IntelBluetoothOpsGen2::
+getFirmwareLegacy(IntelVersion *ver, char *name, size_t len, const char *suffix)
+{
+    /* Nombres historicos de linux-firmware para ThP/JfP/HrP/CcP:
+     * ibt-<hw_variant>-2.sfi. Solo se usan si la revision exacta no existe.
+     */
+    switch (ver->hw_variant) {
+        case 0x11:    /* JfP */
+        case 0x12:    /* ThP */
+        case 0x13:    /* HrP */
+        case 0x14:    /* CcP */
+            snprintf(name, len, "ibt-%u-2.%s",
+                     OSSwapLittleToHostInt16(ver->hw_variant),
+                     suffix);
+            return true;
+        default:
+            return false;
+    }
 }
 
 bool IntelBluetoothOpsGen2::

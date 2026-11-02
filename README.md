@@ -11,8 +11,18 @@
   - LE Read Remote Features Complete 事件三段改写：假 PHY Update Complete + 假 LE Data Length Change，解开 bluetoothd 的 `LE_READY_WAIT_FOR_LENGTH` 卡死（#514）
   - 钩住 `IOUSBHostPipe::io` 与 `initWithDescriptorsAndOwners`（含 macOS 26.5+ 签名变化）
 - **OTA 修复（process-scoped 补丁）**：bluetoothd/BlueTool 的内存补丁只在**该进程自身加载页面时**才应用。`softwareupdated` 等更新进程校验的是原始二进制，OTA 增量升级不再报 `bluetoothd does not verify / FullReplacementRequired`
-- 固件仅打包 AX201 所需的 `ibt-17-*` / `ibt-18-*`（**laguillo 原版固件**，与驱动下载逻辑配套）
+- 固件与 IBT 全量包一致：`ibt-17-*` / `ibt-18-*` 直接取自 lshbluesky v2.5.2（`ibt-17-16-1.sfi` = 675500 B）
 - 保留上游改进：随机 BLE 地址每次开机生成、长度校验、原子状态、补丁应用日志
+
+> 上游 FAQ 明确：**macOS Monterey 及以后不要使用 `IntelBluetoothInjector.kext`**（"Do NOT use this Kext on macOS Monterey and newer"）。Monterey+ 靠的是驱动把 USB 设备改名为 `Bluetooth USB Host Controller` 来绕过 bluetoothd/BlueTool 的 board-id 检查，所以单 kext 里**不该**有那条 Broadcom transport 注入personality。本包结构与全量包一一对应：`IntelBluetoothFirmware` + `IntelBTPatcher` + `BlueToolFixup`，不含 Injector。
+
+## 1.3.0 修复（对照全量包后定位）
+
+| 问题 | 说明 | 修复 |
+|---|---|---|
+| 固件被换成了旧修订 | 1.2.0 把 `ibt-17-16-1.sfi` 换成 laguillo 仓库里的 664592 B 版本 —— 实测它与 v2.5.2 的 `ibt-17-2.sfi` **逐字节相同**，即"旧固件顶了新文件名"；上游同名文件是 675500 B、`ddc` 也由 14 B 变为 9 B | `fw/` 整体恢复为 v2.5.2 全量包 |
+| 固件名不在 kext 内时直接失败 | 芯片 bootloader 报的 revision 与打包文件不一致时，冷启动无固件可灌 | 新增 `getFirmwareLegacy()`，按 `ibt-<variant>-2.sfi` 回退（日志 `Using fallback firmware`） |
+| 冷启动首次下载失败无重试 | 冷启动时控制器还在枚举，首次 `downloadFirmwareData` 容易失败，原代码直接放弃 | 回 bootloader → 等待 1 s → 整轮重试一次（`retry succeeded/failed` 日志） |
 
 ## 1.2.0 修复（冷启动后蓝牙打不开）
 
@@ -27,7 +37,7 @@
 
 ## 安装（OpenCore）
 
-1. 从 Actions 构建产物下载 `IntelBTUnified-1.2.0-AX201.zip`
+1. 从 Actions 构建产物下载 `IntelBTUnified-1.3.0-AX201.zip`
 2. 删除 EFI 里的：`IntelBluetoothFirmware.kext`、`IntelBTPatcher.kext`、`BlueToolFixup.kext`、`IntelBluetoothInjector.kext`、`IntelBluetoothBundle.kext`（以及任何合体版）
 3. 把 `IntelBTUnified.kext` 放入 `EFI/OC/Kexts/`，在 `config.plist → Kernel → Add` 中**放在 Lilu 之后**
 4. NVRAM 建议注入（Tahoe 蓝牙重新初始化）：
