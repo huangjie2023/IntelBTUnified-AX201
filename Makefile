@@ -6,7 +6,7 @@
 #   make dist      genera dist/IntelBTUnified-<version>-{AX210,full}.zip (para subir a GitHub Releases)
 
 NAME       := IntelBTUnified
-VERSION    := 1.4.0
+VERSION    := 1.4.1
 BUNDLE_ID  := local.$(NAME)
 FW         ?= *
 

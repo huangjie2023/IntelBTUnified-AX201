@@ -26,6 +26,13 @@
 #define super IOService
 OSDefineMetaClassAndStructors(IntelBluetoothFirmware, IOService)
 
+/* Si el firmware no encaja con el chip, IOKit reintenta el probe sin parar
+ * (log infinito en pantalla y arranque eterno). Tras 3 fallos seguidos se
+ * deja de intentar: se pierde el Bluetooth, pero el sistema arranca.
+ */
+static int gStartFailures = 0;
+static const int kMaxStartFailures = 3;
+
 //com.apple.iokit.IOBluetoothHostControllerUSBTransport
 
 enum { kMyOffPowerState = 0, kMyOnPowerState = 1 };
@@ -64,6 +71,11 @@ bool IntelBluetoothFirmware::fail()
 bool IntelBluetoothFirmware::start(IOService *provider)
 {
     XYLog("Driver Start()\n");
+    if (gStartFailures >= kMaxStartFailures) {
+        XYLog("Setup failed %d times in a row, giving up (firmware/chip mismatch)\n",
+              gStartFailures);
+        return false;
+    }
     char fwName[64];
     m_pDevice = OSDynamicCast(IOUSBHostDevice, provider);
     if (m_pDevice == NULL) {
@@ -102,9 +114,11 @@ bool IntelBluetoothFirmware::start(IOService *provider)
     }
     XYLog("BT init succeed\n");
     if (!m_pBTIntel->setup()) {
+        gStartFailures++;
         m_pDevice->setProperty("FirmwareLoaded", false);
         return fail();
     }
+    gStartFailures = 0;
     m_pBTIntel->getFirmwareName(fwName, sizeof(fwName));
     publishReg(true, fwName);
     cleanUp();
