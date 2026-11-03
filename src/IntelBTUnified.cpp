@@ -11,12 +11,17 @@
 //      parches son PROCESS-SCOPED: solo se aplican cuando el propio proceso
 //      bluetoothd / BlueTool valida sus paginas, de modo que softwareupdated
 //      ve los binarios originales y la actualizacion OTA de macOS no falla.
-//  Desde 1.6.0 estos parches vienen DESACTIVADOS: escribir dentro de la pagina
-//  descomprimida de un binario decmpfs del volumen de sistema provoca
-//  "APFS compressed data hash mismatch" y SIGBUS en bluetoothd tras el reposo.
-//  Se activan con -ibtpatch (por proceso) o -ibtplegacy (antiguo).
+//  Desde 1.7.0 estos parches estan ACTIVOS (sin ellos el controlador no se enciende en
+//  macOS 26) y siguen siendo process-scoped para no romper la actualizacion OTA.
+//  -ibtota los desactiva; -ibtplegacy restaura el comportamiento incondicional.
 //  El driver que carga el firmware (IntelBluetoothFirmware) vive en el mismo
-//  bundle. Solo se incluye firmware AX201 (8087:0026, gen2, ibt-17-*/ibt-18-*).
+//  bundle. Solo se incluye firmware AX201 (8087:0026, gen2, ibt-19-32-*).
+//
+//  1.8.0: la reescritura de eventos LE Read Remote Features lleva estado por conexion
+//  (connection handle) en vez de un contador global. Con varios dispositivos
+//  reconectando a la vez (tipico del arranque en frio) la secuencia global se
+//  desalineaba: un dispositivo perdia su features complete y no conectaba, sin ningun
+//  crash ni log. -ibtleoff desactiva esa reescritura para aislar el problema.
 //
 //  Solo macOS 12 (Monterey) o posterior: los parches de macOS 11 y anteriores se han eliminado.
 //
@@ -79,10 +84,85 @@ static uint8_t randomAddrCmd[HCI_CMD_HDR_SIZE + 6];
 // 1 = ya enviada tras el ultimo HCI_Reset. Se toca desde un hook que puede ejecutarse en paralelo.
 static int randomAddrSent = 0;
 
-// #514: contador de lecturas LE Read Remote Features extra pendientes.
-static int remoteReadSCount = 0;
 // Pipe de interrupcion (eventos HCI) del controlador Intel, capturado en initWithDescriptorsAndOwners.
 static void *hookPipeInstance = nullptr;
+
+// #514: estado por conexion (1.8.0).
+//
+// 1.7.0 y anteriores usaban un unico contador global (leMetaStage) para reescribir los
+// eventos LE Read Remote Features Complete. Eso solo funciona si las conexiones llegan de
+// una en una. Al arrancar en frio el Mac reconecta varios dispositivos a la vez y los eventos
+// de conexiones distintas se intercalan (A1 B1 A2 B2 A3 B3), con lo que la maquina de
+// estados global se desplaza: el evento real de un dispositivo se convierte en "fake PHY
+// Update" y el otro pierde su features complete. Resultado: el controlador esta perfecto,
+// no hay ningun crash, y el dispositivo simplemente no conecta hasta el siguiente reinicio.
+//
+// Ahora el estado va indexado por connection handle (los tres eventos de una misma lectura
+// llevan el mismo handle) y se libera solo cuando se han reescrito los tres.
+#define LE_SLOT_COUNT       4       // conexiones simultaneas soportadas
+#define LE_SLOT_IDLE_LIMIT  256     // eventos sin usar el slot -> se descarta
+
+struct LeSlot {
+    uint16_t handle;
+    uint8_t  stage;      // 0 = real (pasa), 1 -> fake PHY Update, 2 -> fake Data Length
+    uint16_t idle;       // eventos vistos desde el ultimo uso (para caducar)
+    bool     used;
+};
+
+static LeSlot leSlots[LE_SLOT_COUNT];
+static int  leActiveSlots = 0;
+// -ibtleoff: desactiva por completo la reescritura (palanca de diagnostico).
+static bool leRewriteDisabled = false;
+// Presupuesto de lineas de log para no inundar el arranque.
+static int  leLogBudget = 16;
+
+static inline uint16_t leHandleOfEvent(const HciEventHdr *hdr) {
+    // Read Remote Features Complete: [0]=subevent 0x04, [1]=status, [2..3]=handle
+    return (uint16_t)((hdr->data[2] | (hdr->data[3] << 8)) & 0x0FFF);
+}
+
+static LeSlot *leFindSlot(uint16_t handle) {
+    for (int i = 0; i < LE_SLOT_COUNT; i++)
+        if (leSlots[i].used && leSlots[i].handle == handle)
+            return &leSlots[i];
+    return nullptr;
+}
+
+static void leClearAllSlots(const char *why) {
+    bool any = false;
+    for (int i = 0; i < LE_SLOT_COUNT; i++) {
+        if (leSlots[i].used) {
+            any = true;
+            leSlots[i].used = false;
+        }
+    }
+    if (__atomic_exchange_n(&leActiveSlots, 0, __ATOMIC_SEQ_CST) && any)
+        DBGLOG(MODULE_IBTP, "le slots cleared (%s)", why);
+}
+
+static void leRegisterSlot(uint16_t handle) {
+    LeSlot *slot = leFindSlot(handle);
+    if (slot) {     // reintento sobre la misma conexion: reiniciar la secuencia
+        slot->stage = 0;
+        slot->idle = 0;
+        return;
+    }
+    for (int i = 0; i < LE_SLOT_COUNT; i++) {
+        if (!leSlots[i].used) {
+            leSlots[i].used = true;
+            leSlots[i].handle = handle;
+            leSlots[i].stage = 0;
+            leSlots[i].idle = 0;
+            __atomic_add_fetch(&leActiveSlots, 1, __ATOMIC_SEQ_CST);
+            DBGLOG(MODULE_IBTP, "le slot +h=0x%03x (active %d)", handle, leActiveSlots);
+            return;
+        }
+    }
+    // Tabla llena: hay mas conexiones simultaneas de las previstas. Mejor no tocar nada
+    // que reescribir a ciegas; se registra para que el fallo sea visible en el log.
+    if (leLogBudget-- > 0)
+        SYSLOG(MODULE_IBTP, "[PATCH] le slot table full, h=0x%03x left untouched (connect may stall)", handle);
+}
 
 static void makeRandomAddressCommand() {
     uint8_t addr[6];
@@ -142,20 +222,24 @@ static void sendRandomAddress(void *that, IOService *provider, unsigned int time
 //   etapa 0 = el real (pasa tal cual), 1 = reescrito como fake PHY Update Complete,
 //   2 = reescrito como fake LE Data Length Change (desbloquea el
 //   LE_READY_WAIT_FOR_LENGTH de bluetoothd).
+// Desde 1.8.0 la etapa es POR CONEXION (connection handle), no global: con varios
+// dispositivos reconectando a la vez (habitual en arranque en frio) la secuencia global
+// se desalineaba y las conexiones se quedaban colgadas sin ningun crash.
 #define HCI_EVT_LE_META                               0x3E
 #define HCI_EVT_LE_META_READ_REMOTE_FEATURES_COMPLETE 0x04
 
-uint8_t fakePhyUpdateCompleteEvent[8] = {0x3E, 0x06, 0x0C, 0x00, 0x00, 0x00, 0x02, 0x02};
+// Plantillas; cada reescritura usa una copia local para no compartir bytes mutables
+// entre conexiones que se completan a la vez.
+static const uint8_t fakePhyUpdateCompleteEvent[8] = {0x3E, 0x06, 0x0C, 0x00, 0x00, 0x00, 0x02, 0x02};
 // LE Data Length Change (LE Meta subevent 0x07, sin byte de estado -> handle en [3][4]).
 // bluetoothd se queda en LE_READY_WAIT_FOR_LENGTH tras el PHY hasta ver esto.
 // 27 octets / 328us tx+rx.
-uint8_t fakeDataLengthChangeEvent[13] = {0x3E, 0x0B, 0x07, 0x00, 0x00, 0x1B, 0x00, 0x48, 0x01, 0x1B, 0x00, 0x48, 0x01};
+static const uint8_t fakeDataLengthChangeEvent[13] = {0x3E, 0x0B, 0x07, 0x00, 0x00, 0x1B, 0x00, 0x48, 0x01, 0x1B, 0x00, 0x48, 0x01};
 
 static void asyncIOCompletion(void* owner, void* parameter, IOReturn status, uint32_t bytesTransferred)
 {
     AsyncOwnerData *asyncOwner = (AsyncOwnerData *)owner;
     IOMemoryDescriptor* dataBuffer = asyncOwner->dataBuffer;
-    static int leMetaStage = 0;
     uint32_t allocLen = bytesTransferred;
 
     if (dataBuffer && bytesTransferred) {
@@ -165,22 +249,62 @@ static void asyncIOCompletion(void* owner, void* parameter, IOReturn status, uin
                 dataBuffer->readBytes(0, buffer, allocLen);
                 HciEventHdr *hdr = (HciEventHdr *)buffer;
                 if (hdr->evt == HCI_EVT_LE_META && hdr->data[0] == HCI_EVT_LE_META_READ_REMOTE_FEATURES_COMPLETE) {
-                    if (leMetaStage == 0) {
-                        leMetaStage = 1;            // real features complete -> pasa tal cual
-                    } else if (leMetaStage == 1) {  // 1er duplicado -> fake PHY Update Complete
-                        fakePhyUpdateCompleteEvent[4] = hdr->data[2];
-                        fakePhyUpdateCompleteEvent[5] = hdr->data[3];
-                        dataBuffer->writeBytes(0, fakePhyUpdateCompleteEvent, 8);
-                        bytesTransferred = 8;
-                        leMetaStage = 2;
-                        remoteReadSCount--;
-                    } else {                        // 2o duplicado -> fake LE Data Length Change
-                        fakeDataLengthChangeEvent[3] = hdr->data[2];
-                        fakeDataLengthChangeEvent[4] = hdr->data[3];
-                        dataBuffer->writeBytes(0, fakeDataLengthChangeEvent, 13);
-                        bytesTransferred = 13;
-                        leMetaStage = 0;
-                        remoteReadSCount--;
+                    if (hdr->len >= 12) {
+                        uint16_t handle = leHandleOfEvent(hdr);
+                        uint8_t eventStatus = hdr->data[1];
+                        LeSlot *slot = leFindSlot(handle);
+                        if (slot && eventStatus == 0) {
+                            // El primer evento de cada conexion pasa intacto (es el features
+                            // complete real); los dos siguientes se reescriben.
+                            if (slot->stage == 0) {
+                                slot->stage = 1;
+                                slot->idle = 0;
+                                if (leLogBudget-- > 0)
+                                    SYSLOG(MODULE_IBTP, "[PATCH] le h=0x%03x features complete (real, pass)", handle);
+                            } else if (slot->stage == 1) {
+                                uint8_t phy[sizeof(fakePhyUpdateCompleteEvent)];
+                                memcpy(phy, fakePhyUpdateCompleteEvent, sizeof(phy));
+                                phy[4] = hdr->data[2];
+                                phy[5] = hdr->data[3];
+                                dataBuffer->writeBytes(0, phy, sizeof(phy));
+                                bytesTransferred = 8;
+                                slot->stage = 2;
+                                slot->idle = 0;
+                                if (leLogBudget-- > 0)
+                                    SYSLOG(MODULE_IBTP, "[PATCH] le h=0x%03x -> fake PHY Update", handle);
+                            } else {
+                                uint8_t dlc[sizeof(fakeDataLengthChangeEvent)];
+                                memcpy(dlc, fakeDataLengthChangeEvent, sizeof(dlc));
+                                dlc[3] = hdr->data[2];
+                                dlc[4] = hdr->data[3];
+                                dataBuffer->writeBytes(0, dlc, sizeof(dlc));
+                                bytesTransferred = 13;
+                                if (leLogBudget-- > 0)
+                                    SYSLOG(MODULE_IBTP, "[PATCH] le h=0x%03x -> fake Data Length Change (done)", handle);
+                                slot->used = false;
+                                __atomic_sub_fetch(&leActiveSlots, 1, __ATOMIC_SEQ_CST);
+                            }
+                        } else if (slot) {
+                            // Status != 0: la lectura fallo, no hay features que reescribir.
+                            slot->used = false;
+                            __atomic_sub_fetch(&leActiveSlots, 1, __ATOMIC_SEQ_CST);
+                            DBGLOG(MODULE_IBTP, "le h=0x%03x features failed (status %u), slot dropped", handle, eventStatus);
+                        } else {
+                            // Evento sin slot registrado: llega de una conexion para la que no
+                            // se pidieron lecturas extra. Se deja pasar sin tocar.
+                            DBGLOG(MODULE_IBTP, "le h=0x%03x features event without slot, untouched", handle);
+                        }
+                        // Caducar slots que dejaron de recibir eventos (p.ej. conexion abortada),
+                        // para que un handle reutilizado no herede una etapa desplazada.
+                        for (int i = 0; i < LE_SLOT_COUNT; i++) {
+                            if (!leSlots[i].used || leSlots[i].handle == handle)
+                                continue;
+                            if (++leSlots[i].idle > LE_SLOT_IDLE_LIMIT) {
+                                DBGLOG(MODULE_IBTP, "le slot h=0x%03x expired (idle)", leSlots[i].handle);
+                                leSlots[i].used = false;
+                                __atomic_sub_fetch(&leActiveSlots, 1, __ATOMIC_SEQ_CST);
+                            }
+                        }
                     }
                 }
                 if (getKernelVersion() >= KernelVersion::Sequoia) dataBuffer->complete(kIODirectionInOut);
@@ -195,13 +319,20 @@ static void asyncIOCompletion(void* owner, void* parameter, IOReturn status, uin
 
 static IOReturn newAsyncIO(void *that, IOMemoryDescriptor* dataBuffer, uint32_t bytesTransferred, IOUSBHostCompletion* completion, uint32_t completionTimeoutMs)
 {
-    if (remoteReadSCount > 0 && that == hookPipeInstance && completion) {
-        AsyncOwnerData *ownerData = new AsyncOwnerData;
-        ownerData->action = completion->action;
-        ownerData->owner = completion->owner;
-        ownerData->dataBuffer = dataBuffer;
-        completion->action = asyncIOCompletion;
-        completion->owner = ownerData;
+    if (!leRewriteDisabled && leActiveSlots > 0 && completion) {
+        if (that == hookPipeInstance) {
+            AsyncOwnerData *ownerData = new AsyncOwnerData;
+            ownerData->action = completion->action;
+            ownerData->owner = completion->owner;
+            ownerData->dataBuffer = dataBuffer;
+            completion->action = asyncIOCompletion;
+            completion->owner = ownerData;
+        } else if (leLogBudget-- > 0) {
+            // Diagnostico de arranque en frio: si el pipe capturado no es el que usa el
+            // controlador, la reescritura LE no se aplica a nada y el sintoma es
+            // exactamente "bluetooth encendido pero no conecta, sin crash".
+            SYSLOG(MODULE_IBTP, "[PATCH] event pipe mismatch: captured %p, io on %p (le fix inactive)", hookPipeInstance, that);
+        }
     }
     return FunctionCast(newAsyncIO, oldAsyncIO)(that, dataBuffer, bytesTransferred, completion, completionTimeoutMs);
 }
@@ -213,8 +344,12 @@ static void captureIntelInterruptPipe(void *that, IOUSBHostDevice *device, Stand
     if (deviceDescriptor && USBToHost16(deviceDescriptor->idVendor) == INTEL_VENDOR_ID &&
         isIntelBluetooth(device)) {
         uint8_t epType = StandardUSB::getEndpointType(descriptor);
-        if (epType == kIOUSBEndpointTypeInterrupt)
+        if (epType == kIOUSBEndpointTypeInterrupt && hookPipeInstance != that) {
+            // Cambia en cada re-enumeracion (tras la descarga de firmware), por eso se
+            // registra: una captura fallida explica los fallos de conexion en frio.
+            SYSLOG(MODULE_IBTP, "[PATCH] event pipe captured %p (was %p)", that, hookPipeInstance);
             hookPipeInstance = that;
+        }
     }
 }
 
@@ -256,8 +391,10 @@ static IOReturn newHostDeviceRequest(void *that, IOService *provider, StandardUS
         }
         if (hdr) {
             if (hdr->opcode == HCI_OP_RESET) {
-                // Tras un reset hay que volver a enviar la direccion.
+                // Tras un reset hay que volver a enviar la direccion y olvidar el estado
+                // de las conexiones anteriores (el controlador las ha perdido).
                 __atomic_store_n(&randomAddrSent, 0, __ATOMIC_SEQ_CST);
+                leClearAllSlots("hci reset");
             } else if (hdr->opcode == HCI_OP_LE_SET_SCAN_PARAM) {
                 if (__atomic_exchange_n(&randomAddrSent, 1, __ATOMIC_SEQ_CST) == 0)
                     sendRandomAddress(that, provider, timeout);
@@ -265,7 +402,13 @@ static IOReturn newHostDeviceRequest(void *that, IOService *provider, StandardUS
                 // #514: enviar DOS lecturas extra -> dos eventos 0x04 duplicados que se
                 // reescriben (1er dup -> fake PHY Update Complete, 2o dup -> fake LE Data
                 // Length Change). La peticion real (con completion) se ejecuta abajo.
-                remoteReadSCount += 2;
+                // El estado se lleva por connection handle: los tres eventos de esta
+                // lectura lo comparten, y asi dos dispositivos reconectando a la vez no
+                // se pisan (causa de "conecta a veces" en arranque en frio).
+                if (!leRewriteDisabled && hdr->len >= 2) {
+                    uint16_t handle = (uint16_t)((hdr->data[0] | (hdr->data[1] << 8)) & 0x0FFF);
+                    leRegisterSlot(handle);
+                }
                 FunctionCast(newHostDeviceRequest, oldHostDeviceRequest)(that, provider, request, nullptr, descriptor, length, nullptr, timeout);
                 FunctionCast(newHostDeviceRequest, oldHostDeviceRequest)(that, provider, request, nullptr, descriptor, length, nullptr, timeout);
             }
@@ -527,6 +670,11 @@ static void processPatcher(KernelPatcher &patcher) {
 
 static void pluginStart() {
     SYSLOG("ibt", "start");
+    // 1.8.0: palanca de diagnostico. Si con -ibtleoff las conexiones dejan de fallar en
+    // arranque en frio, el problema esta en la reescritura de eventos LE, no en el firmware.
+    leRewriteDisabled = checkKernelArgument("-ibtleoff");
+    if (leRewriteDisabled)
+        SYSLOG(MODULE_IBTP, "[PATCH] LE event rewriting OFF (-ibtleoff)");
     lilu.onKextLoadForce(&kextIOUSBHost, 1,
         [](void *, KernelPatcher &patcher, size_t index, mach_vm_address_t address, size_t size) {
             processUSBHost(patcher, index, address, size);

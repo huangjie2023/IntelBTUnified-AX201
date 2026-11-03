@@ -16,6 +16,33 @@
 
 > 上游 FAQ 明确：**macOS Monterey 及以后不要使用 `IntelBluetoothInjector.kext`**（"Do NOT use this Kext on macOS Monterey and newer"）。Monterey+ 靠的是驱动把 USB 设备改名为 `Bluetooth USB Host Controller` 来绕过 bluetoothd/BlueTool 的 board-id 检查，所以单 kext 里**不该**有那条 Broadcom transport 注入 personality。本包结构对应全量包的 `IntelBluetoothFirmware` + `IntelBTPatcher` + `BlueToolFixup`，不含 Injector。
 
+## 1.8.0：冷启动偶发「蓝牙正常但连不上设备」
+
+1.7.0 实测：OTA 正常、日常可用，但**有时候冷启动**后蓝牙能开、能看到设备，却连不上，且没有任何崩溃日志。
+
+根因在 LE 事件改写：上游（lshbluesky v2.5.2）用一个**全局** `leMetaStage` 静态变量，按「第 1 个事件放行 / 第 2 个改写为假 PHY / 第 3 个改写为假 Data Length」推进。这只有在**连接一个一个来**时才成立。冷启动时系统会把多个已配对设备同时重连，事件在管道上交错：
+
+```
+A1 B1 A2 B2 A3 B3      <- 三个事件一组，每组带同一个 connection handle
+```
+
+全局计数器就会错位：A 的真实 features complete 被当成「第 1 个」放行过（或 B 的会被改写成假 PHY），于是某个设备**永远收不到自己的 features complete**，卡在连接建立阶段。表现就是「驱动正常、界面正常、就是连不上、无崩溃」——因为协议层失败，不涉及崩溃。
+
+1.8.0 把状态改成**按 connection handle 索引的小表**（4 个 slot）：
+
+| 改动 | 作用 |
+|---|---|
+| 每个 handle 独立 stage 0→1→2 | 多设备同时重连不再互相踩 |
+| 只在命令里的 handle 上注册，未注册的 features 事件**原样放行** | 不再误改别人的事件 |
+| `status != 0` 时直接丢弃 slot | 失败事件不该被改写 |
+| handle 空闲 256 个事件后自动过期；`HCI_Reset` 清空全表 | 防止 handle 复用继承错位状态 |
+| 假事件写入改为**局部拷贝** | 两条连接并发完成时不共享可变缓冲 |
+| 新增 `[PATCH] le h=0xNNN ...` 日志（每 boot 前 16 条） | 能直接看到某个 handle 是否走完三段 |
+| 新增 `[PATCH] event pipe captured / mismatch` 日志 | 若捕获到的 pipe 不是实际收发事件的那个，此前会静默失效 |
+| 新增 `-ibtleoff` | 关掉 LE 改写做隔离验证 |
+
+排障脚本：`sh tools/bt-diag.sh`（只读，收集 kext 版本、补丁命中、固件日志、LE 改写、崩溃报告、控制器信息）。
+
 ## 1.6.0 / 1.7.0：睡眠唤醒 SIGBUS 的排查（补丁是必需的）
 
 现象：1.5.0 冷启动、连接都正常，**合盖唤醒后 bluetoothd 崩溃**，崩溃点落在 `/usr/sbin/bluetoothd` 的 `__TEXT`，内核 triage 是：
@@ -100,7 +127,7 @@ IntelFirmware: Intel boot failed
 
 ## 安装（OpenCore）
 
-1. 取 Actions 构建产物 `IntelBTUnified-1.7.0-AX201.zip`
+1. 取 Actions 构建产物 `IntelBTUnified-1.8.0-AX201.zip`
 2. 删除 EFI 里的：`IntelBluetoothFirmware.kext`、`IntelBTPatcher.kext`、`BlueToolFixup.kext`、`IntelBluetoothInjector.kext`、`IntelBluetoothBundle.kext`（以及任何合体版）
 3. 把 `IntelBTUnified.kext` 放入 `EFI/OC/Kexts/`，在 `config.plist → Kernel → Add` 中**放在 Lilu 之后**
 4. NVRAM 建议注入（Tahoe 蓝牙重新初始化）：
@@ -112,6 +139,7 @@ IntelFirmware: Intel boot failed
    - `ioreg -l -rc IntelBluetoothFirmware | grep fw_name` → `ibt-19-32-4.sfi`（热重启后显示 `(already running)` 属正常）
    - `system_profiler SPBluetoothDataType` → State: On
    - OTA 升级：系统设置里直接检查软件更新应能正常验证
+   - 冷启动连接异常时跑 `sh tools/bt-diag.sh`，把输出留档
 
 若日志出现 `Intel boot failed` 且刷屏，说明灌进去的固件与芯片不符：立刻移除本 kext，把 `dmesg` 里 `Bootloader revision` / `Firmware:` 那几行贴出来。
 
@@ -124,6 +152,7 @@ IntelFirmware: Intel boot failed
 | `-ibtbeta` | 允许比声明上限更新的 macOS |
 | `-ibtota` | 完全关闭 bluetoothd/BlueTool 补丁（关闭后蓝牙不启动，仅排障） |
 | `-ibtplegacy` | 恢复老式无条件补丁（等价 BlueToolFixup，会破坏 OTA 校验） |
+| `-ibtleoff` | 关闭 LE Read Remote Features 事件改写（隔离「连不上又没崩溃」用） |
 | `-btlfxboardid` / `-btlfxallowanyaddr` / `-btlfxnvramcheck` | 同 BlueToolFixup 原有开关 |
 
 内核日志只出现在 `sudo dmesg`（`log show` 看不到），可加 `msgbuf=1048576` 扩大缓冲区。
