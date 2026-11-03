@@ -37,7 +37,7 @@ A1 B1 A2 B2 A3 B3      <- 三个事件一组，每组带同一个 connection han
 | `status != 0` 时直接丢弃 slot | 失败事件不该被改写 |
 | handle 空闲 256 个事件后自动过期；`HCI_Reset` 清空全表 | 防止 handle 复用继承错位状态 |
 | 假事件写入改为**局部拷贝** | 两条连接并发完成时不共享可变缓冲 |
-| 新增 `le h=0xNNN ...` 日志（每 boot 前 16 条，**1.8.1 起仅 `-ibtpdbg` 调试模式输出**） | 需要时能看到某个 handle 是否走完三段 |
+| 新增 `le h=0xNNN ...` 日志（每 boot 前 16 条，1.9.0 起需 `-ibtpdbg`） | 需要时能看到某个 handle 是否走完三段 |
 | 新增 `[PATCH] event pipe captured / mismatch` 日志 | 若捕获到的 pipe 不是实际收发事件的那个，此前会静默失效 |
 | 新增 `-ibtleoff` | 关掉 LE 改写做隔离验证 |
 
@@ -54,7 +54,7 @@ A1 B1 A2 B2 A3 B3      <- 三个事件一组，每组带同一个 connection han
 
 ### 1.8.1：把诊断日志移出 USB 热路径
 
-功能与 1.8.0 完全相同。1.8.0 为了排查，把 LE 三段的日志放在 `IOUSBHostPipe::io` 完成回调里，而 Lilu 的 `SYSLOG` 是同步 `IOLog`，放在 USB 事件回调用属于不必要的开销。1.8.1 把这些打印降为 `DBGLOG`（只有加 `-ibtpdbg` / `-btlfxdbg` 才输出），成功路径不再刷任何日志，失败（随机地址命令被拒、slot 表满）仍然会报一次。
+功能与 1.8.0 完全相同。1.8.0 为了排查，把 LE 三段的日志放在 `IOUSBHostPipe::io` 完成回调里，而 Lilu 的 `SYSLOG` 是同步 `IOLog`，放在 USB 事件回调用属于不必要的开销。1.8.1 把这些打印从 `SYSLOG` 撤下。**注意：当时的做法是改 `DBGLOG`，而 Lilu 的 `DBGLOG` 在非 DEBUG 构建里会被编译成空语句，字符串根本不进二进制，也就是说那批日志实际是被删掉了，加 `-ibtpdbg` 也看不到。** 1.9.0 改为自建 `DIAGLOG`：运行时判断 `diagEnabled`，默认不打印，加 `-ibtpdbg` 才输出，热路径上只有一个 bool 比较。
 
 ## 1.6.0 / 1.7.0：睡眠唤醒 SIGBUS 的排查（补丁是必需的）
 
@@ -167,6 +167,7 @@ IntelFirmware: Intel boot failed
 | `-ibtplegacy` | 恢复老式无条件补丁（等价 BlueToolFixup，会破坏 OTA 校验） |
 | `-ibtleoff` | 关闭 LE Read Remote Features 事件改写（隔离「连不上又没崩溃」用） |
 | `-ibtphy2m` | 假 PHY Update 恢复上报 LE 2M（1.9.0 之前的行为，仅用于对照） |
+| `-ibtpdbg` | 打开 LE 槽位/事件改写诊断日志（默认关闭，热路径零输出） |
 | `-btlfxboardid` / `-btlfxallowanyaddr` / `-btlfxnvramcheck` | 同 BlueToolFixup 原有开关 |
 
 内核日志只出现在 `sudo dmesg`（`log show` 看不到），可加 `msgbuf=1048576` 扩大缓冲区。

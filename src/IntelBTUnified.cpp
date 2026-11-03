@@ -43,6 +43,12 @@
 #include "Devices.h"
 
 #define MODULE_IBTP  "ibtp"
+
+// Lilu 的 DBGLOG 在非 DEBUG 构建里被编译成空语句（字符串根本不进二进制），所以
+// "-ibtpdbg 能打开日志"是假的。这里用运行时开关代替：默认不打印，加 -ibtpdbg 才输出。
+// 判断放在 pluginStart 里做一次，热路径上只有一个 bool 比较。
+static bool diagEnabled = false;
+#define DIAGLOG(module, str, ...) do { if (diagEnabled) SYSLOG(module, str, ## __VA_ARGS__); } while (0)
 #define MODULE_BTLFX "btlfx"
 
 #pragma mark - Intel HCI: direccion aleatoria + eventos LE (antes IntelBTPatcher)
@@ -139,7 +145,7 @@ static void leClearAllSlots(const char *why) {
         }
     }
     if (__atomic_exchange_n(&leActiveSlots, 0, __ATOMIC_SEQ_CST) && any)
-        DBGLOG(MODULE_IBTP, "le slots cleared (%s)", why);
+        DIAGLOG(MODULE_IBTP, "le slots cleared (%s)", why);
 }
 
 static void leRegisterSlot(uint16_t handle) {
@@ -156,7 +162,7 @@ static void leRegisterSlot(uint16_t handle) {
             leSlots[i].stage = 0;
             leSlots[i].idle = 0;
             __atomic_add_fetch(&leActiveSlots, 1, __ATOMIC_SEQ_CST);
-            DBGLOG(MODULE_IBTP, "le slot +h=0x%03x (active %d)", handle, leActiveSlots);
+            DIAGLOG(MODULE_IBTP, "le slot +h=0x%03x (active %d)", handle, leActiveSlots);
             return;
         }
     }
@@ -169,7 +175,7 @@ static void leRegisterSlot(uint16_t handle) {
         if (leSlots[i].idle > leSlots[victim].idle)
             victim = i;
     if (leLogBudget-- > 0)
-        DBGLOG(MODULE_IBTP, "le slot evict h=0x%03x (idle %u) -> h=0x%03x", leSlots[victim].handle, leSlots[victim].idle, handle);
+        DIAGLOG(MODULE_IBTP, "le slot evict h=0x%03x (idle %u) -> h=0x%03x", leSlots[victim].handle, leSlots[victim].idle, handle);
     leSlots[victim].handle = handle;
     leSlots[victim].stage = 0;
     leSlots[victim].idle = 0;
@@ -224,7 +230,7 @@ static void sendRandomAddress(void *that, IOService *provider, unsigned int time
         desc->release();
     }
     if (ret == kIOReturnSuccess) {
-        DBGLOG(MODULE_IBTP, "random address HCI sent");
+        DIAGLOG(MODULE_IBTP, "random address HCI sent");
     } else {
         SYSLOG(MODULE_IBTP, "[PATCH] random address HCI failed: 0x%x (will retry on next scan)", ret);
     }
@@ -282,7 +288,7 @@ static void asyncIOCompletion(void* owner, void* parameter, IOReturn status, uin
                             slot->stage = 1;
                             slot->idle = 0;
                             if (leLogBudget-- > 0)
-                                DBGLOG(MODULE_IBTP, "le h=0x%03x features complete (real, pass)", handle);
+                                DIAGLOG(MODULE_IBTP, "le h=0x%03x features complete (real, pass)", handle);
                         } else if (slot->stage == 1) {
                             uint8_t phy[sizeof(fakePhyUpdateCompleteEvent)];
                             memcpy(phy, fakePhyUpdateCompleteEvent, sizeof(phy));
@@ -295,7 +301,7 @@ static void asyncIOCompletion(void* owner, void* parameter, IOReturn status, uin
                             slot->stage = 2;
                             slot->idle = 0;
                             if (leLogBudget-- > 0)
-                                DBGLOG(MODULE_IBTP, "le h=0x%03x -> fake PHY Update", handle);
+                                DIAGLOG(MODULE_IBTP, "le h=0x%03x -> fake PHY Update", handle);
                         } else {
                             uint8_t dlc[sizeof(fakeDataLengthChangeEvent)];
                             memcpy(dlc, fakeDataLengthChangeEvent, sizeof(dlc));
@@ -304,7 +310,7 @@ static void asyncIOCompletion(void* owner, void* parameter, IOReturn status, uin
                             dataBuffer->writeBytes(0, dlc, sizeof(dlc));
                             bytesTransferred = 13;
                             if (leLogBudget-- > 0)
-                                DBGLOG(MODULE_IBTP, "le h=0x%03x -> fake Data Length Change (done)", handle);
+                                DIAGLOG(MODULE_IBTP, "le h=0x%03x -> fake Data Length Change (done)", handle);
                             slot->used = false;
                             __atomic_sub_fetch(&leActiveSlots, 1, __ATOMIC_SEQ_CST);
                         }
@@ -312,11 +318,11 @@ static void asyncIOCompletion(void* owner, void* parameter, IOReturn status, uin
                         // Status != 0: la lectura fallo, no hay features que reescribir.
                         slot->used = false;
                         __atomic_sub_fetch(&leActiveSlots, 1, __ATOMIC_SEQ_CST);
-                        DBGLOG(MODULE_IBTP, "le h=0x%03x features failed (status %u), slot dropped", handle, eventStatus);
+                        DIAGLOG(MODULE_IBTP, "le h=0x%03x features failed (status %u), slot dropped", handle, eventStatus);
                     } else {
                         // Evento sin slot registrado: llega de una conexion para la que no
                         // se pidieron lecturas extra. Se deja pasar sin tocar.
-                        DBGLOG(MODULE_IBTP, "le h=0x%03x features event without slot, untouched", handle);
+                        DIAGLOG(MODULE_IBTP, "le h=0x%03x features event without slot, untouched", handle);
                     }
                 }
                 // Caducar slots que dejaron de recibir eventos (p.ej. conexion abortada o
@@ -328,7 +334,7 @@ static void asyncIOCompletion(void* owner, void* parameter, IOReturn status, uin
                         if (!leSlots[i].used || leSlots[i].handle == curHandle)
                             continue;
                         if (++leSlots[i].idle > LE_SLOT_IDLE_LIMIT) {
-                            DBGLOG(MODULE_IBTP, "le slot h=0x%03x expired (idle)", leSlots[i].handle);
+                            DIAGLOG(MODULE_IBTP, "le slot h=0x%03x expired (idle)", leSlots[i].handle);
                             leSlots[i].used = false;
                             __atomic_sub_fetch(&leActiveSlots, 1, __ATOMIC_SEQ_CST);
                         }
@@ -358,7 +364,7 @@ static IOReturn newAsyncIO(void *that, IOMemoryDescriptor* dataBuffer, uint32_t 
             // Diagnostico de arranque en frio: si el pipe capturado no es el que usa el
             // controlador, la reescritura LE no se aplica a nada y el sintoma es
             // exactamente "bluetooth encendido pero no conecta, sin crash".
-            DBGLOG(MODULE_IBTP, "event pipe mismatch: captured %p, io on %p (le fix inactive)", hookPipeInstance, that);
+            DIAGLOG(MODULE_IBTP, "event pipe mismatch: captured %p, io on %p (le fix inactive)", hookPipeInstance, that);
         }
     }
     return FunctionCast(newAsyncIO, oldAsyncIO)(that, dataBuffer, bytesTransferred, completion, completionTimeoutMs);
@@ -439,7 +445,7 @@ static IOReturn newHostDeviceRequest(void *that, IOService *provider, StandardUS
                 FunctionCast(newHostDeviceRequest, oldHostDeviceRequest)(that, provider, request, nullptr, descriptor, length, nullptr, timeout);
                 FunctionCast(newHostDeviceRequest, oldHostDeviceRequest)(that, provider, request, nullptr, descriptor, length, nullptr, timeout);
             }
-            DBGLOG(MODULE_IBTP, "opcode: 0x%04x len: %u wLength: %u async: %d", hdr->opcode, hdr->len, request.wLength, completion != nullptr);
+            DIAGLOG(MODULE_IBTP, "opcode: 0x%04x len: %u wLength: %u async: %d", hdr->opcode, hdr->len, request.wLength, completion != nullptr);
         }
     }
     return FunctionCast(newHostDeviceRequest, oldHostDeviceRequest)(that, provider, request, data, descriptor, length, completion, timeout);
@@ -697,6 +703,9 @@ static void processPatcher(KernelPatcher &patcher) {
 
 static void pluginStart() {
     SYSLOG("ibt", "start");
+    diagEnabled = checkKernelArgument("-ibtpdbg");
+    if (diagEnabled)
+        SYSLOG(MODULE_IBTP, "diagnostics ON (-ibtpdbg)");
     // 1.8.0: palanca de diagnostico. Si con -ibtleoff las conexiones dejan de fallar en
     // arranque en frio, el problema esta en la reescritura de eventos LE, no en el firmware.
     leRewriteDisabled = checkKernelArgument("-ibtleoff");
