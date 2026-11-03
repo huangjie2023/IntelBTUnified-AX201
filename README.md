@@ -37,11 +37,15 @@ A1 B1 A2 B2 A3 B3      <- 三个事件一组，每组带同一个 connection han
 | `status != 0` 时直接丢弃 slot | 失败事件不该被改写 |
 | handle 空闲 256 个事件后自动过期；`HCI_Reset` 清空全表 | 防止 handle 复用继承错位状态 |
 | 假事件写入改为**局部拷贝** | 两条连接并发完成时不共享可变缓冲 |
-| 新增 `[PATCH] le h=0xNNN ...` 日志（每 boot 前 16 条） | 能直接看到某个 handle 是否走完三段 |
+| 新增 `le h=0xNNN ...` 日志（每 boot 前 16 条，**1.8.1 起仅 `-ibtpdbg` 调试模式输出**） | 需要时能看到某个 handle 是否走完三段 |
 | 新增 `[PATCH] event pipe captured / mismatch` 日志 | 若捕获到的 pipe 不是实际收发事件的那个，此前会静默失效 |
 | 新增 `-ibtleoff` | 关掉 LE 改写做隔离验证 |
 
 排障脚本：`sh tools/bt-diag.sh`（只读，收集 kext 版本、补丁命中、固件日志、LE 改写、崩溃报告、控制器信息）。
+
+### 1.8.1：把诊断日志移出 USB 热路径
+
+功能与 1.8.0 完全相同。1.8.0 为了排查，把 LE 三段的日志放在 `IOUSBHostPipe::io` 完成回调里，而 Lilu 的 `SYSLOG` 是同步 `IOLog`，放在 USB 事件回调用属于不必要的开销。1.8.1 把这些打印降为 `DBGLOG`（只有加 `-ibtpdbg` / `-btlfxdbg` 才输出），成功路径不再刷任何日志，失败（随机地址命令被拒、slot 表满）仍然会报一次。
 
 ## 1.6.0 / 1.7.0：睡眠唤醒 SIGBUS 的排查（补丁是必需的）
 
@@ -127,7 +131,7 @@ IntelFirmware: Intel boot failed
 
 ## 安装（OpenCore）
 
-1. 取 Actions 构建产物 `IntelBTUnified-1.8.0-AX201.zip`
+1. 取 Actions 构建产物 `IntelBTUnified-1.8.1-AX201.zip`
 2. 删除 EFI 里的：`IntelBluetoothFirmware.kext`、`IntelBTPatcher.kext`、`BlueToolFixup.kext`、`IntelBluetoothInjector.kext`、`IntelBluetoothBundle.kext`（以及任何合体版）
 3. 把 `IntelBTUnified.kext` 放入 `EFI/OC/Kexts/`，在 `config.plist → Kernel → Add` 中**放在 Lilu 之后**
 4. NVRAM 建议注入（Tahoe 蓝牙重新初始化）：

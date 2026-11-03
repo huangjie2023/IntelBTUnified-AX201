@@ -212,7 +212,11 @@ static void sendRandomAddress(void *that, IOService *provider, unsigned int time
         }
         desc->release();
     }
-    SYSLOG(MODULE_IBTP, "[PATCH] Sending random address HCI: 0x%x", ret);
+    if (ret == kIOReturnSuccess) {
+        DBGLOG(MODULE_IBTP, "random address HCI sent");
+    } else {
+        SYSLOG(MODULE_IBTP, "[PATCH] random address HCI failed: 0x%x (will retry on next scan)", ret);
+    }
     if (ret != kIOReturnSuccess)
         __atomic_store_n(&randomAddrSent, 0, __ATOMIC_SEQ_CST);  // reintentar en el siguiente scan
 }
@@ -263,7 +267,7 @@ static void asyncIOCompletion(void* owner, void* parameter, IOReturn status, uin
                             slot->stage = 1;
                             slot->idle = 0;
                             if (leLogBudget-- > 0)
-                                SYSLOG(MODULE_IBTP, "[PATCH] le h=0x%03x features complete (real, pass)", handle);
+                                DBGLOG(MODULE_IBTP, "le h=0x%03x features complete (real, pass)", handle);
                         } else if (slot->stage == 1) {
                             uint8_t phy[sizeof(fakePhyUpdateCompleteEvent)];
                             memcpy(phy, fakePhyUpdateCompleteEvent, sizeof(phy));
@@ -274,7 +278,7 @@ static void asyncIOCompletion(void* owner, void* parameter, IOReturn status, uin
                             slot->stage = 2;
                             slot->idle = 0;
                             if (leLogBudget-- > 0)
-                                SYSLOG(MODULE_IBTP, "[PATCH] le h=0x%03x -> fake PHY Update", handle);
+                                DBGLOG(MODULE_IBTP, "le h=0x%03x -> fake PHY Update", handle);
                         } else {
                             uint8_t dlc[sizeof(fakeDataLengthChangeEvent)];
                             memcpy(dlc, fakeDataLengthChangeEvent, sizeof(dlc));
@@ -283,7 +287,7 @@ static void asyncIOCompletion(void* owner, void* parameter, IOReturn status, uin
                             dataBuffer->writeBytes(0, dlc, sizeof(dlc));
                             bytesTransferred = 13;
                             if (leLogBudget-- > 0)
-                                SYSLOG(MODULE_IBTP, "[PATCH] le h=0x%03x -> fake Data Length Change (done)", handle);
+                                DBGLOG(MODULE_IBTP, "le h=0x%03x -> fake Data Length Change (done)", handle);
                             slot->used = false;
                             __atomic_sub_fetch(&leActiveSlots, 1, __ATOMIC_SEQ_CST);
                         }
@@ -337,7 +341,7 @@ static IOReturn newAsyncIO(void *that, IOMemoryDescriptor* dataBuffer, uint32_t 
             // Diagnostico de arranque en frio: si el pipe capturado no es el que usa el
             // controlador, la reescritura LE no se aplica a nada y el sintoma es
             // exactamente "bluetooth encendido pero no conecta, sin crash".
-            SYSLOG(MODULE_IBTP, "[PATCH] event pipe mismatch: captured %p, io on %p (le fix inactive)", hookPipeInstance, that);
+            DBGLOG(MODULE_IBTP, "event pipe mismatch: captured %p, io on %p (le fix inactive)", hookPipeInstance, that);
         }
     }
     return FunctionCast(newAsyncIO, oldAsyncIO)(that, dataBuffer, bytesTransferred, completion, completionTimeoutMs);
