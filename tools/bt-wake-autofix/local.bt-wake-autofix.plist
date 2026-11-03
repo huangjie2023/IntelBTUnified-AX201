@@ -1,0 +1,34 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>local.bt-wake-autofix</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/bin/sh</string>
+        <string>/usr/local/lib/bt-autofix/bt-wake-autofix.sh</string>
+    </array>
+
+    <!-- 冷启动时先跑一次，把当前 bluetoothd 的 PID 登记下来，之后才能识别"重启过" -->
+    <key>RunAtLoad</key>
+    <true/>
+
+    <!-- 每 30 秒看一眼 PID；脚本内部最长阻塞 20 秒，不会叠加 -->
+    <key>StartInterval</key>
+    <integer>30</integer>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>/usr/bin:/bin:/usr/sbin:/sbin:/usr/local/bin</string>
+    </dict>
+
+    <key>StandardErrorPath</key>
+    <string>/var/log/bt-autofix.err</string>
+
+    <key>ProcessType</key>
+    <string>Background</string>
+</dict>
+</plist>
