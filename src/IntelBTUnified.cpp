@@ -248,62 +248,68 @@ static void asyncIOCompletion(void* owner, void* parameter, IOReturn status, uin
             if (dataBuffer->getLength() > 0 && (getKernelVersion() < KernelVersion::Sequoia || !dataBuffer->prepare(kIODirectionInOut))) {
                 dataBuffer->readBytes(0, buffer, allocLen);
                 HciEventHdr *hdr = (HciEventHdr *)buffer;
-                if (hdr->evt == HCI_EVT_LE_META && hdr->data[0] == HCI_EVT_LE_META_READ_REMOTE_FEATURES_COMPLETE) {
-                    if (hdr->len >= 12) {
-                        uint16_t handle = leHandleOfEvent(hdr);
-                        uint8_t eventStatus = hdr->data[1];
-                        LeSlot *slot = leFindSlot(handle);
-                        if (slot && eventStatus == 0) {
-                            // El primer evento de cada conexion pasa intacto (es el features
-                            // complete real); los dos siguientes se reescriben.
-                            if (slot->stage == 0) {
-                                slot->stage = 1;
-                                slot->idle = 0;
-                                if (leLogBudget-- > 0)
-                                    SYSLOG(MODULE_IBTP, "[PATCH] le h=0x%03x features complete (real, pass)", handle);
-                            } else if (slot->stage == 1) {
-                                uint8_t phy[sizeof(fakePhyUpdateCompleteEvent)];
-                                memcpy(phy, fakePhyUpdateCompleteEvent, sizeof(phy));
-                                phy[4] = hdr->data[2];
-                                phy[5] = hdr->data[3];
-                                dataBuffer->writeBytes(0, phy, sizeof(phy));
-                                bytesTransferred = 8;
-                                slot->stage = 2;
-                                slot->idle = 0;
-                                if (leLogBudget-- > 0)
-                                    SYSLOG(MODULE_IBTP, "[PATCH] le h=0x%03x -> fake PHY Update", handle);
-                            } else {
-                                uint8_t dlc[sizeof(fakeDataLengthChangeEvent)];
-                                memcpy(dlc, fakeDataLengthChangeEvent, sizeof(dlc));
-                                dlc[3] = hdr->data[2];
-                                dlc[4] = hdr->data[3];
-                                dataBuffer->writeBytes(0, dlc, sizeof(dlc));
-                                bytesTransferred = 13;
-                                if (leLogBudget-- > 0)
-                                    SYSLOG(MODULE_IBTP, "[PATCH] le h=0x%03x -> fake Data Length Change (done)", handle);
-                                slot->used = false;
-                                __atomic_sub_fetch(&leActiveSlots, 1, __ATOMIC_SEQ_CST);
-                            }
-                        } else if (slot) {
-                            // Status != 0: la lectura fallo, no hay features que reescribir.
+                const bool isLeFeatures = hdr->evt == HCI_EVT_LE_META &&
+                                          hdr->data[0] == HCI_EVT_LE_META_READ_REMOTE_FEATURES_COMPLETE &&
+                                          hdr->len >= 12;
+                const uint16_t curHandle = isLeFeatures ? leHandleOfEvent(hdr) : 0xFFFF;
+                if (isLeFeatures) {
+                    uint16_t handle = curHandle;
+                    uint8_t eventStatus = hdr->data[1];
+                    LeSlot *slot = leFindSlot(handle);
+                    if (slot && eventStatus == 0) {
+                        // El primer evento de cada conexion pasa intacto (es el features
+                        // complete real); los dos siguientes se reescriben.
+                        if (slot->stage == 0) {
+                            slot->stage = 1;
+                            slot->idle = 0;
+                            if (leLogBudget-- > 0)
+                                SYSLOG(MODULE_IBTP, "[PATCH] le h=0x%03x features complete (real, pass)", handle);
+                        } else if (slot->stage == 1) {
+                            uint8_t phy[sizeof(fakePhyUpdateCompleteEvent)];
+                            memcpy(phy, fakePhyUpdateCompleteEvent, sizeof(phy));
+                            phy[4] = hdr->data[2];
+                            phy[5] = hdr->data[3];
+                            dataBuffer->writeBytes(0, phy, sizeof(phy));
+                            bytesTransferred = 8;
+                            slot->stage = 2;
+                            slot->idle = 0;
+                            if (leLogBudget-- > 0)
+                                SYSLOG(MODULE_IBTP, "[PATCH] le h=0x%03x -> fake PHY Update", handle);
+                        } else {
+                            uint8_t dlc[sizeof(fakeDataLengthChangeEvent)];
+                            memcpy(dlc, fakeDataLengthChangeEvent, sizeof(dlc));
+                            dlc[3] = hdr->data[2];
+                            dlc[4] = hdr->data[3];
+                            dataBuffer->writeBytes(0, dlc, sizeof(dlc));
+                            bytesTransferred = 13;
+                            if (leLogBudget-- > 0)
+                                SYSLOG(MODULE_IBTP, "[PATCH] le h=0x%03x -> fake Data Length Change (done)", handle);
                             slot->used = false;
                             __atomic_sub_fetch(&leActiveSlots, 1, __ATOMIC_SEQ_CST);
-                            DBGLOG(MODULE_IBTP, "le h=0x%03x features failed (status %u), slot dropped", handle, eventStatus);
-                        } else {
-                            // Evento sin slot registrado: llega de una conexion para la que no
-                            // se pidieron lecturas extra. Se deja pasar sin tocar.
-                            DBGLOG(MODULE_IBTP, "le h=0x%03x features event without slot, untouched", handle);
                         }
-                        // Caducar slots que dejaron de recibir eventos (p.ej. conexion abortada),
-                        // para que un handle reutilizado no herede una etapa desplazada.
-                        for (int i = 0; i < LE_SLOT_COUNT; i++) {
-                            if (!leSlots[i].used || leSlots[i].handle == handle)
-                                continue;
-                            if (++leSlots[i].idle > LE_SLOT_IDLE_LIMIT) {
-                                DBGLOG(MODULE_IBTP, "le slot h=0x%03x expired (idle)", leSlots[i].handle);
-                                leSlots[i].used = false;
-                                __atomic_sub_fetch(&leActiveSlots, 1, __ATOMIC_SEQ_CST);
-                            }
+                    } else if (slot) {
+                        // Status != 0: la lectura fallo, no hay features que reescribir.
+                        slot->used = false;
+                        __atomic_sub_fetch(&leActiveSlots, 1, __ATOMIC_SEQ_CST);
+                        DBGLOG(MODULE_IBTP, "le h=0x%03x features failed (status %u), slot dropped", handle, eventStatus);
+                    } else {
+                        // Evento sin slot registrado: llega de una conexion para la que no
+                        // se pidieron lecturas extra. Se deja pasar sin tocar.
+                        DBGLOG(MODULE_IBTP, "le h=0x%03x features event without slot, untouched", handle);
+                    }
+                }
+                // Caducar slots que dejaron de recibir eventos (p.ej. conexion abortada o
+                // lecturas extra rechazadas por el controlador). Se cuenta con CUALQUIER
+                // evento, no solo con features complete: si no llega ninguno mas, el slot
+                // quedaria armado para siempre y un handle reutilizado heredaria la etapa.
+                if (leActiveSlots > 0) {
+                    for (int i = 0; i < LE_SLOT_COUNT; i++) {
+                        if (!leSlots[i].used || leSlots[i].handle == curHandle)
+                            continue;
+                        if (++leSlots[i].idle > LE_SLOT_IDLE_LIMIT) {
+                            DBGLOG(MODULE_IBTP, "le slot h=0x%03x expired (idle)", leSlots[i].handle);
+                            leSlots[i].used = false;
+                            __atomic_sub_fetch(&leActiveSlots, 1, __ATOMIC_SEQ_CST);
                         }
                     }
                 }
