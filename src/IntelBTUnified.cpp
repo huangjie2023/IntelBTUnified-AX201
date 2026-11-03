@@ -113,6 +113,8 @@ static LeSlot leSlots[LE_SLOT_COUNT];
 static int  leActiveSlots = 0;
 // -ibtleoff: desactiva por completo la reescritura (palanca de diagnostico).
 static bool leRewriteDisabled = false;
+// PHY que se reporta en el fake PHY Update Complete (0x01 = LE 1M, 0x02 = LE 2M).
+static uint8_t fakePhyValue = 0x01;
 // Presupuesto de lineas de log para no inundar el arranque.
 static int  leLogBudget = 16;
 
@@ -158,10 +160,19 @@ static void leRegisterSlot(uint16_t handle) {
             return;
         }
     }
-    // Tabla llena: hay mas conexiones simultaneas de las previstas. Mejor no tocar nada
-    // que reescribir a ciegas; se registra para que el fallo sea visible en el log.
+    // Tabla llena: desalojar el slot mas inactivo y quedarse con la conexion nueva.
+    // Dejar la nueva sin registrar es peor: sus dos eventos extra llegarian intactos y
+    // bluetoothd veria tres "features complete" para una sola peticion, que es el tipo
+    // de incoherencia que dispara el aborto en la reconexion tras el reposo.
+    int victim = 0;
+    for (int i = 1; i < LE_SLOT_COUNT; i++)
+        if (leSlots[i].idle > leSlots[victim].idle)
+            victim = i;
     if (leLogBudget-- > 0)
-        SYSLOG(MODULE_IBTP, "[PATCH] le slot table full, h=0x%03x left untouched (connect may stall)", handle);
+        DBGLOG(MODULE_IBTP, "le slot evict h=0x%03x (idle %u) -> h=0x%03x", leSlots[victim].handle, leSlots[victim].idle, handle);
+    leSlots[victim].handle = handle;
+    leSlots[victim].stage = 0;
+    leSlots[victim].idle = 0;
 }
 
 static void makeRandomAddressCommand() {
@@ -234,7 +245,11 @@ static void sendRandomAddress(void *that, IOService *provider, unsigned int time
 
 // Plantillas; cada reescritura usa una copia local para no compartir bytes mutables
 // entre conexiones que se completan a la vez.
-static const uint8_t fakePhyUpdateCompleteEvent[8] = {0x3E, 0x06, 0x0C, 0x00, 0x00, 0x00, 0x02, 0x02};
+// El controlador nunca ha recibido HCI_LE_Set_PHY, asi que sigue en LE 1M. El upstream
+// reportaba 2M/2M: bluetoothd creia la conexion ya subida a 2M mientras el chip seguia
+// en 1M, y esa incoherencia es la sospechosa del aborto a los ~16 s tras despertar.
+// 1.9.0 informa 1M/1M (estado real). -ibtphy2m recupera el comportamiento antiguo.
+static const uint8_t fakePhyUpdateCompleteEvent[8] = {0x3E, 0x06, 0x0C, 0x00, 0x00, 0x00, 0x01, 0x01};
 // LE Data Length Change (LE Meta subevent 0x07, sin byte de estado -> handle en [3][4]).
 // bluetoothd se queda en LE_READY_WAIT_FOR_LENGTH tras el PHY hasta ver esto.
 // 27 octets / 328us tx+rx.
@@ -273,6 +288,8 @@ static void asyncIOCompletion(void* owner, void* parameter, IOReturn status, uin
                             memcpy(phy, fakePhyUpdateCompleteEvent, sizeof(phy));
                             phy[4] = hdr->data[2];
                             phy[5] = hdr->data[3];
+                            phy[6] = fakePhyValue;
+                            phy[7] = fakePhyValue;
                             dataBuffer->writeBytes(0, phy, sizeof(phy));
                             bytesTransferred = 8;
                             slot->stage = 2;
@@ -685,6 +702,12 @@ static void pluginStart() {
     leRewriteDisabled = checkKernelArgument("-ibtleoff");
     if (leRewriteDisabled)
         SYSLOG(MODULE_IBTP, "[PATCH] LE event rewriting OFF (-ibtleoff)");
+    // 1.9.0: por defecto se informa LE 1M, que es el PHY real del controlador; -ibtphy2m
+    // recupera el 2M/2M del upstream para poder comparar.
+    if (checkKernelArgument("-ibtphy2m")) {
+        fakePhyValue = 0x02;
+        SYSLOG(MODULE_IBTP, "fake PHY Update reports LE 2M (-ibtphy2m, legacy behaviour)");
+    }
     lilu.onKextLoadForce(&kextIOUSBHost, 1,
         [](void *, KernelPatcher &patcher, size_t index, mach_vm_address_t address, size_t size) {
             processUSBHost(patcher, index, address, size);

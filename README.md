@@ -43,6 +43,15 @@ A1 B1 A2 B2 A3 B3      <- 三个事件一组，每组带同一个 connection han
 
 排障脚本：`sh tools/bt-diag.sh`（只读，收集 kext 版本、补丁命中、固件日志、LE 改写、崩溃报告、控制器信息）。
 
+### 1.9.0：唤醒后 bluetoothd 断言（EXC_GUARD）的两处修正
+
+现象：合盖睡眠唤醒后 bluetoothd 在约 16 秒时 `EXC_GUARD / GUARD_TYPE_USER / namespc 18 / reason 2` 主动终止，随后 launchd 拉起、蓝牙显示关闭，手动开启即恢复。四次样本中三次发生、一次未发生，且 `Time Since Wake` 恒为 18 秒、崩溃栈 6 帧偏移完全一致——固定超时后主动断言，不是随机内存故障。
+
+1. **假 PHY Update 谎报 2M**。`fakePhyUpdateCompleteEvent` 沿用了上游的 `tx=LE 2M, rx=LE 2M`，但驱动从未下发 `HCI_LE_Set_PHY`，控制器实际仍在 LE 1M。bluetoothd 认为链路已升级、芯片仍在 1M，这条不一致在唤醒重连时最容易暴露。1.9.0 改为上报 `LE 1M`（真实值）。`-ibtphy2m` 可恢复旧行为用于对照。
+2. **槽位表满时原样放行**。1.8.0 的做法是表满就不注册，该 handle 的三个 `features complete` 会全部交给 bluetoothd（它只请求了一次）。1.9.0 改为淘汰 `idle` 最大的槽位、保留新连接。
+
+对照方法：默认（1M）跑几轮睡眠；若仍崩，加 `-ibtphy2m` 再跑，两者都崩则加 `-ibtleoff` 判断是否与 LE 改写有关。
+
 ### 1.8.1：把诊断日志移出 USB 热路径
 
 功能与 1.8.0 完全相同。1.8.0 为了排查，把 LE 三段的日志放在 `IOUSBHostPipe::io` 完成回调里，而 Lilu 的 `SYSLOG` 是同步 `IOLog`，放在 USB 事件回调用属于不必要的开销。1.8.1 把这些打印降为 `DBGLOG`（只有加 `-ibtpdbg` / `-btlfxdbg` 才输出），成功路径不再刷任何日志，失败（随机地址命令被拒、slot 表满）仍然会报一次。
@@ -131,7 +140,7 @@ IntelFirmware: Intel boot failed
 
 ## 安装（OpenCore）
 
-1. 取 Actions 构建产物 `IntelBTUnified-1.8.1-AX201.zip`
+1. 取 Actions 构建产物 `IntelBTUnified-1.9.0-AX201.zip`
 2. 删除 EFI 里的：`IntelBluetoothFirmware.kext`、`IntelBTPatcher.kext`、`BlueToolFixup.kext`、`IntelBluetoothInjector.kext`、`IntelBluetoothBundle.kext`（以及任何合体版）
 3. 把 `IntelBTUnified.kext` 放入 `EFI/OC/Kexts/`，在 `config.plist → Kernel → Add` 中**放在 Lilu 之后**
 4. NVRAM 建议注入（Tahoe 蓝牙重新初始化）：
@@ -157,6 +166,7 @@ IntelFirmware: Intel boot failed
 | `-ibtota` | 完全关闭 bluetoothd/BlueTool 补丁（关闭后蓝牙不启动，仅排障） |
 | `-ibtplegacy` | 恢复老式无条件补丁（等价 BlueToolFixup，会破坏 OTA 校验） |
 | `-ibtleoff` | 关闭 LE Read Remote Features 事件改写（隔离「连不上又没崩溃」用） |
+| `-ibtphy2m` | 假 PHY Update 恢复上报 LE 2M（1.9.0 之前的行为，仅用于对照） |
 | `-btlfxboardid` / `-btlfxallowanyaddr` / `-btlfxnvramcheck` | 同 BlueToolFixup 原有开关 |
 
 内核日志只出现在 `sudo dmesg`（`log show` 看不到），可加 `msgbuf=1048576` 扩大缓冲区。
