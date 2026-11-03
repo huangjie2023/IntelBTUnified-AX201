@@ -11,6 +11,10 @@
 //      parches son PROCESS-SCOPED: solo se aplican cuando el propio proceso
 //      bluetoothd / BlueTool valida sus paginas, de modo que softwareupdated
 //      ve los binarios originales y la actualizacion OTA de macOS no falla.
+//  Desde 1.6.0 estos parches vienen DESACTIVADOS: escribir dentro de la pagina
+//  descomprimida de un binario decmpfs del volumen de sistema provoca
+//  "APFS compressed data hash mismatch" y SIGBUS en bluetoothd tras el reposo.
+//  Se activan con -ibtpatch (por proceso) o -ibtplegacy (antiguo).
 //  El driver que carga el firmware (IntelBluetoothFirmware) vive en el mismo
 //  bundle. Solo se incluye firmware AX201 (8087:0026, gen2, ibt-17-*/ibt-18-*).
 //
@@ -365,8 +369,19 @@ static const uint8_t kSkipInternalControllerNVRAMCheckPatched13_3[] = {
 static bool shouldPatchBoardId = false;
 static bool shouldPatchAddress = false;
 static bool shouldPatchNvramCheck = false;
-// OTA: desactiva por completo el parcheo cs_validate (boot-arg -ibtota).
-static bool disableCsPatching = false;
+// 1.6.0: el parcheo de cs_validate queda DESACTIVADO por defecto.
+//
+// Motivo (SIGBUS en reposo -> reanudacion, macOS 26.7.2): cs_validate_page
+// entrega la pagina ya descomprimida de un fichero decmpfs (/usr/sbin/bluetoothd
+// esta comprimido en el volumen de sistema). findAndReplace() escribe dentro de
+// esa pagina para parchear el codigo, y eso rompe la coherencia entre la pagina
+// y los datos comprimidos en cache: el siguiente pagein de ese bloque falla con
+// "APFS: compressed data hash mismatch" -> KERN_MEMORY_ERROR -> SIGBUS, y
+// bluetoothd entra en bucle de reinicio hasta el siguiente arranque.
+// Desactivarlo por defecto elimina de raiz ese camino; -ibtpatch lo reactiva
+// (parcheo por proceso, apto para OTA) y -ibtplegacy hace el parcheo antiguo
+// incondicional.
+static bool disableCsPatching = true;
 // Modo legado: parchea siempre (comportamiento BlueToolFixup original, rompe OTA).
 static bool legacyCsPatching = false;
 
@@ -463,8 +478,13 @@ static void patched_cs_validate_page(vnode_t vp, memory_object_t pager, memory_o
 }
 
 static void processPatcher(KernelPatcher &patcher) {
-    disableCsPatching = checkKernelArgument("-ibtota");
-    legacyCsPatching  = checkKernelArgument("-ibtplegacy");
+    const bool argOta    = checkKernelArgument("-ibtota");
+    const bool argPatch  = checkKernelArgument("-ibtpatch");
+    legacyCsPatching     = checkKernelArgument("-ibtplegacy");
+    // Por defecto NO se toca ninguna pagina de bluetoothd/BlueTool (ver comentario
+    // de disableCsPatching). -ibtpatch = parcheo por proceso; -ibtplegacy = antiguo.
+    disableCsPatching    = argOta || (!argPatch && !legacyCsPatching);
+    SYSLOG(MODULE_BTLFX, "cs_validate patching: %s", disableCsPatching ? "OFF (default)" : (legacyCsPatching ? "legacy (unconditional)" : "process-scoped"));
     if (getKernelVersion() >= KernelVersion::Sonoma) {
         shouldPatchBoardId = checkKernelArgument("-btlfxboardid");
     } else {
@@ -483,6 +503,10 @@ static void processPatcher(KernelPatcher &patcher) {
         shouldPatchAddress = checkKernelArgument("-btlfxallowanyaddr");
     if (getKernelVersion() <= KernelVersion::Sonoma)
         shouldPatchNvramCheck = checkKernelArgument("-btlfxnvramcheck");
+    if (disableCsPatching) {
+        SYSLOG(MODULE_BTLFX, "bluetoothd/BlueTool pages left untouched (add -ibtpatch to enable)");
+        return;
+    }
     KernelPatcher::RouteRequest csRoute("_cs_validate_page", patched_cs_validate_page, orig_cs_validate);
     if (!patcher.routeMultipleLong(KernelPatcher::KernelID, &csRoute, 1))
         SYSLOG(MODULE_BTLFX, "failed to route cs validation pages");

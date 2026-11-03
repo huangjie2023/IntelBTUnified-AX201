@@ -16,6 +16,33 @@
 
 > 上游 FAQ 明确：**macOS Monterey 及以后不要使用 `IntelBluetoothInjector.kext`**（"Do NOT use this Kext on macOS Monterey and newer"）。Monterey+ 靠的是驱动把 USB 设备改名为 `Bluetooth USB Host Controller` 来绕过 bluetoothd/BlueTool 的 board-id 检查，所以单 kext 里**不该**有那条 Broadcom transport 注入 personality。本包结构对应全量包的 `IntelBluetoothFirmware` + `IntelBTPatcher` + `BlueToolFixup`，不含 Injector。
 
+## 1.6.0：默认关闭 bluetoothd / BlueTool 内存补丁（睡眠唤醒 SIGBUS）
+
+现象：1.5.0 冷启动、连接均正常，**合盖唤醒后 bluetoothd 崩溃**，崩溃点落在 `/usr/sbin/bluetoothd` 的 `__TEXT` 里，且内核 triage 是：
+
+```
+APFS - Encountered a compressed data hash mismatch
+APFS - Pagein of compressed inode failed
+VM   - Filesystem pagein returned an error in vnode_pagein
+```
+
+两次崩溃的故障地址换算成文件偏移**完全相同**（`0x339B50`，页 `0x339000`），bluetoothd 进入 `consecutiveCrashCount` 递增的重启循环。
+
+根因在 `cs_validate_page` 钩子：系统卷上的 `bluetoothd` 是 **decmpfs 压缩文件**，`cs_validate_page` 拿到的 `data` 是「已解压的页」。`findAndReplace()` 直接在这张页上原地改字节，页与「压缩数据缓存 + 其哈希」就不再一致。该页被回收后再次 pagein 时校验失败 → `KERN_MEMORY_ERROR` → SIGBUS。睡眠唤醒时内核会大量回收代码页，所以问题只在唤醒后暴露。
+
+1.6.0 的处理：**默认不安装 `_cs_validate_page` 钩子**，任何页面都不碰。
+
+| boot-arg | 行为 |
+|---|---|
+| 无 | 完全不打补丁（默认，1.6.0 起） |
+| `-ibtpatch` | 打开按进程打补丁（旧 1.5.0 行为，OTA 友好，但仍有上面的风险） |
+| `-ibtplegacy` | 老式无条件打补丁（等价 BlueToolFixup） |
+| `-ibtota` | 强制关闭（保留兼容） |
+
+启动日志会明确写一行：`btlfx: cs_validate patching: OFF (default)`。
+
+> 如果关掉补丁后蓝牙仍能正常开关、连接（多数 Tahoe + AX201 场景如此），就永久这样用：**既没有唤醒崩溃，也不会再有 OTA 升级失败**。
+
 ## 1.5.0 瘦身（只针对这一台 AX201）
 
 目标机器固定为内置 AX201（USB 8087:0026，hw_variant 0x13，revision 32），不做通用化：
@@ -70,7 +97,7 @@ IntelFirmware: Intel boot failed
 
 ## 安装（OpenCore）
 
-1. 取 Actions 构建产物 `IntelBTUnified-1.5.0-AX201.zip`
+1. 取 Actions 构建产物 `IntelBTUnified-1.6.0-AX201.zip`
 2. 删除 EFI 里的：`IntelBluetoothFirmware.kext`、`IntelBTPatcher.kext`、`BlueToolFixup.kext`、`IntelBluetoothInjector.kext`、`IntelBluetoothBundle.kext`（以及任何合体版）
 3. 把 `IntelBTUnified.kext` 放入 `EFI/OC/Kexts/`，在 `config.plist → Kernel → Add` 中**放在 Lilu 之后**
 4. NVRAM 建议注入（Tahoe 蓝牙重新初始化）：
@@ -92,7 +119,9 @@ IntelFirmware: Intel boot failed
 | `-ibtoff` / `-ibtcompatoff` / `-btlfxoff` | 禁用本插件 |
 | `-ibtdbg` / `-ibtcompatdbg` / `-btlfxdbg` | 调试日志 |
 | `-ibtbeta` | 允许比声明上限更新的 macOS |
-| `-ibtota` | 完全关闭 bluetoothd/BlueTool 内存补丁（OTA 排障用，蓝牙会失效） |
+| （默认） | **不再打 bluetoothd/BlueTool 补丁**，1.6.0 起的默认行为 |
+| `-ibtpatch` | 按进程打补丁（1.5.0 的默认行为，可回退验证） |
+| `-ibtota` | 强制关闭补丁（与默认等价，保留兼容） |
 | `-ibtplegacy` | 恢复老式无条件补丁（等价 BlueToolFixup，会破坏 OTA 校验） |
 | `-btlfxboardid` / `-btlfxallowanyaddr` / `-btlfxnvramcheck` | 同 BlueToolFixup 原有开关 |
 
