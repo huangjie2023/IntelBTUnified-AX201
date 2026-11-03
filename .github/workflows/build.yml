@@ -23,11 +23,11 @@ jobs:
           cd build
           ls -la IntelBTUnified.kext/Contents
           file IntelBTUnified.kext/Contents/MacOS/IntelBTUnified
-          zip -qry IntelBTUnified-1.6.0-AX201.zip IntelBTUnified.kext
+          zip -qry IntelBTUnified-1.7.0-AX201.zip IntelBTUnified.kext
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
           name: IntelBTUnified-AX201
-          path: build/IntelBTUnified-1.6.0-AX201.zip
+          path: build/IntelBTUnified-1.7.0-AX201.zip
           if-no-files-found: error

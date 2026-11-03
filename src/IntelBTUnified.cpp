@@ -369,19 +369,11 @@ static const uint8_t kSkipInternalControllerNVRAMCheckPatched13_3[] = {
 static bool shouldPatchBoardId = false;
 static bool shouldPatchAddress = false;
 static bool shouldPatchNvramCheck = false;
-// 1.6.0: el parcheo de cs_validate queda DESACTIVADO por defecto.
-//
-// Motivo (SIGBUS en reposo -> reanudacion, macOS 26.7.2): cs_validate_page
-// entrega la pagina ya descomprimida de un fichero decmpfs (/usr/sbin/bluetoothd
-// esta comprimido en el volumen de sistema). findAndReplace() escribe dentro de
-// esa pagina para parchear el codigo, y eso rompe la coherencia entre la pagina
-// y los datos comprimidos en cache: el siguiente pagein de ese bloque falla con
-// "APFS: compressed data hash mismatch" -> KERN_MEMORY_ERROR -> SIGBUS, y
-// bluetoothd entra en bucle de reinicio hasta el siguiente arranque.
-// Desactivarlo por defecto elimina de raiz ese camino; -ibtpatch lo reactiva
-// (parcheo por proceso, apto para OTA) y -ibtplegacy hace el parcheo antiguo
-// incondicional.
-static bool disableCsPatching = true;
+// 1.6.0 desactivo estos parches por defecto; en 1.7.0 vuelven a estar activos
+// porque sin ellos el controlador no se enciende (macOS 26.7.2). El offset de
+// cada parche se registra para poder comprobar si la pagina que falla al
+// reanudar es una de las que modificamos.
+static bool disableCsPatching = false;
 // Modo legado: parchea siempre (comportamiento BlueToolFixup original, rompe OTA).
 static bool legacyCsPatching = false;
 
@@ -412,14 +404,32 @@ enum PatchId : uint32_t {
 };
 static uint32_t appliedPatches = 0;
 
-static inline void notePatch(PatchId id, const char *name, const char *path) {
+// 1.7.0: se registra el offset de fichero de cada parche aplicado. Sirve para
+// saber si la pagina que falla al reanudar (APFS compressed data hash mismatch)
+// es justamente una de las que tocamos nosotros o no.
+static uint64_t currentPageOffset = 0;
+
+static inline void notePatch(PatchId id, const char *name, const char *path, size_t off) {
     if ((__atomic_fetch_or(&appliedPatches, (uint32_t)id, __ATOMIC_RELAXED) & id) == 0)
-        SYSLOG(MODULE_BTLFX, "patched %s: %s", path, name);
+        SYSLOG(MODULE_BTLFX, "patched %s: %s (page 0x%llx, file offset 0x%llx)", path, name,
+               (unsigned long long)currentPageOffset, (unsigned long long)(currentPageOffset + off));
+}
+
+static inline size_t findPatternOffset(const void *haystack, size_t haystackSize, const void *needle, size_t findSize) {
+    if (!findSize || haystackSize < findSize)
+        return SIZE_MAX;
+    const uint8_t *h = static_cast<const uint8_t *>(haystack);
+    const uint8_t *n = static_cast<const uint8_t *>(needle);
+    for (size_t i = 0; i + findSize <= haystackSize; i++)
+        if (h[i] == n[0] && memcmp(h + i, n, findSize) == 0)
+            return i;
+    return SIZE_MAX;
 }
 
 static inline void searchAndPatch(PatchId id, const char *name, const void *haystack, size_t haystackSize, const char *path, const void *needle, size_t findSize, const void *patch, size_t replaceSize) {
+    size_t off = findPatternOffset(haystack, haystackSize, needle, findSize);
     if (KernelPatcher::findAndReplace(const_cast<void *>(haystack), haystackSize, needle, findSize, patch, replaceSize))
-        notePatch(id, name, path);
+        notePatch(id, name, path, off);
 }
 
 template <size_t findSize, size_t replaceSize>
@@ -428,8 +438,9 @@ static inline void searchAndPatch(PatchId id, const char *name, const void *hays
 }
 
 static inline void searchAndPatchWithMask(PatchId id, const char *name, const void *haystack, size_t haystackSize, const char *path, const void *needle, size_t findSize, const void *findMask, size_t findMaskSize, const void *patch, size_t replaceSize) {
+    size_t off = findPatternOffset(haystack, haystackSize, needle, findSize);
     if (KernelPatcher::findAndReplaceWithMask(const_cast<void *>(haystack), haystackSize, needle, findSize, findMask, findMaskSize, patch, replaceSize, nullptr, 0))
-        notePatch(id, name, path);
+        notePatch(id, name, path, off);
 }
 
 // PROCESS-SCOPED (OTA-safe): la pagina solo se parchea cuando el propio proceso
@@ -449,6 +460,7 @@ static void patched_cs_validate_page(vnode_t vp, memory_object_t pager, memory_o
     FunctionCast(patched_cs_validate_page, orig_cs_validate)(vp, pager, page_offset, data, validated_p, tainted_p, nx_p);
     if (disableCsPatching)
         return;
+    currentPageOffset = page_offset;
     static constexpr size_t dirLength = sizeof("/usr/sbin/")-1;
     if (vn_getpath(vp, path, &pathlen) == 0 && UNLIKELY(strncmp(path, "/usr/sbin/", dirLength) == 0)) {
         if (strcmp(path + dirLength, "BlueTool") == 0) {
@@ -479,12 +491,11 @@ static void patched_cs_validate_page(vnode_t vp, memory_object_t pager, memory_o
 
 static void processPatcher(KernelPatcher &patcher) {
     const bool argOta    = checkKernelArgument("-ibtota");
-    const bool argPatch  = checkKernelArgument("-ibtpatch");
     legacyCsPatching     = checkKernelArgument("-ibtplegacy");
-    // Por defecto NO se toca ninguna pagina de bluetoothd/BlueTool (ver comentario
-    // de disableCsPatching). -ibtpatch = parcheo por proceso; -ibtplegacy = antiguo.
-    disableCsPatching    = argOta || (!argPatch && !legacyCsPatching);
-    SYSLOG(MODULE_BTLFX, "cs_validate patching: %s", disableCsPatching ? "OFF (default)" : (legacyCsPatching ? "legacy (unconditional)" : "process-scoped"));
+    // Por defecto SI se parchea (sin los parches el controlador no se enciende);
+    // -ibtota desactiva todo, -ibtplegacy usa el modo antiguo incondicional.
+    disableCsPatching    = argOta;
+    SYSLOG(MODULE_BTLFX, "cs_validate patching: %s", disableCsPatching ? "OFF (-ibtota)" : (legacyCsPatching ? "legacy (unconditional)" : "process-scoped"));
     if (getKernelVersion() >= KernelVersion::Sonoma) {
         shouldPatchBoardId = checkKernelArgument("-btlfxboardid");
     } else {
