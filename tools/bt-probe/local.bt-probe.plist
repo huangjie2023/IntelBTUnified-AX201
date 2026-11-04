@@ -1,0 +1,37 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>local.bt-probe</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/bin/sh</string>
+        <string>/usr/local/lib/bt-probe/bt-probe.sh</string>
+    </array>
+
+    <!-- 开机就跑一次，把基线状态记下来，之后才能识别“变化” -->
+    <key>RunAtLoad</key>
+    <true/>
+
+    <!-- 每分钟采一次；三次 ioreg/pgrep 加起来不到 100ms -->
+    <key>StartInterval</key>
+    <integer>60</integer>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>/usr/bin:/bin:/usr/sbin:/sbin:/usr/local/bin</string>
+    </dict>
+
+    <key>StandardErrorPath</key>
+    <string>/var/log/bt-probe.err</string>
+
+    <!-- 不要让它在电池模式下被 App Nap 之类的机制节流 -->
+    <key>ProcessType</key>
+    <string>Background</string>
+    <key>LowPriorityIO</key>
+    <true/>
+</dict>
+</plist>

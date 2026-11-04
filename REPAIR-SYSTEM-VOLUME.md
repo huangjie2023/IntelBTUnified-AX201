@@ -108,6 +108,29 @@ done
 
 顺带核对一件事：同一次抓取里，`log show --last boot | grep -i "compressed data hash mismatch"` 有没有 `(bluetoothd)` **以外**的进程名。有 → 扩散了；只有 bluetoothd → 局部。
 
+### 实测结果（2026-11-04 12:38，`seq 700 1000` 逐页）
+
+**702 个页（覆盖 `0x2BC000–0x3E8000`，含报错的 `0x33E000` / 页 830 和 `0x370000` / 页 880），一个 `BAD page` 都没有。**
+
+按上面自己写的判定标准，这一条读下来是"盘清白、我判断错了"。但要老实补三句：
+
+1. **这个实验比我当初说的弱。** `dd` 走的是 `read(2)` → `apfs_vnop_read` → decmpfs 解压；崩溃走的是 vnode pager → `apfs_pagein` → 解压 + 哈希比对。两条路复用同一套解压代码，所以**大概率**同样会撞哈希；但我没有在本机验证过 read 路径一定跑那一步比对。所以"全过"只能说明"数据现在读得出来、解得出"，不能 100% 反证 pagein 一定没问题。
+2. **有个前置项必须先排掉**：如果 macOS 在这两次崩溃之后换过 `/usr/sbin/bluetoothd`（系统更新/快照重建），dd 读的就是另一个文件，实验作废。先看 `stat` 的 inode 与 mtime。
+3. **一旦确认是同一个文件**，那么"落盘数据坏了"这条就该降级：坏的不是存着的字节（现在读得出来），而是那两次 boot session 里**解压出来的结果**。方向要转到：内存/页缓存、解压路径、或那一瞬间的读回路，而不是"介质上有一片死区"。
+
+真正决定性的动作不是 dd，而是**让 bluetoothd 再 exec 一次**——exec 才会走 pagein：
+
+```sh
+stat -f "inode=%i size=%z mtime=%Sm" /usr/sbin/bluetoothd
+pgrep -lf bluetoothd
+sudo launchctl kickstart -k system/com.apple.bluetoothd && sleep 3
+pgrep -lf bluetoothd
+log show --last 1m --predicate 'eventMessage CONTAINS "apfs_pagein" OR eventMessage CONTAINS "compressed data hash mismatch"' --info | tail -20
+```
+
+- kickstart 后进程又没了 / 又出 `apfs_pagein ... error 94` → 现在就复现，问题还在，走第四节重装。
+- kickstart 后正常起来、没有 APFS 报错 → 是间歇性，不是常驻损坏。这时不必急着换盘，但要看它下次睡眠唤醒后还犯不犯。
+
 ---
 
 ## 四、修复步骤
