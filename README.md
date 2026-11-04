@@ -85,6 +85,29 @@ A1 B1 A2 B2 A3 B3      <- 三个事件一组，每组带同一个 connection han
 
 剩下的空间只有两条，都不属于驱动：`pmset` 层面降低唤醒恢复压力，以及让 bluetoothd 退出后自愈得更彻底。
 
+### 2026-11-04：bluetoothd 变成崩溃循环，根因在系统卷而不是驱动
+
+新现象与上面那份 `EXC_GUARD` **不是一回事**：`EXC_BAD_ACCESS (SIGBUS)` + `KERN_MEMORY_ERROR`，内核 triage 是 `APFS - Encountered a compressed data hash mismatch` / `Pagein of compressed inode failed` / `VM - Filesystem pagein returned an error in vnode_pagein`，落点仍在 bluetoothd 的 `__TEXT`。
+
+关键一条是内核日志：
+
+```
+(apfs) apfs_pagein:15350: disk1s4 ino 1152921500312575936/... f_offset 3399680 size 4096 ... error 94 (bluetoothd)
+```
+
+`error 94` = `EBADMSG`，每 10 秒一条，最后 `Too many corpses being created` —— bluetoothd 在 page fault 阶段就死了，进程根本没起来。
+
+**可以确定与 kext 无关**，两条独立理由：
+
+1. decmpfs 的哈希校验发生在 `vnode_pagein` 解压完成的那一刻，`_cs_validate_page` 是 pagein **成功之后**才被调用；pagein 失败时钩子不执行。报错的是「数据从哪来」的环节。
+2. `patched_cs_validate_page` 只做 `KernelPatcher::findAndReplace(const_cast<void*>(data), ...)` 原地 memcpy，没有 `ubc_upl_commit_range` / `UPL_COMMIT_SET_DIRTY`，页不会被标脏，也不会被写回；何况文件在密封只读快照里。
+
+因此 `-ibtota` 在此状态下无作用，不要用它做判定。
+
+坏块位置：`0x370000–0x37FFFF`（11-03 21:59）与 `0x330000–0x33FFFF`（11-04 10:33），分属两个 boot session，说明是落盘数据。结合作业日志里每次开机的 `reloading after unclean unmount` 与并存的 DC6 kernel panic，成因指向「反复非正常关机 + 无 DRAM 无掉电保护的 Phison E13T」。
+
+修复只能动系统卷：**见 [`REPAIR-SYSTEM-VOLUME.md`](REPAIR-SYSTEM-VOLUME.md)**。要点：先备份 → 看重装/快照 → 做完立刻加 `-nodisplaysleepDC6` 止住 panic → 几天内若在新文件新偏移上复发即换 SSD。
+
 ### 1.8.1：把诊断日志移出 USB 热路径
 
 功能与 1.8.0 完全相同。1.8.0 为了排查，把 LE 三段的日志放在 `IOUSBHostPipe::io` 完成回调里，而 Lilu 的 `SYSLOG` 是同步 `IOLog`，放在 USB 事件回调用属于不必要的开销。1.8.1 把这些打印从 `SYSLOG` 撤下。**注意：当时的做法是改 `DBGLOG`，而 Lilu 的 `DBGLOG` 在非 DEBUG 构建里会被编译成空语句，字符串根本不进二进制，也就是说那批日志实际是被删掉了，加 `-ibtpdbg` 也看不到。** 1.9.0 改为自建 `DIAGLOG`：运行时判断 `diagEnabled`，默认不打印，加 `-ibtpdbg` 才输出，热路径上只有一个 bool 比较。
@@ -118,6 +141,12 @@ btlfx: patched /usr/sbin/bluetoothd: chipset range check (15.4) (page 0x........
 | `-ibtota` | 完全关闭补丁（蓝牙会不启动，仅排障用） |
 
 log: `sudo dmesg | grep btlfx`
+
+**现状（1.9.0 之后）**：这条 `APFS compressed data hash mismatch` 自 1.7.0 起未再复现。它和唤醒后的 `EXC_GUARD / Application Triggered Fault`（bluetoothd 主动退出，见 1.9.0 节）是**两条完全不同的路径**，不要混在一起看——前者是存储层 pagein 失败，后者是进程自己结束。
+
+机制上的隐患仍在：钩子改的是 decmpfs 压缩文件的页缓存，改完之后这一页的内容与磁盘上的压缩块不再一致。1.7.0 加 offset 日志本来就是为了验证「崩的那页是不是我们改过的」，但 1.7.0 之后没再复现，所以这个问题至今没有定论。主要变量更可能是无 DRAM 的 Phison E13T 本身——压缩数据损坏是它的典型故障形态。
+
+要从机制上彻底消除，只能不再碰页：把 `cs_validate_page` 换成 Lilu `UserPatcher`，改进程内存而不是页缓存。代价是要降 SIP（`csr-active-config`）、重做 patch 注入，且 1.6.0 已证明「不 patch 蓝牙就不启动」，没有回退余地。
 
 ## 1.5.0 瘦身（只针对这一台 AX201）
 
