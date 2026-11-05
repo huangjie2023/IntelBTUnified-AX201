@@ -61,11 +61,29 @@ sudo tail -50 /var/log/bt-probe.log
 
 | 变化 | 含义 | 处置 |
 |---|---|---|
-| `btd=1 → btd=0`，`usb` 仍是 `1` | **设备还在总线上**，只是 bluetoothd 死了 | 不用重启。`sudo launchctl kickstart -k system/com.apple.bluetoothd` 大概率能拉回来 |
+| `btd=1 → btd=0`，`usb` 仍是 `1` | **设备还在总线上**，只是 bluetoothd 死了 | 不用重启。手动恢复见下面「验证有效的手动自救」 |
 | `usb=1 → usb=0` | 设备掉出了 USB 总线 | 需要端口复位，通常只能重启。这是最坏的一种 |
 | `pw=1 → pw=0` | 用户/系统把蓝牙关了 | 正常行为，不是故障 |
 
 **这张表是装探针的全部意义。** 上一轮我判断「设备掉出了总线」，依据只有一条 `system_profiler | sed`——那条命令如果把错误吞进 stderr，就什么也不打印，和「设备不存在」看起来一模一样。所以那个结论**还没有站住**。探针的第一份 `TRANSITION` 才能定性。
+
+---
+
+## 验证有效的手动自救（2026-11-05 实测）
+
+蓝牙「在但连不上、一连就掉」时，两条命令恢复（已实测成功）：
+
+```sh
+sudo purge
+sudo launchctl kickstart -k system/com.apple.bluetoothd
+```
+
+**为什么有效**：IntelBTUnified 的 `patched_cs_validate_page` 钩子会在内存里修改 bluetoothd 的代码页（vendor check / chipset range / board-id）。这页属于盘上某个 APFS 16KB 压缩验证组；内存压力下该组内页面被逐出，之后 pagein 时组哈希校验失败（EBADMSG → SIGBUS），或者进程加载到「半旧半新」的坏页——表现就是 bluetoothd 活着但行为异常。
+
+- `purge` 把整个统一 page cache 冲掉，坏页被丢弃；
+- `kickstart` 让 bluetoothd 重新拉起，从盘上加载干净的原始页，再由钩子重新打补丁——这次是完整的。
+
+单独 `kickstart` 有时不够：如果坏页还留在 UBC（统一缓冲缓存）里，新进程重新 mmap 时拿到的还是那页坏数据。**先 purge 再 kickstart 才是完整序列。**
 
 ---
 
@@ -77,12 +95,17 @@ sudo tail -50 /var/log/bt-probe.log
 usb=1（设备在总线上） && pw=1（用户希望开着） && btd=0（进程没了）
 ```
 
-然后执行一次 `launchctl kickstart -k system/com.apple.bluetoothd`，3 秒后复查，结果写进日志。
+动作序列（2026-11-05 起升级为 purge + kickstart，与「验证有效的手动自救」一致）：
+
+1. `purge` 冲掉 page cache（清掉可能存在的坏页）
+2. `launchctl kickstart -k system/com.apple.bluetoothd`
+3. 3 秒后复查；若失败，隔 10 秒再完整来一轮，仍失败才记 `AUTORECOVER: failed`
 
 - 如果上一节的表格落到第一行，它能把「只能重启」变成「一分钟内自己回来」。
+- 「蓝牙在但连不上」这种 bluetoothd 活着的故障态，探针看不到（pgrep 是 1），仍需手动跑上面两条命令。
 - 如果设备真的掉出了总线，它什么也做不了，只会在日志里留下 `AUTORECOVER: failed`——这也是有用的信息。
 
-不要一上来就开。先跑纯观测，拿到第一份 `TRANSITION` 再决定。
+现在可以开了：purge + kickstart 序列已经实测验证。
 
 ---
 

@@ -99,14 +99,30 @@ logline "TRANSITION | $prev -> $cur"
 dump_context
 
 # ---------------- 实验性自愈 ----------------
+# 2026-11-05 实测验证：purge + kickstart 组合成功恢复“蓝牙在但连不上”的状态。
+# 机制：IntelBTUnified 的 patched_cs_validate_page 钩子会在内存里改 bluetoothd 的代码页；
+# 内存压力下该页（或其所在 APFS 16KB 压缩验证组的相邻页）被逐出，再 pagein 时
+# 组内哈希校验失败 → SIGBUS / 加载到坏页。purge 把整个 page cache 冲掉，
+# 让 bluetoothd 下次从盘上重新加载“干净原始页”，kickstart 重新拉起进程。
+# 单独 kickstart 在部分场景（坏页仍在 UBC 里）不够，必须先 purge。
 if [ "$AUTORECOVER" = 1 ] && [ "$usb" = 1 ] && [ "$pw" = 1 ] && [ "$btd" = 0 ]; then
-    logline "AUTORECOVER: device on bus, power on, bluetoothd missing -> kickstart"
+    logline "AUTORECOVER: device on bus, power on, bluetoothd missing -> purge + kickstart"
+    /usr/sbin/purge >> "$LOG" 2>&1 || true
     launchctl kickstart -k system/com.apple.bluetoothd >> "$LOG" 2>&1 || true
     sleep 3
     if pgrep -x bluetoothd >/dev/null 2>&1; then
         logline "AUTORECOVER: ok, bluetoothd is back"
     else
-        logline "AUTORECOVER: failed, still no bluetoothd"
+        # 第二次尝试：有些场景 purge 后第一次 kickstart 仍会撞上校验，隔 10s 再来一次
+        sleep 10
+        /usr/sbin/purge >> "$LOG" 2>&1 || true
+        launchctl kickstart -k system/com.apple.bluetoothd >> "$LOG" 2>&1 || true
+        sleep 3
+        if pgrep -x bluetoothd >/dev/null 2>&1; then
+            logline "AUTORECOVER: ok on 2nd attempt, bluetoothd is back"
+        else
+            logline "AUTORECOVER: failed, still no bluetoothd"
+        fi
     fi
 fi
 
