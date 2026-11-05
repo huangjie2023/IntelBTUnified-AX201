@@ -29,10 +29,11 @@ One bundle, three cooperating pieces:
 1. **Lilu plugin** — `src/IntelBTUnified.cpp`, single `PluginConfiguration` (Monterey..Tahoe). Merges two upstream plugins:
    - an HCI hook on `IOUSBHostDevice::deviceRequest` (after `IOUSBHostFamily` loads) that resends a random BLE address before `LE_SET_SCAN_PARAM` on Intel controllers listed in `devices.txt`;
    - `cs_validate_page` patching of `/usr/sbin/BlueTool` and `/usr/sbin/bluetoothd` in memory (byte patterns tied to macOS builds). Each patch logs once when first applied.
+   - **1.9.1**: `_VNOP_VERIFY` route — swallows `EBADMSG` from APFS 16KiB compressed-group verification for exactly those two vnodes, when (and only when) we patched their pages this boot. Reason: a patched resident page + refilled neighbor pages no longer match the on-disk hash, which kills bluetoothd with SIGBUS after wake/memory pressure (mechanism: acidanthera/bugtracker#2228). `-ibtnovb` disables the bypass.
 2. **IOKit firmware driver** — `src/driver/` (`IntelBluetoothFirmware` class, `BtIntel*`, `IntelBluetoothOpsGen1/2/3`, `USBDeviceController`). Matches the USB device, picks the generation from `devices.txt`, downloads the `.sfi`/`.ddc` firmware over bulk pipes. Only Gen3 (AX210/AX211/…) has been exercised on this machine.
 3. **Generated pieces** (all under `build/`, driven by `devices.txt`, the single source of truth for supported USB product IDs): `Devices.h` (driver and plugin tables), `Info.plist` personalities, and `FwBinary.cpp` (zlib-compressed firmware from `fw/`, with the uncompressed size stored).
 
-Boot-args: `-ibtoff` / `-ibtdbg` / `-ibtbeta` plus the legacy `-ibtcompat*` and `-btlfx*` spellings; feature flags `-btlfxboardid`, `-btlfxallowanyaddr`, `-btlfxnvramcheck`.
+Boot-args: `-ibtoff` / `-ibtdbg` / `-ibtbeta` plus the legacy `-ibtcompat*` and `-btlfx*` spellings; feature flags `-btlfxboardid`, `-btlfxallowanyaddr`, `-btlfxnvramcheck`; diagnostics `-ibtleoff`, `-ibtphy2m`, `-ibtnovb`.
 
 ## Things that are easy to get wrong
 

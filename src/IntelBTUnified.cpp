@@ -23,6 +23,20 @@
 //  desalineaba: un dispositivo perdia su features complete y no conectaba, sin ningun
 //  crash ni log. -ibtleoff desactiva esa reescritura para aislar el problema.
 //
+//  1.9.1: 根治「唤醒/内存压力后 bluetoothd SIGBUS（APFS compressed data hash mismatch）」。
+//  机制（acidanthera/bugtracker#2228，jaymatich 2026-08-28 受控复现）：
+//    1. 本插件经 cs_validate_page 在内存里改写 bluetoothd/BlueTool 的某个 4K 代码页；
+//    2. 该页所属的 APFS 16KiB 压缩验证组在内存压力下被“部分”逐出（补丁页驻留、
+//       相邻页被回收）；
+//    3. 回填缺页时 decmpfs_pagein_compressed 解压缺页后对整个 16KiB 组调 VNOP_VERIFY；
+//    4. “驻留补丁页 + 回填原始页”的混合内容与盘上认证哈希不符 → EBADMSG → SIGBUS。
+//  这解释了延迟出现、负载相关、purge/重启暂时修复、盘上数据校验全部通过的现象。
+//  修复：路由 _VNOP_VERIFY，仅当“本 boot 我们确实补丁过的那两个文件
+//  (/usr/sbin/bluetoothd、/usr/sbin/BlueTool)”返回 EBADMSG 时吞掉。回填的页内容本身
+//  正确（解压的原始字节），校验失败纯粹因为内存里的补丁页混进了验证组；吞掉后
+//  decmpfs 正常 commit，故障页路径与崩溃一并消失。系统其余文件的完整性校验完全
+//  不受影响（按 vnode 路径过滤）。-ibtnovb 关闭此行为。
+//
 //  Solo macOS 12 (Monterey) o posterior: los parches de macOS 11 y anteriores se han eliminado.
 //
 //  SPDX-License-Identifier: GPL-3.0-only
@@ -39,6 +53,7 @@
 #include <IOKit/usb/IOUSBHostDevice.h>
 #include <sys/proc.h>
 #include <sys/random.h>
+#include <sys/errno.h>
 
 #include "Devices.h"
 
@@ -585,6 +600,14 @@ static uint32_t appliedPatches = 0;
 // es justamente una de las que tocamos nosotros o no.
 static uint64_t currentPageOffset = 0;
 
+// 1.9.1: 本 boot 是否真的改写过这两个文件的页（只有改写过才允许吞 VNOP_VERIFY 的
+// EBADMSG）。set-once，用原子写保证 VNOP_VERIFY 钩子（任意进程上下文）能读到。
+static bool patchedBluetoothdPages = false;
+static bool patchedBlueToolPages = false;
+// -ibtnovb: 关闭 1.9.1 的 VNOP_VERIFY 吞错（诊断开关）。
+static bool disableVerifyBypass = false;
+static constexpr size_t kSbinDirLength = sizeof("/usr/sbin/") - 1;
+
 static inline void notePatch(PatchId id, const char *name, const char *path, size_t off) {
     if ((__atomic_fetch_or(&appliedPatches, (uint32_t)id, __ATOMIC_RELAXED) & id) == 0)
         SYSLOG(MODULE_BTLFX, "patched %s: %s (page 0x%llx, file offset 0x%llx)", path, name,
@@ -602,21 +625,29 @@ static inline size_t findPatternOffset(const void *haystack, size_t haystackSize
     return SIZE_MAX;
 }
 
-static inline void searchAndPatch(PatchId id, const char *name, const void *haystack, size_t haystackSize, const char *path, const void *needle, size_t findSize, const void *patch, size_t replaceSize) {
+// 1.9.1: 返回是否真的改到了字节（findAndReplace 找到并替换才为 true）。
+// 调用方据此置位 patchedBluetoothdPages / patchedBlueToolPages。
+static inline bool searchAndPatch(PatchId id, const char *name, const void *haystack, size_t haystackSize, const char *path, const void *needle, size_t findSize, const void *patch, size_t replaceSize) {
     size_t off = findPatternOffset(haystack, haystackSize, needle, findSize);
-    if (KernelPatcher::findAndReplace(const_cast<void *>(haystack), haystackSize, needle, findSize, patch, replaceSize))
+    if (KernelPatcher::findAndReplace(const_cast<void *>(haystack), haystackSize, needle, findSize, patch, replaceSize)) {
         notePatch(id, name, path, off);
+        return true;
+    }
+    return false;
 }
 
 template <size_t findSize, size_t replaceSize>
-static inline void searchAndPatch(PatchId id, const char *name, const void *haystack, size_t haystackSize, const char *path, const uint8_t (&needle)[findSize], const uint8_t (&patch)[replaceSize]) {
-    searchAndPatch(id, name, haystack, haystackSize, path, needle, findSize, patch, replaceSize);
+static inline bool searchAndPatch(PatchId id, const char *name, const void *haystack, size_t haystackSize, const char *path, const uint8_t (&needle)[findSize], const uint8_t (&patch)[replaceSize]) {
+    return searchAndPatch(id, name, haystack, haystackSize, path, needle, findSize, patch, replaceSize);
 }
 
-static inline void searchAndPatchWithMask(PatchId id, const char *name, const void *haystack, size_t haystackSize, const char *path, const void *needle, size_t findSize, const void *findMask, size_t findMaskSize, const void *patch, size_t replaceSize) {
+static inline bool searchAndPatchWithMask(PatchId id, const char *name, const void *haystack, size_t haystackSize, const char *path, const void *needle, size_t findSize, const void *findMask, size_t findMaskSize, const void *patch, size_t replaceSize) {
     size_t off = findPatternOffset(haystack, haystackSize, needle, findSize);
-    if (KernelPatcher::findAndReplaceWithMask(const_cast<void *>(haystack), haystackSize, needle, findSize, findMask, findMaskSize, patch, replaceSize, nullptr, 0))
+    if (KernelPatcher::findAndReplaceWithMask(const_cast<void *>(haystack), haystackSize, needle, findSize, findMask, findMaskSize, patch, replaceSize, nullptr, 0)) {
         notePatch(id, name, path, off);
+        return true;
+    }
+    return false;
 }
 
 // PROCESS-SCOPED (OTA-safe): la pagina solo se parchea cuando el propio proceso
@@ -637,32 +668,79 @@ static void patched_cs_validate_page(vnode_t vp, memory_object_t pager, memory_o
     if (disableCsPatching)
         return;
     currentPageOffset = page_offset;
-    static constexpr size_t dirLength = sizeof("/usr/sbin/")-1;
-    if (vn_getpath(vp, path, &pathlen) == 0 && UNLIKELY(strncmp(path, "/usr/sbin/", dirLength) == 0)) {
-        if (strcmp(path + dirLength, "BlueTool") == 0) {
+    if (vn_getpath(vp, path, &pathlen) == 0 && UNLIKELY(strncmp(path, "/usr/sbin/", kSbinDirLength) == 0)) {
+        if (strcmp(path + kSbinDirLength, "BlueTool") == 0) {
             if (!legacyCsPatching && !currentProcIs("BlueTool"))
                 return;
-            searchAndPatch(PatchSkipUpdate, "skip firmware auto-update", data, PAGE_SIZE, path, kSkipUpdateFilePathOriginal, kSkipUpdateFilePathPatched);
+            bool any = false;
+            any |= searchAndPatch(PatchSkipUpdate, "skip firmware auto-update", data, PAGE_SIZE, path, kSkipUpdateFilePathOriginal, kSkipUpdateFilePathPatched);
             if (shouldPatchBoardId)
-                searchAndPatch(PatchBlueToolBid, "board-id", data, PAGE_SIZE, path, boardIdsWithUSBBluetooth[0], kBoardIdSize, BaseDeviceInfo::get().boardIdentifier, kBoardIdSize);
+                any |= searchAndPatch(PatchBlueToolBid, "board-id", data, PAGE_SIZE, path, boardIdsWithUSBBluetooth[0], kBoardIdSize, BaseDeviceInfo::get().boardIdentifier, kBoardIdSize);
+            if (any)
+                __atomic_store_n(&patchedBlueToolPages, true, __ATOMIC_RELEASE);
         }
-        else if (strcmp(path + dirLength, "bluetoothd") == 0) {
+        else if (strcmp(path + kSbinDirLength, "bluetoothd") == 0) {
             if (!legacyCsPatching && !currentProcIs("bluetoothd"))
                 return;
-            searchAndPatch(PatchVendor, "vendor check", data, PAGE_SIZE, path, kVendorCheckOriginal, kVendorCheckPatched);
-            searchAndPatch(PatchChipset, "chipset range check", data, PAGE_SIZE, path, kBadChipsetCheckOriginal, kBadChipsetCheckPatched);
+            bool any = false;
+            any |= searchAndPatch(PatchVendor, "vendor check", data, PAGE_SIZE, path, kVendorCheckOriginal, kVendorCheckPatched);
+            any |= searchAndPatch(PatchChipset, "chipset range check", data, PAGE_SIZE, path, kBadChipsetCheckOriginal, kBadChipsetCheckPatched);
             if (getKernelVersion() >= KernelVersion::Ventura && getKernelVersion() < KernelVersion::Sequoia)
-                searchAndPatch(PatchChipset13, "chipset range check (13.3)", data, PAGE_SIZE, path, kBadChipsetCheckOriginal13_3, kBadChipsetCheckPatched13_3);
+                any |= searchAndPatch(PatchChipset13, "chipset range check (13.3)", data, PAGE_SIZE, path, kBadChipsetCheckOriginal13_3, kBadChipsetCheckPatched13_3);
             if (getKernelVersion() >= KernelVersion::Sequoia)
-                searchAndPatch(PatchChipset15, "chipset range check (15.4)", data, PAGE_SIZE, path, kBadChipsetCheckOriginal15_4, kBadChipsetCheckPatched15_4);
+                any |= searchAndPatch(PatchChipset15, "chipset range check (15.4)", data, PAGE_SIZE, path, kBadChipsetCheckOriginal15_4, kBadChipsetCheckPatched15_4);
             if (shouldPatchNvramCheck)
-                searchAndPatchWithMask(PatchNvram, "internal controller NVRAM check", data, PAGE_SIZE, path, kSkipInternalControllerNVRAMCheck13_3, sizeof(kSkipInternalControllerNVRAMCheck13_3), kSkipInternalControllerNVRAMCheckMask13_3, sizeof(kSkipInternalControllerNVRAMCheckMask13_3), kSkipInternalControllerNVRAMCheckPatched13_3, sizeof(kSkipInternalControllerNVRAMCheckPatched13_3));
+                any |= searchAndPatchWithMask(PatchNvram, "internal controller NVRAM check", data, PAGE_SIZE, path, kSkipInternalControllerNVRAMCheck13_3, sizeof(kSkipInternalControllerNVRAMCheck13_3), kSkipInternalControllerNVRAMCheckMask13_3, sizeof(kSkipInternalControllerNVRAMCheckMask13_3), kSkipInternalControllerNVRAMCheckPatched13_3, sizeof(kSkipInternalControllerNVRAMCheckPatched13_3));
             if (shouldPatchBoardId)
-                searchAndPatch(PatchBtdBid, "board-id", data, PAGE_SIZE, path, boardIdsWithUSBBluetooth[0], kBoardIdSize, BaseDeviceInfo::get().boardIdentifier, kBoardIdSize);
+                any |= searchAndPatch(PatchBtdBid, "board-id", data, PAGE_SIZE, path, boardIdsWithUSBBluetooth[0], kBoardIdSize, BaseDeviceInfo::get().boardIdentifier, kBoardIdSize);
             if (shouldPatchAddress)
-                searchAndPatchWithMask(PatchAddress, "same-address check", data, PAGE_SIZE, path, kSkipAddressCheckOriginal, sizeof(kSkipAddressCheckOriginal), kSkipAddressCheckMask, sizeof(kSkipAddressCheckMask), kSkipAddressCheckPatched, sizeof(kSkipAddressCheckPatched));
+                any |= searchAndPatchWithMask(PatchAddress, "same-address check", data, PAGE_SIZE, path, kSkipAddressCheckOriginal, sizeof(kSkipAddressCheckOriginal), kSkipAddressCheckMask, sizeof(kSkipAddressCheckMask), kSkipAddressCheckPatched, sizeof(kSkipAddressCheckPatched));
+            if (any)
+                __atomic_store_n(&patchedBluetoothdPages, true, __ATOMIC_RELEASE);
         }
     }
+}
+
+// 1.9.1：吞掉“补丁页驻留 + 相邻页回填”造成的 16KiB 验证组校验失败。
+//
+// 原型（XNU bsd/sys/vnode_if.h）：
+//   extern errno_t VNOP_VERIFY(vnode_t, off_t, uint8_t *, size_t, size_t *,
+//                              void **, vnode_verify_flags_t, vfs_context_t,
+//                              vnode_verify_kind_t *);
+// 9 个参数；x86_64 SysV 下前 6 个走寄存器、后 3 个走栈，声明必须精确 9 参才能
+// 正确转发。枚举/上下文/类型指针在这里用等价的 ABI 表示（int/void *）。
+// 钩子只用到第 1 参（vnode）和返回值，其余原样转发，即使不同 macOS 小版本的
+// 中间参数语义有出入也不会误读。
+//
+// 触发链（acidanthera/bugtracker#2228）：decmpfs_pagein_compressed 回填缺页后
+// VNOP_VERIFY 整组校验 → 混合内容与盘上哈希不符 → err 94 (EBADMSG) → UPL 带
+// 错误 abort → vm_fault 失败 → bluetoothd SIGBUS（Time Since Wake ~20-30s 的
+// 固定签名）。
+//
+// 吞掉的判据（全部满足才动手）：
+//   1. 返回 EBADMSG（唯一关心的错误；真实 I/O 错误不受影响）；
+//   2. buf != NULL（是对实际数据的校验，不是块大小查询）；
+//   3. 本 boot 我们确实改写过 bluetoothd 或 BlueTool 的页（未打补丁就绝不吞，
+//      -ibtota 下该标志恒为 false）；
+//   4. vn_getpath 精确匹配这两个路径——系统其余文件的校验一丝不减。
+// 吞掉后 decmpfs 走正常 commit 路径，回填的页内容是解压出的原始字节，正确。
+static mach_vm_address_t orig_vnop_verify {};
+
+static int patched_vnop_verify(vnode_t vp, off_t offset, uint8_t *buf, size_t bufsize, size_t *verifyblksize, void **verifyctxp, uint32_t flags, void *ctx, void *verifykind) {
+    int err = FunctionCast(patched_vnop_verify, orig_vnop_verify)(vp, offset, buf, bufsize, verifyblksize, verifyctxp, flags, ctx, verifykind);
+    if (err == EBADMSG && buf != nullptr && vp != nullptr &&
+        !disableVerifyBypass &&
+        (__atomic_load_n(&patchedBluetoothdPages, __ATOMIC_ACQUIRE) || __atomic_load_n(&patchedBlueToolPages, __ATOMIC_ACQUIRE))) {
+        char path[PATH_MAX];
+        int pathlen = PATH_MAX;
+        if (vn_getpath(vp, path, &pathlen) == 0 && strncmp(path, "/usr/sbin/", kSbinDirLength) == 0 &&
+            (strcmp(path + kSbinDirLength, "bluetoothd") == 0 || strcmp(path + kSbinDirLength, "BlueTool") == 0)) {
+            SYSLOG(MODULE_BTLFX, "swallowed verify mismatch on %s @ 0x%llx (size %zu): patched page resident in this 16K group",
+                   path, (unsigned long long)offset, bufsize);
+            return 0;
+        }
+    }
+    return err;
 }
 
 static void processPatcher(KernelPatcher &patcher) {
@@ -694,9 +772,18 @@ static void processPatcher(KernelPatcher &patcher) {
         SYSLOG(MODULE_BTLFX, "bluetoothd/BlueTool pages left untouched (add -ibtpatch to enable)");
         return;
     }
+    // 1.9.1: -ibtnovb 关闭 VNOP_VERIFY 吞错（诊断开关；默认开启）。
+    disableVerifyBypass = checkKernelArgument("-ibtnovb");
+    if (disableVerifyBypass)
+        SYSLOG(MODULE_BTLFX, "VNOP_VERIFY EBADMSG bypass OFF (-ibtnovb)");
     KernelPatcher::RouteRequest csRoute("_cs_validate_page", patched_cs_validate_page, orig_cs_validate);
     if (!patcher.routeMultipleLong(KernelPatcher::KernelID, &csRoute, 1))
         SYSLOG(MODULE_BTLFX, "failed to route cs validation pages");
+    // 两条路由分开提交：符号缺失只影响自己，不影响另一条（ Tahoe 上 _VNOP_VERIFY
+    // 解析失败 = 1.9.1 修复不生效，退回 1.9.0 行为，不会更糟）。
+    KernelPatcher::RouteRequest verifyRoute("_VNOP_VERIFY", patched_vnop_verify, orig_vnop_verify);
+    if (!patcher.routeMultipleLong(KernelPatcher::KernelID, &verifyRoute, 1))
+        SYSLOG(MODULE_BTLFX, "failed to route VNOP_VERIFY (1.9.1 crash fix inactive)");
 }
 
 #pragma mark - Lilu

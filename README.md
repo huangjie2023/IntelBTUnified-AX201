@@ -85,7 +85,26 @@ A1 B1 A2 B2 A3 B3      <- 三个事件一组，每组带同一个 connection han
 
 剩下的空间只有两条，都不属于驱动：`pmset` 层面降低唤醒恢复压力，以及让 bluetoothd 退出后自愈得更彻底。
 
-### 2026-11-04：bluetoothd 变成崩溃循环，根因在系统卷而不是驱动
+### 1.9.1：根治唤醒/内存压力后的 bluetoothd SIGBUS（2026-11-05 定案）
+
+> **本节推翻了下一节（2026-11-04）的结论。** “根因在系统卷、与 kext 无关”的判断是错的，硬盘与重装都不需要。保留下一节原文作为排查记录。
+
+**根因（已定位并验证）**：`patched_cs_validate_page` 在内存里改写 bluetoothd 的代码页后，该页驻留在 UBC（统一缓冲缓存）里；它所属的 **APFS 16KiB 压缩验证组**在内存压力下被**部分**逐出（补丁页驻留、相邻页回收）。之后任何进程回填缺页时，`decmpfs_pagein_compressed` 解压缺页并对整个 16KiB 组做 `VNOP_VERIFY`——“驻留补丁页 + 回填原始页”的混合内容与盘上认证哈希不符 → `EBADMSG` → UPL 带错误 abort → vm_fault 失败 → bluetoothd SIGBUS。机制由 acidanthera/bugtracker#2228（jaymatich 2026-08-28 受控复现）确证，与本项目崩溃的固定签名（唤醒后 ~20-30 秒、偏移随机、SMART/SSV/冷读全过、`purge` 暂时修复）逐项吻合。2026-11-05 手动 `sudo purge` + `sudo launchctl kickstart -k system/com.apple.bluetoothd` 成功恢复“蓝牙在但连不上”状态，闭环验证。
+
+**修复**：路由内核符号 `_VNOP_VERIFY`（与 `_cs_validate_page` 同一 Lilu 机制），当且仅当四个条件全满足时把 `EBADMSG` 吞成 0：
+
+1. 错误恰为 `EBADMSG`；
+2. 是对实际数据缓冲的校验（`buf != NULL`），不是块大小查询；
+3. 本 boot 我们确实改写过 bluetoothd/BlueTool 的页（未打补丁则绝不吞，`-ibtota` 下恒不吞）；
+4. `vn_getpath` 精确等于 `/usr/sbin/bluetoothd` 或 `/usr/sbin/BlueTool`。
+
+系统其余文件（包括系统卷上的所有数据）的完整性校验**一丝不减**。回填的页内容是解压出的原始字节（本来正确），吞掉校验错误后 decmpfs 走正常 commit 路径，崩溃链从根上断掉。`-ibtnovb` 可关闭此行为做对照。
+
+**为什么不用另一条思路（wire 住 16K 组）**：jaymatich 的方向 2 是“把受影响的 16K 组整组常驻”。需要碰 `vm_page`/`vm_object` 私有结构与锁纪律，在 Tahoe 上风险高；而吞 `VNOP_VERIFY` 是确定性的——无论页怎么淘汰、什么时候回填，都不再产生这个错误。两条等价地断链，选风险低的那条。
+
+验证方法：装 1.9.1 后正常使用 + 合盖睡眠几轮；`log show --last boot | grep -i "swallowed verify"` 应能看到吞错记录（出现即说明曾经命中故障条件且被拦下），同时不应再出现新的 bluetoothd SIGBUS 崩溃报告。bt-probe 的 `purge + kickstart` 自愈作为后手保留。
+
+### 2026-11-04：bluetoothd 变成崩溃循环，~~根因在系统卷而不是驱动~~（结论已被 1.9.1 推翻）
 
 新现象与上面那份 `EXC_GUARD` **不是一回事**：`EXC_BAD_ACCESS (SIGBUS)` + `KERN_MEMORY_ERROR`，内核 triage 是 `APFS - Encountered a compressed data hash mismatch` / `Pagein of compressed inode failed` / `VM - Filesystem pagein returned an error in vnode_pagein`，落点仍在 bluetoothd 的 `__TEXT`。
 
@@ -99,14 +118,16 @@ A1 B1 A2 B2 A3 B3      <- 三个事件一组，每组带同一个 connection han
 
 **可以确定与 kext 无关**，两条独立理由：
 
+> ⚠️ **2026-11-05 更正：下面两条“理由”均不成立，整段结论作废。** 第 1 条的错误在于：出错的不是“本次 pagein 的数据来源”，而是**上一轮驻留在内存里的补丁页**混进了本次回填后的 16K 组校验（见 1.9.1 节）；第 2 条只排除了“写回盘”，而故障从头到尾都只发生在内存里，与写回无关。当时据以立论的“两个偏移分属两个 boot session 所以是落盘数据”，与“驻留补丁页在 purge/重启后消失、每 boot 重新生成、位置由当次补丁命中页决定”同样兼容——后者才是真相。
+
 1. decmpfs 的哈希校验发生在 `vnode_pagein` 解压完成的那一刻，`_cs_validate_page` 是 pagein **成功之后**才被调用；pagein 失败时钩子不执行。报错的是「数据从哪来」的环节。
 2. `patched_cs_validate_page` 只做 `KernelPatcher::findAndReplace(const_cast<void*>(data), ...)` 原地 memcpy，没有 `ubc_upl_commit_range` / `UPL_COMMIT_SET_DIRTY`，页不会被标脏，也不会被写回；何况文件在密封只读快照里。
 
 因此 `-ibtota` 在此状态下无作用，不要用它做判定。
 
-坏块位置：`0x370000–0x37FFFF`（11-03 21:59）与 `0x330000–0x33FFFF`（11-04 10:33），分属两个 boot session，说明是落盘数据。结合作业日志里每次开机的 `reloading after unclean unmount` 与并存的 DC6 kernel panic，成因指向「反复非正常关机 + 无 DRAM 无掉电保护的 Phison E13T」。
+坏块位置：`0x370000–0x37FFFF`（11-03 21:59）与 `0x330000–0x339B50`（11-04 10:33），分属两个 boot session，~~说明是落盘数据~~（更正：同样符合“每 boot 重新生成的驻留补丁页”，非落盘证据）。~~结合作业日志里每次开机的 `reloading after unclean unmount` 与并存的 DC6 kernel panic，成因指向「反复非正常关机 + 无 DRAM 无掉电保护的 Phison E13T」。~~
 
-修复只能动系统卷：**见 [`REPAIR-SYSTEM-VOLUME.md`](REPAIR-SYSTEM-VOLUME.md)**。要点：先备份 → 看重装/快照 → 做完立刻加 `-nodisplaysleepDC6` 止住 panic → 几天内若在新文件新偏移上复发即换 SSD。
+~~修复只能动系统卷：**见 [`REPAIR-SYSTEM-VOLUME.md`](REPAIR-SYSTEM-VOLUME.md)**。要点：先备份 → 看重装/快照 → 做完立刻加 `-nodisplaysleepDC6` 止住 panic → 几天内若在新文件新偏移上复发即换 SSD。~~（作废：真正的修复是 1.9.1 的 `_VNOP_VERIFY` 吞错，见上节。不需要重装，也不需要换 SSD。）
 
 ### 1.8.1：把诊断日志移出 USB 热路径
 
@@ -229,6 +250,7 @@ IntelFirmware: Intel boot failed
 | `-ibtplegacy` | 恢复老式无条件补丁（等价 BlueToolFixup，会破坏 OTA 校验） |
 | `-ibtleoff` | 关闭 LE Read Remote Features 事件改写（隔离「连不上又没崩溃」用） |
 | `-ibtphy2m` | 假 PHY Update 恢复上报 LE 2M（1.9.0 之前的行为，仅用于对照） |
+| `-ibtnovb` | 关闭 1.9.1 的 `_VNOP_VERIFY` EBADMSG 吞错（诊断对照用；默认开启，勿关） |
 | `-ibtpdbg` | 打开 LE 槽位/事件改写诊断日志（默认关闭，热路径零输出） |
 | `-btlfxboardid` / `-btlfxallowanyaddr` / `-btlfxnvramcheck` | 同 BlueToolFixup 原有开关 |
 

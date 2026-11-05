@@ -1,5 +1,7 @@
 # bluetoothd 崩溃循环：系统卷修复手册
 
+> **⚠️ 2026-11-05：本手册的诊断已证伪，归档保留。** 根因不是系统卷/硬盘介质损坏，而是 IntelBTUnified 的 `patched_cs_validate_page` 改页后，APFS 16KiB 压缩验证组在内存压力下部分逐出、回填时组校验失败（acidanthera/bugtracker#2228 已确证机制）。**修复是 kext 侧的 1.9.1（`_VNOP_VERIFY` 定向吞 EBADMSG），不需要重装系统，也不需要换 SSD。** 临时自救：`sudo purge && sudo launchctl kickstart -k system/com.apple.bluetoothd`（2026-11-05 实测有效）。以下原文未删改，仅作排查过程记录。
+
 > 适用症状：bluetoothd 每 10 秒崩一次，最后 `Too many corpses being created`，蓝牙完全不可用。
 > 本文件与 IntelBTUnified 无关，**不要试图改 kext 解决**。
 
