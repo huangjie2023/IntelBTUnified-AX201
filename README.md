@@ -51,6 +51,21 @@ ioreg -r -c IntelBluetoothFirmware -l -w0 | grep -E '"IBT'
 
 刷新时机：`start()`（armed 标志的最终值）、每次 `setPowerState()`（睡眠/唤醒）、`stop()`，以及每次吞错时（每 boot 最多 8 次）。唤醒瞬间那份快照早于 bluetoothd 缺页，所以**唤醒后读到的 `IBTSwallowed` 是上一轮的数字**；再睡眠一次就会把本轮结果刷进去。
 
+### 1.9.5 实机读数（2026-11-06 16:27，AX201 / macOS 26.7.2）
+
+```
+"IBTArmed"        = Yes      ← _cs_validate_page 路由成功
+"IBTVnopArmed"    = Yes      ← _VNOP_VERIFY 路由成功（吞错生效前提）
+"IBTMode"         = 0        ← process-scoped
+"IBTNovb"         = No
+"IBTSwallowed"    = 0        ← start() 时刻的快照，bluetoothd 还没跑
+"IBTPmEvents"     = 1        ← 只有 start() 那一次，说明快照是开机时的
+"IBTPatchedPages" = 0        ← 同上：那时还没有页被改写
+"fw_name"         = "ibt-19-32-4.sfi"
+```
+
+两个 armed 都是 Yes，**排除了"`_VNOP_VERIFY` 在 Tahoe 上符号缺失、1.9.x 从未生效"这个长期未验证的怀疑**。1.9.1/1.9.3 的零 swallowed 由它们自己的门控缺陷解释（`cs_validate_page` 只在首次 pagein 调用，`patchedPages[]` 天然不完整），与符号路由无关。
+
 ## 1.8.0：冷启动偶发「蓝牙正常但连不上设备」
 
 1.7.0 实测：OTA 正常、日常可用，但**有时候冷启动**后蓝牙能开、能看到设备，却连不上，且没有任何崩溃日志。
