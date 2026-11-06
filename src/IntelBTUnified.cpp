@@ -37,6 +37,14 @@
 //  decmpfs 正常 commit，故障页路径与崩溃一并消失。系统其余文件的完整性校验完全
 //  不受影响（按 vnode 路径过滤）。-ibtnovb 关闭此行为。
 //
+//  1.9.4: 撤回 1.9.3 的“按记录页偏移门控吞错”，回到“路径 + EBADMSG 必定吞”。
+//  1.9.3 把“失败区间里含我们改写过的 4K 页”当成吞错前提，等于又埋回 1.9.1 的坑：
+//  cs_validate_page 只在页首次从盘 pagein 时被调用，页被改写并驻留进 file cache 之后
+//  就不再经过它，所以记录集合天然不完整；一旦比对不中，吞错又变成“一次都不吞”。
+//  页偏移比对降级为日志附注（inside / no recorded page），只用于根因归类，不阻断吞错。
+//  注意：本机与两份独立案例的对照组均已排除介质/盘上数据——不命中只能说明“我们的
+//  采样没覆盖到”，不能反推盘坏。
+//
 //  Solo macOS 12 (Monterey) o posterior: los parches de macOS 11 y anteriores se han eliminado.
 //
 //  1.9.2: 修掉 1.9.1 吞错的实际失效原因（顺序依赖 bug）。
@@ -638,7 +646,6 @@ static bool disableVerifyBypass = false;
 static uint32_t verifySwallowed = 0;
 static uint32_t verifyPathFailures = 0;
 static uint32_t verifyOtherErrors = 0;
-static uint32_t verifyNotOurs = 0;
 // 被我们改写过的 4K 页（文件偏移）。写入只发生在 cs_validate 上下文，读取在任意进程
 // 上下文的 VNOP_VERIFY 里，所以走原子。0 表示空槽（offset 0 是 Mach-O 头所在页，
 // 永远不含我们要匹配的指令序列）。
@@ -770,16 +777,21 @@ static void patched_cs_validate_page(vnode_t vp, memory_object_t pager, memory_o
 // 错误 abort → vm_fault 失败 → bluetoothd SIGBUS（Time Since Wake ~20-30s 的
 // 固定签名）。
 //
-// 1.9.3 的判据（按顺序短路，正常情况下每条热路径只多一次返回值比较）：
+// 1.9.4 的判据（按顺序短路，正常情况下每条热路径只多一次返回值比较）：
 //   1. 返回非 0 且 buf != NULL（是对实际数据的校验，不是块大小查询）；
 //   2. 钩子确实 armed（-ibtota 下钩子根本不会安装，这道只是兜底）；
 //   3. vn_getpath 精确匹配 /usr/sbin/bluetoothd 或 /usr/sbin/BlueTool
 //      ——系统其余文件的校验一丝不减，其它错误也照原样返回；
-//   4. 错误恰为 EBADMSG；
-//   5. **失败区间 [offset, offset+bufsize) 里含至少一个我们改写过的 4K 页**。
-// 第 5 条是 1.9.3 新增的：1.9.1 的门控因顺序问题恒不成立（一次不吞），1.9.2 改成
-// “路径命中就吞”又会连带吞掉与补丁无关的真数据损坏。按页偏移判定两者都解决，
-// 且能直接给出结论：不吞时说明这个 16K 组跟补丁无关。
+//   4. 错误恰为 EBADMSG。
+// 页偏移比对（patchedPages[] 是否落在 [offset, offset+bufsize)）**只写日志**，
+// 不参与判定。原因：cs_validate_page 只在页首次从盘 pagein 时调用，页被改写并驻留
+// 进 file cache 之后不再经过它，记录集合必然不完整；拿它当门控就会重演 1.9.1/1.9.3
+// “一次都不吞”的结局。
+//
+// 关于“会不会误吞真损坏”：本机与两份独立案例的对照组（APFS 卷校验、SMART、全量
+// pread、冷扫描 os.dmg、故障后立刻 mmap 复扫）全部通过，说明盘上字节是好的；
+// 系统卷又有 SSV 每次开机加密校验兜底。所以这条路径上把 EBADMSG 当作“内存态混合
+// 内容”处理是站得住的，日志里的 inside/no-recorded-page 只是用来做根因归类。
 //
 // 吞掉后 decmpfs 走正常 commit 路径，回填的页内容是解压出的原始字节，正确。
 static mach_vm_address_t orig_vnop_verify {};
@@ -807,7 +819,12 @@ static int patched_vnop_verify(vnode_t vp, off_t offset, uint8_t *buf, size_t bu
         return err;
     }
 
-    // 1.9.3: 只有失败区间里真的含我们改写过的页，才认定是“混合内容”并吞。
+    // 1.9.4: 页偏移比对只作为**日志附注**，不再参与“吞不吞”的决定。
+    // 1.9.3 把它当门控，结果又退回到 1.9.1 那类“我们记的页不全 → 一次都不吞”的坑：
+    // cs_validate_page 只在页首次从盘 pagein 时被调用，页一旦被改写并驻留进 file cache，
+    // 后续（包括本 boot 内进程重启）都不会再走这条路径，patchedPages[] 完全可能不包含
+    // 真正被污染的那一页。用“记录是否命中”决定吞不吞，等于把结论寄托在一个不可靠的
+    // 采样上。判据回到确定性的三条：armed + 路径命中 + EBADMSG。
     uint64_t oursAt = 0;
     uint32_t recorded = __atomic_load_n(&patchedPageCount, __ATOMIC_ACQUIRE);
     for (uint32_t i = 0; i < recorded && i < kMaxPatchedPages; i++) {
@@ -817,18 +834,16 @@ static int patched_vnop_verify(vnode_t vp, off_t offset, uint8_t *buf, size_t bu
             break;
         }
     }
-    if (oursAt == 0) {
-        // 和补丁无关：原样返回，让调用方照常失败，但把结论写清楚。
-        if (__atomic_fetch_add(&verifyNotOurs, 1, __ATOMIC_RELAXED) == 0)
-            SYSLOG(MODULE_BTLFX, "verify mismatch on %s @ 0x%llx (size %zu) contains NO page we patched (%u pages recorded) - not swallowing: this is real data corruption",
-                   path, (unsigned long long)offset, bufsize, recorded);
-        return err;
-    }
 
     uint32_t n = __atomic_add_fetch(&verifySwallowed, 1, __ATOMIC_RELAXED);
-    if (n <= 8)
-        SYSLOG(MODULE_BTLFX, "swallowed verify mismatch #%u on %s @ 0x%llx (size %zu): our patched page 0x%llx is inside this verify range",
-               n, path, (unsigned long long)offset, bufsize, (unsigned long long)oursAt);
+    if (n <= 8) {
+        if (oursAt)
+            SYSLOG(MODULE_BTLFX, "swallowed verify mismatch #%u on %s @ 0x%llx (size %zu): patched page 0x%llx inside this group (%u pages recorded)",
+                   n, path, (unsigned long long)offset, bufsize, (unsigned long long)oursAt, recorded);
+        else
+            SYSLOG(MODULE_BTLFX, "swallowed verify mismatch #%u on %s @ 0x%llx (size %zu): no recorded patched page in this group (%u recorded) - window already evicted/rematerialised, diagnostic only",
+                   n, path, (unsigned long long)offset, bufsize, recorded);
+    }
     return 0;
 }
 
