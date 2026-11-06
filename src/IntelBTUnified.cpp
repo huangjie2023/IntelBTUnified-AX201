@@ -47,6 +47,14 @@
 //  这两个文件 + 错误码 EBADMSG”，并补上成功路径的日志（armed / swallowed #n /
 //  vn_getpath 失败 / 非 EBADMSG），下次崩溃后日志本身就能给出结论。
 //
+//  1.9.3: 把吞错门控改成“失败区间里真的含我们改写过的 4K 页”。
+//  1.9.2 用“路径命中就吞”虽然能生效，但会连带吞掉与补丁无关的真数据损坏，也让
+//  “到底是补丁还是盘”无法判定。1.9.3 记录每页被改写的文件偏移，VNOP_VERIFY 失败时
+//  比对区间：命中 → 吞并打 `our patched page 0x... is inside this verify range`；
+//  不命中 → 原样返回并打 `contains NO page we patched ... real data corruption`。
+//  本机 2026-11-06 15:17 崩溃（offset 0x339B50，与前一天完全相同）就是这条判据的
+//  第一个待判对象。
+//
 //  SPDX-License-Identifier: GPL-3.0-only
 //
 
@@ -608,30 +616,53 @@ static uint32_t appliedPatches = 0;
 // es justamente una de las que tocamos nosotros o no.
 static uint64_t currentPageOffset = 0;
 
-// 1.9.2: 去掉 1.9.1“本 boot 确实补丁过该文件”这个前置门控——它是顺序依赖的 bug：
-// 该标志只在“某一页命中 pattern 并替换成功”时才置位，而 bluetoothd 启动时先缺页的
-// 往往是不含 pattern 的页（本机崩溃点就在 0x339 的类型编码字符串页），等崩溃发生的
-// 那一刻标志仍是 false，条件 3 不成立 → 一次都不会吞。这与实测完全吻合：连崩 6 次、
-// 同一个 offset、零条 swallowed。
+// 1.9.3: 精确门控——只有「本次校验的区间里确实包含我们改写过的 4K 页」才吞。
 //
-// 现在 arming 只表达“钩子确实挂上了”：cs 打补丁总闸 (-ibtota) 关闭时 processPatcher
-// 会直接 return，VNOP_VERIFY 钩子根本不会被安装，所以这个门控不再有存在意义；
-// 真正的范围限制由运行时 vnode 路径判定完成（仍然只认那两个文件）。
+// 走过来的两步教训：
+//   1.9.1 用“本 boot 补丁过该文件”做门控，那是顺序依赖的死锁：该标志只在某页命中
+//   pattern 时才置位，而失败页通常先被访问，标志恒 false → 一次都不吞（实测连崩 6 次、
+//   同一 offset、零条 swallowed）。
+//   1.9.2 改成“路径命中就吞”，能吞了，但会连带吞掉**与补丁无关**的真数据损坏
+//   （那等于把盘上读错的代码放行，比崩溃更危险），而且丢掉了一个关键结论：
+//   到底是不是我们改的页导致的。
+//
+// 1.9.3 直接按事实判定：cs_validate 每次真正改写一页，就把该页的 4K 文件偏移记进
+// patchedPages[]；VNOP_VERIFY 失败时，看失败区间 [offset, offset+bufsize) 里有没有
+// 记录过的页。有 → 混合内容，吞（正当）；没有 → 跟补丁无关，原样返回并记一行
+// “real data corruption”，崩溃照旧，但结论从此不用猜。
+// 这个判定天然没有顺序问题：能造成组哈希不符的页，必然已经被我们改过并记录过。
 static bool verifyBypassArmed = false;
 // -ibtnovb: 关闭 VNOP_VERIFY 吞错（诊断开关）。
 static bool disableVerifyBypass = false;
-// 计数：命中（吞掉）次数、路径解析失败次数、非 EBADMSG 错误次数。首次发生时各打一行，
-// 这样下次崩溃后 log 里一定有可判读的证据，不用再靠推断。
+// 计数：命中（吞掉）次数、路径解析失败次数、非 EBADMSG 错误次数、“不是我们的页”次数。
 static uint32_t verifySwallowed = 0;
 static uint32_t verifyPathFailures = 0;
 static uint32_t verifyOtherErrors = 0;
-static uint32_t patchedPageHits = 0;
+static uint32_t verifyNotOurs = 0;
+// 被我们改写过的 4K 页（文件偏移）。写入只发生在 cs_validate 上下文，读取在任意进程
+// 上下文的 VNOP_VERIFY 里，所以走原子。0 表示空槽（offset 0 是 Mach-O 头所在页，
+// 永远不含我们要匹配的指令序列）。
+static constexpr uint32_t kMaxPatchedPages = 64;
+static uint64_t patchedPages[kMaxPatchedPages] {};
+static uint32_t patchedPageCount = 0;
 static constexpr size_t kSbinDirLength = sizeof("/usr/sbin/") - 1;
 
+static inline void recordPatchedPage(uint64_t pageOffset) {
+    uint32_t n = __atomic_load_n(&patchedPageCount, __ATOMIC_ACQUIRE);
+    for (uint32_t i = 0; i < n && i < kMaxPatchedPages; i++)
+        if (__atomic_load_n(&patchedPages[i], __ATOMIC_RELAXED) == pageOffset)
+            return;
+    uint32_t slot = __atomic_fetch_add(&patchedPageCount, 1, __ATOMIC_ACQ_REL);
+    if (slot < kMaxPatchedPages)
+        __atomic_store_n(&patchedPages[slot], pageOffset, __ATOMIC_RELEASE);
+}
+
 static inline void notePatch(PatchId id, const char *name, const char *path, size_t off) {
-    if ((__atomic_fetch_or(&appliedPatches, (uint32_t)id, __ATOMIC_RELAXED) & id) == 0)
+    if ((__atomic_fetch_or(&appliedPatches, (uint32_t)id, __ATOMIC_RELAXED) & id) == 0) {
+        recordPatchedPage(currentPageOffset);
         SYSLOG(MODULE_BTLFX, "patched %s: %s (page 0x%llx, file offset 0x%llx)", path, name,
                (unsigned long long)currentPageOffset, (unsigned long long)(currentPageOffset + off));
+    }
 }
 
 static inline size_t findPatternOffset(const void *haystack, size_t haystackSize, const void *needle, size_t findSize) {
@@ -646,7 +677,7 @@ static inline size_t findPatternOffset(const void *haystack, size_t haystackSize
 }
 
 // 1.9.1: 返回是否真的改到了字节（findAndReplace 找到并替换才为 true）。
-// 1.9.2: 返回值只用于计数（patchedPageHits），不再参与吞错门控。
+// 返回值只用来表达“本页命中并替换成功”，吞错判定改由 notePatch 记录的页偏移完成。
 static inline bool searchAndPatch(PatchId id, const char *name, const void *haystack, size_t haystackSize, const char *path, const void *needle, size_t findSize, const void *patch, size_t replaceSize) {
     size_t off = findPatternOffset(haystack, haystackSize, needle, findSize);
     if (KernelPatcher::findAndReplace(const_cast<void *>(haystack), haystackSize, needle, findSize, patch, replaceSize)) {
@@ -696,8 +727,9 @@ static void patched_cs_validate_page(vnode_t vp, memory_object_t pager, memory_o
             any |= searchAndPatch(PatchSkipUpdate, "skip firmware auto-update", data, PAGE_SIZE, path, kSkipUpdateFilePathOriginal, kSkipUpdateFilePathPatched);
             if (shouldPatchBoardId)
                 any |= searchAndPatch(PatchBlueToolBid, "board-id", data, PAGE_SIZE, path, boardIdsWithUSBBluetooth[0], kBoardIdSize, BaseDeviceInfo::get().boardIdentifier, kBoardIdSize);
-            if (any)
-                __atomic_add_fetch(&patchedPageHits, 1, __ATOMIC_RELAXED);
+            // 页已被改写时 notePatch 已把页偏移记进 patchedPages[]（吞错判定用）；
+            // any 保留只为表达“本页至少命中一处”，不参与门控。
+            (void)any;
         }
         else if (strcmp(path + kSbinDirLength, "bluetoothd") == 0) {
             if (!legacyCsPatching && !currentProcIs("bluetoothd"))
@@ -715,13 +747,14 @@ static void patched_cs_validate_page(vnode_t vp, memory_object_t pager, memory_o
                 any |= searchAndPatch(PatchBtdBid, "board-id", data, PAGE_SIZE, path, boardIdsWithUSBBluetooth[0], kBoardIdSize, BaseDeviceInfo::get().boardIdentifier, kBoardIdSize);
             if (shouldPatchAddress)
                 any |= searchAndPatchWithMask(PatchAddress, "same-address check", data, PAGE_SIZE, path, kSkipAddressCheckOriginal, sizeof(kSkipAddressCheckOriginal), kSkipAddressCheckMask, sizeof(kSkipAddressCheckMask), kSkipAddressCheckPatched, sizeof(kSkipAddressCheckPatched));
-            if (any)
-                __atomic_add_fetch(&patchedPageHits, 1, __ATOMIC_RELAXED);
+            // 页已被改写时 notePatch 已把页偏移记进 patchedPages[]（吞错判定用）；
+            // any 保留只为表达“本页至少命中一处”，不参与门控。
+            (void)any;
         }
     }
 }
 
-// 1.9.1：吞掉“补丁页驻留 + 相邻页回填”造成的 16KiB 验证组校验失败。
+// 1.9.1 起：吞掉“补丁页驻留 + 相邻页回填”造成的 16KiB 验证组校验失败。
 //
 // 原型（XNU bsd/sys/vnode_if.h）：
 //   extern errno_t VNOP_VERIFY(vnode_t, off_t, uint8_t *, size_t, size_t *,
@@ -737,15 +770,16 @@ static void patched_cs_validate_page(vnode_t vp, memory_object_t pager, memory_o
 // 错误 abort → vm_fault 失败 → bluetoothd SIGBUS（Time Since Wake ~20-30s 的
 // 固定签名）。
 //
-// 1.9.2 的判据（按顺序短路，正常情况下每条热路径只多一次返回值比较）：
+// 1.9.3 的判据（按顺序短路，正常情况下每条热路径只多一次返回值比较）：
 //   1. 返回非 0 且 buf != NULL（是对实际数据的校验，不是块大小查询）；
 //   2. 钩子确实 armed（-ibtota 下钩子根本不会安装，这道只是兜底）；
 //   3. vn_getpath 精确匹配 /usr/sbin/bluetoothd 或 /usr/sbin/BlueTool
 //      ——系统其余文件的校验一丝不减，其它错误也照原样返回；
-//   4. 只有 EBADMSG 才吞。
-// 1.9.1 里“本 boot 补丁过才允许吞”的前置条件已删除：它依赖“先有页命中 pattern、
-// 后有缺页校验”的顺序，实际顺序相反（先缺页→先校验→才可能命中后面的页），
-// 等于永久性关掉了吞错。
+//   4. 错误恰为 EBADMSG；
+//   5. **失败区间 [offset, offset+bufsize) 里含至少一个我们改写过的 4K 页**。
+// 第 5 条是 1.9.3 新增的：1.9.1 的门控因顺序问题恒不成立（一次不吞），1.9.2 改成
+// “路径命中就吞”又会连带吞掉与补丁无关的真数据损坏。按页偏移判定两者都解决，
+// 且能直接给出结论：不吞时说明这个 16K 组跟补丁无关。
 //
 // 吞掉后 decmpfs 走正常 commit 路径，回填的页内容是解压出的原始字节，正确。
 static mach_vm_address_t orig_vnop_verify {};
@@ -773,10 +807,28 @@ static int patched_vnop_verify(vnode_t vp, off_t offset, uint8_t *buf, size_t bu
         return err;
     }
 
+    // 1.9.3: 只有失败区间里真的含我们改写过的页，才认定是“混合内容”并吞。
+    uint64_t oursAt = 0;
+    uint32_t recorded = __atomic_load_n(&patchedPageCount, __ATOMIC_ACQUIRE);
+    for (uint32_t i = 0; i < recorded && i < kMaxPatchedPages; i++) {
+        uint64_t p = __atomic_load_n(&patchedPages[i], __ATOMIC_ACQUIRE);
+        if (p != 0 && p >= (uint64_t)offset && p < (uint64_t)offset + bufsize) {
+            oursAt = p;
+            break;
+        }
+    }
+    if (oursAt == 0) {
+        // 和补丁无关：原样返回，让调用方照常失败，但把结论写清楚。
+        if (__atomic_fetch_add(&verifyNotOurs, 1, __ATOMIC_RELAXED) == 0)
+            SYSLOG(MODULE_BTLFX, "verify mismatch on %s @ 0x%llx (size %zu) contains NO page we patched (%u pages recorded) - not swallowing: this is real data corruption",
+                   path, (unsigned long long)offset, bufsize, recorded);
+        return err;
+    }
+
     uint32_t n = __atomic_add_fetch(&verifySwallowed, 1, __ATOMIC_RELAXED);
     if (n <= 8)
-        SYSLOG(MODULE_BTLFX, "swallowed verify mismatch #%u on %s @ 0x%llx (size %zu): patched page resident in this 16K group",
-               n, path, (unsigned long long)offset, bufsize);
+        SYSLOG(MODULE_BTLFX, "swallowed verify mismatch #%u on %s @ 0x%llx (size %zu): our patched page 0x%llx is inside this verify range",
+               n, path, (unsigned long long)offset, bufsize, (unsigned long long)oursAt);
     return 0;
 }
 
@@ -825,7 +877,7 @@ static void processPatcher(KernelPatcher &patcher) {
     KernelPatcher::RouteRequest verifyRoute("_VNOP_VERIFY", patched_vnop_verify, orig_vnop_verify);
     if (patcher.routeMultipleLong(KernelPatcher::KernelID, &verifyRoute, 1)) {
         verifyBypassArmed = true;
-        SYSLOG(MODULE_BTLFX, "VNOP_VERIFY bypass armed (path-scoped to bluetoothd/BlueTool, no patch-order gate)");
+        SYSLOG(MODULE_BTLFX, "VNOP_VERIFY bypass armed (bluetoothd/BlueTool only, swallows only when our patched page is inside the failing range)");
     } else {
         SYSLOG(MODULE_BTLFX, "failed to route VNOP_VERIFY (crash fix INACTIVE - symbol missing)");
     }
