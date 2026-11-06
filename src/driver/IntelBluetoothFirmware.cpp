@@ -13,6 +13,7 @@
 #include <libkern/OSKextLib.h>
 #include <libkern/version.h>
 #include <libkern/OSTypes.h>
+#include <kern/clock.h>
 #include <IOKit/usb/StandardUSB.h>
 #include "Hci.h"
 #include "linux.h"
@@ -30,6 +31,27 @@ OSDefineMetaClassAndStructors(IntelBluetoothFirmware, IOService)
 // 用 ioreg 读，不需要 root、不写盘、不依赖日志子系统。
 static IOService *gDiagSvc = nullptr;
 static unsigned int gPmEvents = 0;
+// 1.9.10：唤醒竞态计时槽位，见 IbtDiag.h
+static unsigned int gIbtTiming[kIbtT_Slots] = {};
+
+unsigned int ibtNowMs()
+{
+    AbsoluteTime now = 0;
+    clock_get_uptime(&now);
+    return (unsigned int)(absolutetime_to_nanoseconds(now) / 1000000ULL);
+}
+
+void ibtTimingSet(unsigned int slot, unsigned int value)
+{
+    if (slot < kIbtT_Slots)
+        gIbtTiming[slot] = value;
+}
+
+void ibtTimingAdd(unsigned int slot, unsigned int delta)
+{
+    if (slot < kIbtT_Slots)
+        gIbtTiming[slot] += delta;
+}
 
 void ibtDiagPublishLive()
 {
@@ -75,6 +97,15 @@ void ibtDiagPublishLive()
     svc->setProperty("IBTLastOffset", s.lastOffset, 64);
     svc->setProperty("IBTLastSize", s.lastSize, 32);
     svc->setProperty("IBTLastPage", s.lastPage, 64);
+    // 1.9.10：唤醒竞态计时。判读方式：
+    //   IBTSetupMs ≈ 27000 且 IBTFwMs ≈ 26000 → 27 秒全在固件下载
+    //   IBTFwRetry = 1                        → 走的是失败重试路径，重点查第一次为什么失败
+    //   IBTFwMs 很小而 IBTSetupMs 很大        → 不在下载，在 readVersion / 管道建立
+    svc->setProperty("IBTSetupMs", (unsigned long long)gIbtTiming[kIbtT_SetupMs], 32);
+    svc->setProperty("IBTFwMs", (unsigned long long)gIbtTiming[kIbtT_FwMs], 32);
+    svc->setProperty("IBTFwRetry", (unsigned long long)gIbtTiming[kIbtT_FwRetry], 32);
+    svc->setProperty("IBTFwSkip", (unsigned long long)gIbtTiming[kIbtT_FwSkip], 32);
+    svc->setProperty("IBTStartCnt", (unsigned long long)gIbtTiming[kIbtT_SetupCnt], 32);
 }
 
 /* Si el firmware no encaja con el chip, IOKit reintenta el probe sin parar
@@ -128,6 +159,11 @@ bool IntelBluetoothFirmware::start(IOService *provider)
         return false;
     }
     char fwName[64];
+    // 1.9.10：从进 start() 到 publishReg() 的墙钟时长。设备在我们 open 期间
+    // Apple 的 IOBluetoothHostControllerUSBTransport 装不上，所以这段时间
+    // 直接等于"内核迟迟不建 /dev/cu.BLTH"的时长。
+    const unsigned int tStart = ibtNowMs();
+    ibtTimingAdd(kIbtT_SetupCnt, 1);
     m_pDevice = OSDynamicCast(IOUSBHostDevice, provider);
     if (m_pDevice == NULL) {
         XYLog("Driver Start fail, not usb device\n");
@@ -163,6 +199,7 @@ bool IntelBluetoothFirmware::start(IOService *provider)
     gStartFailures = 0;
     m_pBTIntel->getFirmwareName(fwName, sizeof(fwName));
     publishReg(true, fwName);
+    ibtTimingSet(kIbtT_SetupMs, ibtNowMs() - tStart);
     // 1.9.5: 从这里开始 ioreg 才读得到诊断状态。processPatcher 走的是 Lilu 的
     // onPatcherLoad 回调，早于本函数的 start()，所以此刻 armed 标志已是最终值。
     gDiagSvc = this;

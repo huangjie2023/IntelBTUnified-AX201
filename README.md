@@ -16,6 +16,62 @@
 
 > 上游 FAQ 明确：**macOS Monterey 及以后不要使用 `IntelBluetoothInjector.kext`**（"Do NOT use this Kext on macOS Monterey and newer"）。Monterey+ 靠的是驱动把 USB 设备改名为 `Bluetooth USB Host Controller` 来绕过 bluetoothd/BlueTool 的 board-id 检查，所以单 kext 里**不该**有那条 Broadcom transport 注入 personality。本包结构对应全量包的 `IntelBluetoothFirmware` + `IntelBTPatcher` + `BlueToolFixup`，不含 Injector。
 
+## 1.9.10：定位到唤醒崩溃的真实原因——`/dev/cu.BLTH` 等不到
+
+此前 1.9.1~1.9.9 全部在查 APFS 解压与页面签名校验，方向是错的。统一日志把真相写得很清楚：
+
+```
+18:42:35.830 E bluetoothd[1001] [com.apple.bluetooth:Stack.TRANSPORT]
+  UART open(/dev/cu.BLTH) port failed to appear after 15 seconds (Operation timed out)
+18:42:35.830   Failed to initialize driver POSIX
+18:42:35.830   Failed to initialize transport H4BC
+18:42:35.830 E [com.apple.bluetooth:CBCrash] Transport layer initialization failed
+18:42:36.246   Bluetooth error - restarting { reason=1201, context="Transport layer initialization failed" }
+```
+
+崩溃报告里 `isSimulated=1`、帧 #0 是 `os_fault_with_payload`、`termination = {namespace: LIBSYSTEM, indicator: "Application Triggered Fault"}`——**这是 bluetoothd 自己调 `os_crash()` 自杀，不是内存错误**。所以 `IBTSwallowed` 恒 0、`IBTPatchedPages` 恒 4 都正常：没有东西需要钩子命中。
+
+### 时间线（2026-11-06 18:42 实例，8 份报告全部同构）
+
+| 相对唤醒 | 事件 |
+|---|---|
+| +0.00s | USB 端口 power-gate 后重新枚举；`forcePowerGated` 返回 `kIOReturnNoDevice` |
+| +0.41s | `setConfigurationGated: IntelBluetoothFirmware selected configuration 1` ← 本驱动接住设备 |
+| +0.28s | bluetoothd 启动，`FindTransportType -- UART Transport`，开始等 `/dev/cu.BLTH` |
+| **+16.15s** | bluetoothd 等满 15 秒放弃 → `os_crash()` |
+| **+27.0s** | 内核才 `CreateSerialDevice` —— 晚了 11 秒 |
+| +27.3s | launchd 拉起的第二个 bluetoothd 一次成功（此时串口已在） |
+
+8 份报告的 `procLaunch → captureTime` 全部是 16.07~16.22 秒（一次 16.99），`wakeTime` 恒为 18。**是固定超时，不是概率事件。**
+
+### 为什么冷启动没事
+
+本驱动 `start()` 期间 `open` 着 USB 设备，Apple 的 `IOBluetoothHostControllerUSBTransport` 装不上，内核就不会建 `/dev/cu.BLTH`。开机时 bluetoothd 比驱动晚得多，所以从不撞车；唤醒时 bluetoothd 在 +0.28s 就起来了，而设备要到 +27s 才就绪。
+
+### 1.9.10 的改动：只加计时，不改逻辑
+
+新增四个 IORegistry 读数，用来把这 27 秒拆开：
+
+| 属性 | 含义 |
+|---|---|
+| `IBTSetupMs` | `start()` 进入 → `publishReg()` 完成的毫秒数 |
+| `IBTFwMs` | `downloadFirmwareData()` 全流程耗时（含重试） |
+| `IBTFwRetry` | 1 = 走过「失败 → `resetToBootloader` → `IOSleep(1000)` → 整包重下」 |
+| `IBTFwSkip` | 1 = 固件已是最新，`-EALREADY` 跳过下载 |
+| `IBTStartCnt` | 本 boot 内 `start()` 次数 |
+
+判读：
+
+- `IBTSetupMs ≈ 27000` 且 `IBTFwMs ≈ 26000` → 27 秒全在固件下载，下一步查分片确认节奏
+- `IBTFwRetry = 1` → 走的是重试路径，重点查第一次为什么失败（`5s` 的 download-done 等待超时 + 1s 睡眠 + 整包重下，量级正好对得上 27 秒）
+- `IBTSetupMs` 很大而 `IBTFwMs` 很小 → 不在下载，在 `readVersion` 或管道建立
+
+读取：
+
+```bash
+ioreg -r -c IntelBluetoothFirmware -l -w0 | grep -E 'IBT(SetupMs|FwMs|FwRetry|FwSkip|StartCnt)'
+```
+
 ## 1.9.9 实机结果：kext 符号路线到此为止
 
 2026-11-06 18:38 读数：`IBTSymMask = 269`（`1+4+8+256`）、`IBTApfsSolve = 0`、`IBTApfsVerAll/OnBt = 0`。

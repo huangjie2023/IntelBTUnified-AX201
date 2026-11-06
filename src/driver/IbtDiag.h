@@ -54,6 +54,36 @@ struct IbtDiagSnapshot {
     unsigned long long lastPage;    // 该区间内命中的补丁页（0 = 没记录）
 };
 
+// ---------------------------------------------------------------------------
+// 1.9.10：唤醒竞态计时。
+//
+// 已确认的故障链（2026-11-06 18:42 实例，全部来自统一日志实测）：
+//   [唤醒 +0.00s] USB 端口 power-gate 后重新枚举
+//   [+0.41s]      IntelBluetoothFirmware selected configuration 1  ← 本驱动接住设备
+//   [+0.28s]      bluetoothd 启动，传输层切 UART/H4BC，开始等 /dev/cu.BLTH
+//   [+16.15s]     bluetoothd 等满 15 秒放弃 → Transport layer initialization
+//                 failed → os_crash()（ExcUserFault, reason=1201）
+//   [+27.0s]      内核才 CreateSerialDevice —— 已经晚了 11 秒
+//   [+27.3s]      launchd 拉起的第二个 bluetoothd 一次成功
+//
+// 即：这 27 秒里只有本驱动在跑（Apple 的 HCI 传输层装不上，因为设备被
+// 我们 open 着），所以 16s/27s 的差值必须在本驱动内部解释。下面四个槽位
+// 就是把这 27 秒拆开：固件下载本身慢，还是走了"失败→回 bootloader→
+// IOSleep(1000)→整包重下"的重试路径。
+// ---------------------------------------------------------------------------
+enum {
+    kIbtT_SetupMs  = 0,  // start() 进入 → publishReg() 完成，毫秒
+    kIbtT_FwMs     = 1,  // downloadFirmwareData() 全流程耗时（含重试），毫秒
+    kIbtT_FwRetry  = 2,  // 1 = 走过 resetToBootloader + IOSleep(1000) 重试
+    kIbtT_FwSkip   = 3,  // 1 = 固件已是最新，返回 -EALREADY 跳过下载
+    kIbtT_SetupCnt = 4,  // 本 boot 内 start() 被调用次数
+    kIbtT_Slots    = 5
+};
+
+unsigned int ibtNowMs();                                  // 单调毫秒
+void ibtTimingSet(unsigned int slot, unsigned int value);
+void ibtTimingAdd(unsigned int slot, unsigned int delta);
+
 // 由 IntelBTUnified.cpp 实现：读当前全局状态填快照
 void ibtDiagFill(IbtDiagSnapshot *out);
 

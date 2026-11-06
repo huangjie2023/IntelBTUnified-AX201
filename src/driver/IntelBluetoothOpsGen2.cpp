@@ -8,6 +8,7 @@
 
 #include "IntelBluetoothOpsGen2.hpp"
 #include "Log.h"
+#include "IbtDiag.h"
 
 OSDefineMetaClassAndStructors(IntelBluetoothOpsGen2, BtIntel)
 
@@ -106,6 +107,7 @@ downloadFirmware(IntelVersion *ver, IntelBootParams *params, uint32_t *bootParam
     HciResponse *resp = (HciResponse *)buf;
     bool firmwareMode = false;
     bool ret = true;
+    unsigned int fwT0 = 0;   // 1.9.10 计时起点（提前声明，避免 goto 跨初始化）
     
     if (!ver || !params) {
         return false;
@@ -214,9 +216,12 @@ download:
     }
     
     /* Start firmware downloading and get boot parameter */
+    fwT0 = ibtNowMs();
     ior = downloadFirmwareData(ver, fwData, bootParams);
     if (ior == -EALREADY) {
         /* Firmware has already been loaded */
+        ibtTimingSet(kIbtT_FwSkip, 1);
+        ibtTimingSet(kIbtT_FwMs, ibtNowMs() - fwT0);
         ret = true;
         goto done;
     }
@@ -225,21 +230,25 @@ download:
          * controlador termina de enumerar. Se vuelve al bootloader, se le da
          * un segundo para asentarse y se reintenta una sola vez.
          */
+        ibtTimingSet(kIbtT_FwRetry, 1);
         XYLog("Firmware download failed (%d), reset to bootloader and retry\n", ior);
         resetToBootloader();
         IOSleep(1000);
         ior = downloadFirmwareData(ver, fwData, bootParams);
         if (ior == -EALREADY) {
+            ibtTimingSet(kIbtT_FwMs, ibtNowMs() - fwT0);
             ret = true;
             goto done;
         }
         if (ior != kIOReturnSuccess) {
+            ibtTimingSet(kIbtT_FwMs, ibtNowMs() - fwT0);
             XYLog("Firmware download retry failed (%d)\n", ior);
             resetToBootloader();
             goto done;
         }
         XYLog("Firmware download retry succeeded\n");
     }
+    ibtTimingSet(kIbtT_FwMs, ibtNowMs() - fwT0);
     
     /* Before switching the device into operational mode and with that
      * booting the loaded firmware, wait for the bootloader notification
