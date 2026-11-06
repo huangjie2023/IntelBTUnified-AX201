@@ -38,7 +38,10 @@ unsigned int ibtNowMs()
 {
     AbsoluteTime now = 0;
     clock_get_uptime(&now);
-    return (unsigned int)(absolutetime_to_nanoseconds(now) / 1000000ULL);
+    // macOS 26 的 MacKernelSDK 把这个函数改成了两参数（结果走出参）
+    uint64_t ns = 0;
+    absolutetime_to_nanoseconds(now, &ns);
+    return (unsigned int)(ns / 1000000ULL);
 }
 
 void ibtTimingSet(unsigned int slot, unsigned int value)
