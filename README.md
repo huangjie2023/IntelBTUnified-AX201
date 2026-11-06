@@ -16,6 +16,23 @@
 
 > 上游 FAQ 明确：**macOS Monterey 及以后不要使用 `IntelBluetoothInjector.kext`**（"Do NOT use this Kext on macOS Monterey and newer"）。Monterey+ 靠的是驱动把 USB 设备改名为 `Bluetooth USB Host Controller` 来绕过 bluetoothd/BlueTool 的 board-id 检查，所以单 kext 里**不该**有那条 Broadcom transport 注入 personality。本包结构对应全量包的 `IntelBluetoothFirmware` + `IntelBTPatcher` + `BlueToolFixup`，不含 Injector。
 
+## 1.9.9 实机结果：kext 符号路线到此为止
+
+2026-11-06 18:38 读数：`IBTSymMask = 269`（`1+4+8+256`）、`IBTApfsSolve = 0`、`IBTApfsVerAll/OnBt = 0`。
+
+- `bit8 = 1` → `loadKinfo("com.apple.filesystems.apfs", …)` **成功**，APFS 的 MachInfo 拿到了。
+- `bit4~7 = 0` 且 `IBTApfsSolve = 0` → 四个符号在**该 kext 自己的 Mach-O 符号表**里一个都没有。
+
+对照 Lilu 源码 `kern_patcher.cpp`：`solveSymbol(id, name)` 在 `id != KernelID` 时走 `kinfos[id]->solveSymbol(name)`，查的就是这个二进制的符号表；查不到返回 0 并置 `Error::NoSymbolFound`。结论：
+
+> 内核缓存（KC）把 APFS 的**局部符号**剥掉了。`_apfs_vnop_verify` / `_apfs_pagein_with_verification` 这些只被同文件 `apfs_vnodeop_entries[]` 引用的函数，既不在内核导出表（1.9.8 已证），也不在 kext 符号表（1.9.9 已证）。**按名字找它们这条路彻底关闭。**
+
+剩下的唯一根因路线：运行时从 bt vnode 的操作表里取函数地址（不需要名字）。障碍是 `struct vnode` 布局与 `VNODEOP_VERIFY` 的下标都不在 MacKernelSDK 的公开头文件里（`sys/vnode.h` 里 `struct vnode` 是不透明类型，`VNOP_VERIFY` 在 `vnode_if.h` 里也不存在），必须靠运行时探测，风险和重启成本都高。因此**暂停根因路线**，改为消除故障 A 的后果：
+
+## 故障 A 兜底：bluetoothd 看门狗（不需要重启、不碰 kext）
+
+`tools/bt-watchdog/`：一个 LaunchDaemon（20 秒一次）+ 一个 `sh` 脚本。bluetoothd 不在时执行 `launchctl kickstart -k system/com.apple.bluetoothd`，失败再踢一次。正常时只做一次 `pgrep` 就退出，开销可忽略。它把"故障 A 连崩 → launchd 节流 → 蓝牙消失 → 只能重启"这条后果链压到 20 秒内自动恢复。
+
 ## 1.9.9：APFS 的符号要走 kext 的 kinfo，不是 `KernelID`
 
 1.9.8 实机读数（2026-11-06 17:54）：`IBTSymMask = 13`（二进制 `1101`），**bit4~7 全部没有**，`IBTApfs*` 八个计数器全 0。也就是说四条 APFS 路由一条都没装上，那一版的吞错等于没编译进去。
