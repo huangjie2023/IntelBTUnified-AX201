@@ -80,6 +80,7 @@
 #include <sys/errno.h>
 
 #include "Devices.h"
+#include "driver/IbtDiag.h"
 
 #define MODULE_IBTP  "ibtp"
 
@@ -640,12 +641,19 @@ static uint64_t currentPageOffset = 0;
 // “real data corruption”，崩溃照旧，但结论从此不用猜。
 // 这个判定天然没有顺序问题：能造成组哈希不符的页，必然已经被我们改过并记录过。
 static bool verifyBypassArmed = false;
+// 1.9.5: cs_validate 路由是否成功。以前只在日志里体现，而本机日志通道不可用
+// （见 IbtDiag.h 开头），所以把它变成可被 ioreg 读到的状态位。
+static bool csHookArmed = false;
 // -ibtnovb: 关闭 VNOP_VERIFY 吞错（诊断开关）。
 static bool disableVerifyBypass = false;
 // 计数：命中（吞掉）次数、路径解析失败次数、非 EBADMSG 错误次数、“不是我们的页”次数。
 static uint32_t verifySwallowed = 0;
 static uint32_t verifyPathFailures = 0;
 static uint32_t verifyOtherErrors = 0;
+// 1.9.5: 最后一次被吞的区间，供 ioreg 读取。纯内存写，无分配、无 I/O。
+static uint64_t lastVerifyOffset = 0;
+static uint64_t lastVerifySize = 0;
+static uint64_t lastVerifyPage = 0;
 // 被我们改写过的 4K 页（文件偏移）。写入只发生在 cs_validate 上下文，读取在任意进程
 // 上下文的 VNOP_VERIFY 里，所以走原子。0 表示空槽（offset 0 是 Mach-O 头所在页，
 // 永远不含我们要匹配的指令序列）。
@@ -836,7 +844,12 @@ static int patched_vnop_verify(vnode_t vp, off_t offset, uint8_t *buf, size_t bu
     }
 
     uint32_t n = __atomic_add_fetch(&verifySwallowed, 1, __ATOMIC_RELAXED);
+    __atomic_store_n(&lastVerifyOffset, (uint64_t)offset, __ATOMIC_RELAXED);
+    __atomic_store_n(&lastVerifySize, (uint64_t)bufsize, __ATOMIC_RELAXED);
+    __atomic_store_n(&lastVerifyPage, oursAt, __ATOMIC_RELAXED);
+    // 1.9.5: 日志拿不到，改把计数推给 IORegistry。每 boot 最多 8 次，代价可忽略。
     if (n <= 8) {
+        ibtDiagPublishLive();
         if (oursAt)
             SYSLOG(MODULE_BTLFX, "swallowed verify mismatch #%u on %s @ 0x%llx (size %zu): patched page 0x%llx inside this group (%u pages recorded)",
                    n, path, (unsigned long long)offset, bufsize, (unsigned long long)oursAt, recorded);
@@ -883,9 +896,10 @@ static void processPatcher(KernelPatcher &patcher) {
     KernelPatcher::RouteRequest csRoute("_cs_validate_page", patched_cs_validate_page, orig_cs_validate);
     // 1.9.2: 成功也打一行。1.9.1 只在失败时打，导致“到底挂上没有”只能靠推断，
     // 这次实测就是被这一点拖住的——日志里没有行，无法区分“没挂上”和“没触发”。
-    if (patcher.routeMultipleLong(KernelPatcher::KernelID, &csRoute, 1))
+    if (patcher.routeMultipleLong(KernelPatcher::KernelID, &csRoute, 1)) {
+        csHookArmed = true;
         SYSLOG(MODULE_BTLFX, "cs_validate page hook armed");
-    else
+    } else
         SYSLOG(MODULE_BTLFX, "failed to route cs validation pages");
     // 两条路由分开提交：符号缺失只影响自己，不影响另一条（Tahoe 上 _VNOP_VERIFY
     // 解析失败 = 修复不生效，退回 1.9.0 行为，不会更糟）。
@@ -899,6 +913,26 @@ static void processPatcher(KernelPatcher &patcher) {
 }
 
 #pragma mark - Lilu
+
+// 1.9.5: 诊断快照。唯一的目的是让“钩子到底挂上没有、吞了几次”变成
+// ioreg 能读到的数字——本机日志通道不可用（IOLog 不落统一日志、msgbuf 被
+// socket 噪声刷掉），1.9.1~1.9.4 全靠猜，白跑了四轮。
+void ibtDiagFill(IbtDiagSnapshot *out) {
+    if (!out)
+        return;
+    out->csHookArmed  = csHookArmed ? 1 : 0;
+    out->vnopArmed    = verifyBypassArmed ? 1 : 0;
+    out->mode         = disableCsPatching ? 2u : (legacyCsPatching ? 1u : 0u);
+    out->novb         = disableVerifyBypass ? 1 : 0;
+    out->swallowed    = __atomic_load_n(&verifySwallowed, __ATOMIC_RELAXED);
+    out->pathFailures = __atomic_load_n(&verifyPathFailures, __ATOMIC_RELAXED);
+    out->otherErrors  = __atomic_load_n(&verifyOtherErrors, __ATOMIC_RELAXED);
+    out->pmEvents     = 0; // 由驱动层覆盖
+    out->patchedPages = __atomic_load_n(&patchedPageCount, __ATOMIC_RELAXED);
+    out->lastOffset   = __atomic_load_n(&lastVerifyOffset, __ATOMIC_RELAXED);
+    out->lastSize     = __atomic_load_n(&lastVerifySize, __ATOMIC_RELAXED);
+    out->lastPage     = __atomic_load_n(&lastVerifyPage, __ATOMIC_RELAXED);
+}
 
 static void pluginStart() {
     SYSLOG("ibt", "start");

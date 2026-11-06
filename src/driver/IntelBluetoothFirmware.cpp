@@ -18,11 +18,44 @@
 #include "linux.h"
 #include "Log.h"
 #include "Devices.h"
+#include "IbtDiag.h"
 
 #include "IntelBluetoothOpsGen2.hpp"
 
 #define super IOService
 OSDefineMetaClassAndStructors(IntelBluetoothFirmware, IOService)
+
+// 1.9.5: 诊断出口。本机 macOS 26 上 IOLog 不落统一日志、msgbuf 又被 socket 噪声
+// 刷掉，日志一条都读不到，前三轮迭代全靠猜。这里把状态挂到 service 属性上，
+// 用 ioreg 读，不需要 root、不写盘、不依赖日志子系统。
+static IOService *gDiagSvc = nullptr;
+static unsigned int gPmEvents = 0;
+
+void ibtDiagPublishLive()
+{
+    IOService *svc = gDiagSvc;
+    if (!svc)
+        return;
+
+    IbtDiagSnapshot s {};
+    ibtDiagFill(&s);
+    s.pmEvents = gPmEvents;
+
+    // 前三个是“修复到底生效没有”的判据：csHookArmed 决定补丁页写得进去，
+    // vnopArmed 决定 EBADMSG 吞不吞得掉。任何一个为 0，1.9.x 的修复都是空转。
+    svc->setProperty("IBTArmed", (bool)(s.csHookArmed != 0));
+    svc->setProperty("IBTVnopArmed", (bool)(s.vnopArmed != 0));
+    svc->setProperty("IBTMode", (unsigned long long)s.mode, 32);
+    svc->setProperty("IBTNovb", (bool)(s.novb != 0));
+    svc->setProperty("IBTSwallowed", (unsigned long long)s.swallowed, 32);
+    svc->setProperty("IBTPathFail", (unsigned long long)s.pathFailures, 32);
+    svc->setProperty("IBTOtherErr", (unsigned long long)s.otherErrors, 32);
+    svc->setProperty("IBTPmEvents", (unsigned long long)s.pmEvents, 32);
+    svc->setProperty("IBTPatchedPages", (unsigned long long)s.patchedPages, 32);
+    svc->setProperty("IBTLastOffset", s.lastOffset, 64);
+    svc->setProperty("IBTLastSize", s.lastSize, 32);
+    svc->setProperty("IBTLastPage", s.lastPage, 64);
+}
 
 /* Si el firmware no encaja con el chip, IOKit reintenta el probe sin parar
  * (log infinito en pantalla y arranque eterno). Tras 3 fallos seguidos se
@@ -110,6 +143,10 @@ bool IntelBluetoothFirmware::start(IOService *provider)
     gStartFailures = 0;
     m_pBTIntel->getFirmwareName(fwName, sizeof(fwName));
     publishReg(true, fwName);
+    // 1.9.5: 从这里开始 ioreg 才读得到诊断状态。processPatcher 走的是 Lilu 的
+    // onPatcherLoad 回调，早于本函数的 start()，所以此刻 armed 标志已是最终值。
+    gDiagSvc = this;
+    ibtDiagPublishLive();
     cleanUp();
     return true;
 }
@@ -140,12 +177,18 @@ void IntelBluetoothFirmware::cleanUp()
 
 IOReturn IntelBluetoothFirmware::setPowerState(unsigned long powerStateOrdinal, IOService *whatDevice)
 {
+    // 1.9.5: 每次睡眠/唤醒都刷新一次快照，休眠前的那一份正好覆盖上一轮唤醒
+    // 期间累计的 swallowed 计数（唤醒瞬间的快照早于 bluetoothd 缺页）。
+    ++gPmEvents;
+    ibtDiagPublishLive();
     return IOPMAckImplied;
 }
 
 void IntelBluetoothFirmware::stop(IOService *provider)
 {
     XYLog("Driver Stop()\n");
+    ibtDiagPublishLive();
+    gDiagSvc = nullptr;
     if (m_pmStarted) {
         PMstop();
         m_pmStarted = false;

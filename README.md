@@ -16,6 +16,41 @@
 
 > 上游 FAQ 明确：**macOS Monterey 及以后不要使用 `IntelBluetoothInjector.kext`**（"Do NOT use this Kext on macOS Monterey and newer"）。Monterey+ 靠的是驱动把 USB 设备改名为 `Bluetooth USB Host Controller` 来绕过 bluetoothd/BlueTool 的 board-id 检查，所以单 kext 里**不该**有那条 Broadcom transport 注入 personality。本包结构对应全量包的 `IntelBluetoothFirmware` + `IntelBTPatcher` + `BlueToolFixup`，不含 Injector。
 
+## 1.9.5：诊断出口改走 IORegistry（日志通道全线不可用）
+
+**先记结论：本机 macOS 26 上，kext 日志一条都读不到——与代码无关，是通道问题。**
+
+实测证据（2026-11-06，一次完整开机）：
+
+| 命令 | 结果 |
+|---|---|
+| `sudo log show --last boot --info --debug --style compact` | 992974 行，日志库本身完全正常 |
+| `grep -c "IntelBTUnified"` | 2 —— 全是 `kernelmanagerd` 的 kext 加载通知，没有一行是我们的 `SYSLOG` |
+| `grep -c "IntelFirmware"` | **0** —— 这是驱动自己 `XYLog` 的写死前缀，蓝牙功能正常证明那段代码执行过 |
+| `sudo dmesg` | 558 行，全是 Edge 的 socket 调试噪声，开机横幅已被冲掉 |
+
+两条通道同时失效：`lilu_os_log()` 在这版 Lilu 里只有一句 `IOLog("%s", tmp)`（不发 `os_log`），而本机 `IOLog` 不落统一日志；`msgbuf` 又小到开机几分钟就被 socket 日志刷掉。**所以 1.9.1~1.9.4 每次"日志为空"都是必然结果，是错误方向，代码本身没有问题。**
+
+1.9.5 把诊断从日志搬到服务属性，用 ioreg 读：
+
+```bash
+ioreg -r -c IntelBluetoothFirmware -l -w0 | grep -E '"IBT'
+```
+
+| 属性 | 含义 |
+|---|---|
+| `IBTArmed` | `_cs_validate_page` 路由成功（补丁页写得进去） |
+| `IBTVnopArmed` | `_VNOP_VERIFY` 路由成功（EBADMSG 吞得掉）——**为 0 说明 1.9.x 的吞错修复完全没生效** |
+| `IBTMode` | 0 = process-scoped（默认），1 = legacy（`-ibtplegacy`），2 = 关（`-ibtota`） |
+| `IBTNovb` | 1 = 吞错被 `-ibtnovb` 关掉 |
+| `IBTSwallowed` | 累计吞掉的 EBADMSG 次数——**这是"修复真的起作用了"的唯一直接证据** |
+| `IBTPathFail` / `IBTOtherErr` | `vn_getpath` 失败次数 / 非 EBADMSG 错误次数 |
+| `IBTPmEvents` | 睡眠+唤醒回调累计次数，用来判断快照新鲜度 |
+| `IBTPatchedPages` | 本 boot 记录到的补丁页数（诊断附注，不参与吞错判定） |
+| `IBTLastOffset` / `IBTLastSize` / `IBTLastPage` | 最后一次被吞的区间与命中的补丁页（0 = 没记录到） |
+
+刷新时机：`start()`（armed 标志的最终值）、每次 `setPowerState()`（睡眠/唤醒）、`stop()`，以及每次吞错时（每 boot 最多 8 次）。唤醒瞬间那份快照早于 bluetoothd 缺页，所以**唤醒后读到的 `IBTSwallowed` 是上一轮的数字**；再睡眠一次就会把本轮结果刷进去。
+
 ## 1.8.0：冷启动偶发「蓝牙正常但连不上设备」
 
 1.7.0 实测：OTA 正常、日常可用，但**有时候冷启动**后蓝牙能开、能看到设备，却连不上，且没有任何崩溃日志。
