@@ -121,7 +121,20 @@ A1 B1 A2 B2 A3 B3      <- 三个事件一组，每组带同一个 connection han
 2. **成功也打日志**：`cs_validate page hook armed` / `VNOP_VERIFY bypass armed` / `failed to route VNOP_VERIFY (...INACTIVE...)`。1.9.1 只在失败时打，导致“到底挂上没有”只能推断——这正是本次排查被卡住的地方。
 3. 新增三类一次性证据行：`swallowed verify mismatch #N on <path> @ 0x...`（前 8 次）、`verify error %d but vn_getpath failed`、`verify returned %d on <path> (not EBADMSG)`。
 
-**这一版顺带把“补丁导致”还是“盘上真坏”彻底分清**：吞错日志里的 `@ 0x...` 是失败 16KiB 组的起始偏移，和同一份日志里 `patched /usr/sbin/bluetoothd: ... file offset 0x...` 一比对即可——组内有我们的补丁页 = 补丁的预期副作用（本修复正当）；组内一个补丁页都没有 = 与补丁无关，是盘上数据真的读错了。
+### 1.9.3 / 1.9.4：别再用“记录的页是否命中”当吞错前提（2026-11-06）
+
+1.9.3 想收紧到“失败区间里真的含我们改写过的 4K 页才吞”，理由是“免得连带吞掉真数据损坏”。这个理由**与 `CASES.md` 的结论直接矛盾**：本机与两份独立案例的对照组（APFS 卷校验、SMART、全量 `pread`、冷扫描 `os.dmg`、故障后立刻 mmap 复扫）全部通过，介质早就被排除了。
+
+而且 1.9.3 的判据在工程上不成立：`cs_validate_page` **只在页首次从盘 pagein 时被调用**。页被改写、驻留进 file cache 之后，同一个 boot 内（甚至进程重启后）都不会再经过它，`patchedPages[]` 天然不完整。拿它当门控，只会第三次重演“一次都不吞”。
+
+1.9.4 撤回该门控，判据回到三条确定性条件：**钩子 armed + 路径 = bluetoothd/BlueTool + 错误 = EBADMSG**。页偏移比对降级为日志附注，只用于根因归类：
+
+```text
+swallowed verify mismatch #1 on /usr/sbin/bluetoothd @ 0x338000 (size 16384): patched page 0x17f000 inside this group (13 pages recorded)
+swallowed verify mismatch #1 on /usr/sbin/bluetoothd @ 0x338000 (size 16384): no recorded patched page in this group (0 recorded) - window already evicted/rematerialised, diagnostic only
+```
+
+两行的区别是「我们采样时页还在」还是「页已经被逐出/重新落位」，**都是内存态现象，都不指向介质**。
 
 ### 2026-11-04：bluetoothd 变成崩溃循环，~~根因在系统卷而不是驱动~~（结论已被 1.9.1 推翻）
 

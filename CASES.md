@@ -129,16 +129,27 @@ __TEXT  10f0e1000-10f9c0000 [9084K] r-x/r-x SM=COW  /usr/sbin/bluetoothd
 
 用户当时坚持“硬盘没问题、内存也检测了没问题”，是对的。
 
+### 红线（写在前面，防止再犯）
+
+本故障的**所有**后续诊断都不得把结论推向介质。已经确认的三条事实：
+
+1. 崩溃页 `0x339B50` 在 2026-11-05 21:29 与 2026-11-06 15:17 两个不同 boot、不同 ASLR 基址下**完全相同**——是确定性的代码路径，不是随机坏块；
+2. `/usr/sbin/bluetoothd` 的 `mtime = Oct 22 18:38:16`（系统安装时间）、`shasum` 每次一致，盘上原件干净；
+3. 两份独立案例（本机 + #2228 + #493）的对照组全部通过，其中一份还是在两块不同 SSD、两台不同安装上复现的。
+
+所以当某条日志看起来“像是盘坏了”（比如 1.9.3 曾打的 `no recorded page in this group`），正确的解读只有两种：**我们的采样没覆盖到那一页**，或者**那一页已经被逐出后重新落位**。两者都是内存态。要真的指控介质，必须先有「同一只读文件、跨重启 `shasum` 不一致」这种直接证据。
+
 ---
 
 ## 1.9.1 具体做了什么
 
-路由内核符号 `_VNOP_VERIFY`（与已有的 `_cs_validate_page` 同一套 Lilu `routeMultipleLong` 机制），四条件全满足才把 `EBADMSG` 吞成 0：
+路由内核符号 `_VNOP_VERIFY`（与已有的 `_cs_validate_page` 同一套 Lilu `routeMultipleLong` 机制），条件全满足才把 `EBADMSG` 吞成 0：
 
 1. 错误恰为 `EBADMSG`（真实 I/O 错误原样上抛）；
 2. `buf != NULL`（是对数据的校验，不是块大小查询）；
-3. 本 boot 确实补写过 bluetoothd/BlueTool 的页（没打补丁就绝不吞；`-ibtota` 下恒不吞）；
-4. `vn_getpath` 精确等于 `/usr/sbin/bluetoothd` 或 `/usr/sbin/BlueTool`。
+3. `vn_getpath` 精确等于 `/usr/sbin/bluetoothd` 或 `/usr/sbin/BlueTool`。
+
+> 1.9.1 原本还有第 4 条“本 boot 确实补写过这两个文件的页”，1.9.2 已删除；1.9.3 换成“失败区间含我们记录过的页”，1.9.4 又撤回。原因是 `cs_validate_page` 只在页首次 pagein 时调用，页驻留 file cache 后不再经过，任何基于“记录是否命中”的门控都会变成“一次都不吞”。**最终判据就是上面三条。**
 
 系统其余所有文件的完整性校验不受影响。吞掉后 `decmpfs_pagein_compressed` 走正常 commit 分支（源码 `bsd/kern/decmpfs.c:1615` `if (!err)`），回填页内容是解压出的原始字节，本来就正确——校验失败纯粹来自内存里的混合页。
 
@@ -152,7 +163,7 @@ jaymatich 的方向 2 需要操作 `vm_page` / `vm_object` 私有结构与锁纪
 |---|---|---|
 | macOS 26.2 内核里解析不到 `_VNOP_VERIFY` | 修复不生效，退回 1.9.0 行为（仍会崩） | `sudo dmesg \| grep "failed to route VNOP_VERIFY"` |
 | 其他文件也出现 `EBADMSG` | 完全不受影响（按 vnode 路径过滤） | — |
-| 真实的介质损坏恰好发生在 bluetoothd | 会被吞掉，不报警 | 该概率极低；SSV 每次开机已加密校验系统卷 |
+| 真实的介质损坏恰好发生在 bluetoothd | 会被吞掉，不报警 | 该概率极低；SSV 每次开机加密校验系统卷，且本机对照组已排除介质。真出事的前置信号是跨重启 `shasum` 不一致 |
 | 唤醒后的 `EXC_GUARD` 断言（另一条线） | 与本修复无关，可能仍出现 | 崩溃报告里 `Namespace SIMULATED` / `os_fault_with_payload(18,2)` |
 
 ### 验证方法
