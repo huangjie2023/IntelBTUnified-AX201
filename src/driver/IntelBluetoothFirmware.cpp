@@ -52,6 +52,15 @@ void ibtDiagPublishLive()
     svc->setProperty("IBTOtherErr", (unsigned long long)s.otherErrors, 32);
     svc->setProperty("IBTVnopCalls", (unsigned long long)s.callsOnBt, 32);
     svc->setProperty("IBTBtVnodes", (unsigned long long)s.btVnodes, 32);
+    // 1.9.7 探针读数
+    svc->setProperty("IBTSymMask", (unsigned long long)s.symMask, 32);
+    svc->setProperty("IBTVnopAll", (unsigned long long)s.vnopAll, 32);
+    svc->setProperty("IBTKvAll", (unsigned long long)s.kvAll, 32);
+    svc->setProperty("IBTKvOnBt", (unsigned long long)s.kvOnBt, 32);
+    svc->setProperty("IBTDecAll", (unsigned long long)s.decAll, 32);
+    svc->setProperty("IBTDecOnBt", (unsigned long long)s.decOnBt, 32);
+    svc->setProperty("IBTValAll", (unsigned long long)s.valAll, 32);
+    svc->setProperty("IBTValOnBt", (unsigned long long)s.valOnBt, 32);
     svc->setProperty("IBTPmEvents", (unsigned long long)s.pmEvents, 32);
     svc->setProperty("IBTPatchedPages", (unsigned long long)s.patchedPages, 32);
     svc->setProperty("IBTLastOffset", s.lastOffset, 64);

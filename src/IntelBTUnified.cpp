@@ -673,6 +673,25 @@ static vnode_t btVnodes[kMaxBtVnodes] {};
 static uint32_t btVnodeCount = 0;
 static uint32_t verifyCallsOnBt = 0;
 
+// 1.9.7: 1.9.6 实机读数 IBTBtVnodes=2 / IBTPatchedPages=4 / IBTVnopCalls=0 ——
+// cs_validate 认出了这两个文件、页也改进去了，但 _VNOP_VERIFY 一次都没被它们的校验
+// 调用过。这说明「decmpfs 回填缺页后调 _VNOP_VERIFY」这个前提在 macOS 26 上不成立，
+// 1.9.1~1.9.5 的吞错是死代码。为免再靠猜测换钩点，1.9.7 把候选入口全部"探针化"：
+// 逐个尝试路由，成功的按位记进 symMask，并各自统计总调用数与命中 bt vnode 的次数。
+// 所有新钩子都是**原样转发 + 计数**，不改变任何行为，一次开机就能看出真正的入口是哪个。
+//   bit0 = _VNOP_VERIFY          （1.9.1~1.9.6 押的那个，实测 bt 命中 0）
+//   bit1 = _vnode_verify         （VNOP_VERIFY 的内层实现，若调用者直接内联调用它）
+//   bit2 = _decmpfs_pagein_compressed（缺页解压入口，理论上校验就在它内部/之后）
+//   bit3 = _decmpfs_validate_compressed_file（整文件校验，唤醒时可能走这条）
+static uint32_t symMask = 0;
+static uint32_t verifyAllCalls = 0;
+static uint32_t vnodeVerifyAll = 0;
+static uint32_t vnodeVerifyOnBt = 0;
+static uint32_t decmpfsAll = 0;
+static uint32_t decmpfsOnBt = 0;
+static uint32_t validateAll = 0;
+static uint32_t validateOnBt = 0;
+
 static inline bool isBtVnode(vnode_t vp) {
     uint32_t n = __atomic_load_n(&btVnodeCount, __ATOMIC_ACQUIRE);
     for (uint32_t i = 0; i < n && i < kMaxBtVnodes; i++)
@@ -849,6 +868,10 @@ static mach_vm_address_t orig_vnop_verify {};
 
 static int patched_vnop_verify(vnode_t vp, off_t offset, uint8_t *buf, size_t bufsize, size_t *verifyblksize, void **verifyctxp, uint32_t flags, void *ctx, void *verifykind) {
     int err = FunctionCast(patched_vnop_verify, orig_vnop_verify)(vp, offset, buf, bufsize, verifyblksize, verifyctxp, flags, ctx, verifykind);
+    // 1.9.7: 总调用数（不看 vnode）。用来区分两种 0：
+    //   总数为 0 → 这个符号在本内核里已经没人调用（死符号），钩它毫无意义；
+    //   总数很大而 bt 命中为 0 → 符号活着，但 bluetoothd 的校验不走它。
+    __atomic_fetch_add(&verifyAllCalls, 1, __ATOMIC_RELAXED);
     if (vp == nullptr || disableVerifyBypass || !verifyBypassArmed)
         return err;
 
@@ -918,8 +941,42 @@ static int patched_vnop_verify(vnode_t vp, off_t offset, uint8_t *buf, size_t bu
     return 0;
 }
 
-static void processPatcher(KernelPatcher &patcher) {
-    const bool argOta    = checkKernelArgument("-ibtota");
+// ---------------------------------------------------------------------------
+// 1.9.7 探针钩子：原样转发 + 计数，**不改任何行为**。
+//
+// 统一用 9 个参数槽位声明：x86_64 SysV 下前 6 个走寄存器、后 3 个走栈，只要"接收时
+// 用同一套 9 槽、转发时也用同一套 9 槽"，无论真实函数实际收几个参数，字节都是原样
+// 传下去的（多出来的寄存器/栈槽被被调用者忽略）。因此不需要精确知道这些函数原型，
+// 也能安全地做 pass-through —— 前提只有一个：第 1 个参数是 vnode（点或空指针都安全，
+// 因为我们只做指针比较，不解引用）。
+static mach_vm_address_t orig_vnode_verify {};
+static mach_vm_address_t orig_decmpfs_pagein {};
+static mach_vm_address_t orig_decmpfs_validate {};
+
+static int patched_vnode_verify(vnode_t vp, off_t offset, uint8_t *buf, size_t bufsize, size_t *verifyblksize, void **verifyctxp, uint32_t flags, void *ctx, void *verifykind) {
+    __atomic_fetch_add(&vnodeVerifyAll, 1, __ATOMIC_RELAXED);
+    if (vp != nullptr && isBtVnode(vp))
+        __atomic_fetch_add(&vnodeVerifyOnBt, 1, __ATOMIC_RELAXED);
+    return FunctionCast(patched_vnode_verify, orig_vnode_verify)(vp, offset, buf, bufsize, verifyblksize, verifyctxp, flags, ctx, verifykind);
+}
+
+static int patched_decmpfs_pagein(vnode_t vp, off_t offset, uint8_t *buf, size_t bufsize, size_t *a, void **b, uint32_t c, void *d, void *e) {
+    __atomic_fetch_add(&decmpfsAll, 1, __ATOMIC_RELAXED);
+    if (vp != nullptr && isBtVnode(vp))
+        __atomic_fetch_add(&decmpfsOnBt, 1, __ATOMIC_RELAXED);
+    return FunctionCast(patched_decmpfs_pagein, orig_decmpfs_pagein)(vp, offset, buf, bufsize, a, b, c, d, e);
+}
+
+// 第三个候选独立一份 orig/计数：绝不能和上面共用 orig 指针——第二次路由会把它覆盖成
+// 自己的原函数地址，先装的钩子就会转发到错误的函数里。
+static int patched_decmpfs_validate(vnode_t vp, off_t offset, uint8_t *buf, size_t bufsize, size_t *a, void **b, uint32_t c, void *d, void *e) {
+    __atomic_fetch_add(&validateAll, 1, __ATOMIC_RELAXED);
+    if (vp != nullptr && isBtVnode(vp))
+        __atomic_fetch_add(&validateOnBt, 1, __ATOMIC_RELAXED);
+    return FunctionCast(patched_decmpfs_validate, orig_decmpfs_validate)(vp, offset, buf, bufsize, a, b, c, d, e);
+}
+
+static void processPatcher(KernelPatcher &patcher) {    const bool argOta    = checkKernelArgument("-ibtota");
     legacyCsPatching     = checkKernelArgument("-ibtplegacy");
     // Por defecto SI se parchea (sin los parches el controlador no se enciende);
     // -ibtota desactiva todo, -ibtplegacy usa el modo antiguo incondicional.
@@ -964,10 +1021,26 @@ static void processPatcher(KernelPatcher &patcher) {
     KernelPatcher::RouteRequest verifyRoute("_VNOP_VERIFY", patched_vnop_verify, orig_vnop_verify);
     if (patcher.routeMultipleLong(KernelPatcher::KernelID, &verifyRoute, 1)) {
         verifyBypassArmed = true;
+        __atomic_fetch_or(&symMask, 1u, __ATOMIC_RELAXED);
         SYSLOG(MODULE_BTLFX, "VNOP_VERIFY bypass armed (bluetoothd/BlueTool only, any EBADMSG will be swallowed)");
     } else {
         SYSLOG(MODULE_BTLFX, "failed to route VNOP_VERIFY (crash fix INACTIVE - symbol missing)");
     }
+
+    // 1.9.7 探针：只计数、不改行为。成功与否按位记进 symMask，读数是
+    //   IBTSymMask & 1 / 2 / 4 / 8 分别对应下面四条 route 是否成功。
+    // 逐个单独提交，任何一个失败都不影响其它（符号可能被内联或根本不存在）。
+    KernelPatcher::RouteRequest vnodeVerifyRoute("_vnode_verify", patched_vnode_verify, orig_vnode_verify);
+    if (patcher.routeMultipleLong(KernelPatcher::KernelID, &vnodeVerifyRoute, 1))
+        __atomic_fetch_or(&symMask, 2u, __ATOMIC_RELAXED);
+
+    KernelPatcher::RouteRequest decmpfsRoute("_decmpfs_pagein_compressed", patched_decmpfs_pagein, orig_decmpfs_pagein);
+    if (patcher.routeMultipleLong(KernelPatcher::KernelID, &decmpfsRoute, 1))
+        __atomic_fetch_or(&symMask, 4u, __ATOMIC_RELAXED);
+
+    KernelPatcher::RouteRequest decmpfsValidateRoute("_decmpfs_validate_compressed_file", patched_decmpfs_validate, orig_decmpfs_validate);
+    if (patcher.routeMultipleLong(KernelPatcher::KernelID, &decmpfsValidateRoute, 1))
+        __atomic_fetch_or(&symMask, 8u, __ATOMIC_RELAXED);
 }
 
 #pragma mark - Lilu
@@ -987,6 +1060,14 @@ void ibtDiagFill(IbtDiagSnapshot *out) {
     out->otherErrors  = __atomic_load_n(&verifyOtherErrors, __ATOMIC_RELAXED);
     out->callsOnBt    = __atomic_load_n(&verifyCallsOnBt, __ATOMIC_RELAXED);
     out->btVnodes     = __atomic_load_n(&btVnodeCount, __ATOMIC_RELAXED);
+    out->symMask      = __atomic_load_n(&symMask, __ATOMIC_RELAXED);
+    out->vnopAll      = __atomic_load_n(&verifyAllCalls, __ATOMIC_RELAXED);
+    out->kvAll        = __atomic_load_n(&vnodeVerifyAll, __ATOMIC_RELAXED);
+    out->kvOnBt       = __atomic_load_n(&vnodeVerifyOnBt, __ATOMIC_RELAXED);
+    out->decAll       = __atomic_load_n(&decmpfsAll, __ATOMIC_RELAXED);
+    out->decOnBt      = __atomic_load_n(&decmpfsOnBt, __ATOMIC_RELAXED);
+    out->valAll       = __atomic_load_n(&validateAll, __ATOMIC_RELAXED);
+    out->valOnBt      = __atomic_load_n(&validateOnBt, __ATOMIC_RELAXED);
     out->pmEvents     = 0; // 由驱动层覆盖
     out->patchedPages = __atomic_load_n(&patchedPageCount, __ATOMIC_RELAXED);
     out->lastOffset   = __atomic_load_n(&lastVerifyOffset, __ATOMIC_RELAXED);

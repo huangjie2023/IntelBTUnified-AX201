@@ -28,6 +28,15 @@ struct IbtDiagSnapshot {
     unsigned int callsOnBt;     // 1.9.6: _VNOP_VERIFY 被 bluetoothd/BlueTool vnode 调用过的次数（不看返回值）
     unsigned int btVnodes;      // 1.9.6: 已记录的 bluetoothd/BlueTool vnode 数（>0 说明 cs_validate 确实见过它们）
     unsigned int pmEvents;      // 睡眠/唤醒回调次数，用来判断快照新鲜度
+    // 1.9.7 探针：候选入口是否装上了（按位）、各自总调用数、命中 bt vnode 的次数
+    unsigned int symMask;       // bit0 _VNOP_VERIFY, bit1 _vnode_verify, bit2 _decmpfs_pagein_compressed, bit3 _decmpfs_validate_compressed_file
+    unsigned int vnopAll;       // _VNOP_VERIFY 总调用
+    unsigned int kvAll;         // _vnode_verify 总调用
+    unsigned int kvOnBt;        // _vnode_verify 命中 bt vnode
+    unsigned int decAll;        // _decmpfs_pagein_compressed 总调用
+    unsigned int decOnBt;       // 同上，命中 bt vnode
+    unsigned int valAll;        // _decmpfs_validate_compressed_file 总调用
+    unsigned int valOnBt;       // 同上，命中 bt vnode
     unsigned int patchedPages;  // 本 boot 记录到的补丁页数（诊断附注，不作判定）
     unsigned long long lastOffset;  // 最后一次被吞的校验起点
     unsigned long long lastSize;    // 最后一次被吞的校验长度

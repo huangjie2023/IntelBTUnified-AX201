@@ -16,6 +16,35 @@
 
 > 上游 FAQ 明确：**macOS Monterey 及以后不要使用 `IntelBluetoothInjector.kext`**（"Do NOT use this Kext on macOS Monterey and newer"）。Monterey+ 靠的是驱动把 USB 设备改名为 `Bluetooth USB Host Controller` 来绕过 bluetoothd/BlueTool 的 board-id 检查，所以单 kext 里**不该**有那条 Broadcom transport 注入 personality。本包结构对应全量包的 `IntelBluetoothFirmware` + `IntelBTPatcher` + `BlueToolFixup`，不含 Injector。
 
+## 1.9.7：1.9.6 实测判定——`_VNOP_VERIFY` 不是入口，改为三路探针
+
+1.9.6 首次实机读数（2026-11-06 17:17，装好后一次合盖唤醒）：
+
+| 属性 | 值 | 含义 |
+|---|---|---|
+| `IBTPatchedPages` | 4 | 页确实被改写了 |
+| `IBTBtVnodes` | 2 | `cs_validate` 确实认出了 bluetoothd/BlueTool 的 vnode |
+| `IBTVnopCalls` | **0** | `_VNOP_VERIFY` **一次都没被这两个文件的校验调用过** |
+
+结论是确定的：**「decmpfs 回填缺页后调 `_VNOP_VERIFY`」这个前提在 macOS 26 上不成立**。`IBTVnopArmed = Yes` 只代表符号存在且路由成功，不代表有人调用它——1.9.1~1.9.5 五版的吞错逻辑全是死代码，`swallowed` 永远只能是 0，与"修复没生效"无关，因为那条路根本没被走过。
+
+1.9.7 不再靠猜下一个钩点在哪里，而是把四个候选入口**同时装上、只计数、不改行为**：
+
+| 位 | 符号 | 为什么可能 | 读法 |
+|---|---|---|---|
+| `bit0` | `_VNOP_VERIFY` | 前五版押的（已证否） | `IBTVnopAll` / `IBTVnopCalls` |
+| `bit1` | `_vnode_verify` | 若调用方直接用它而不是经 `VNOP_VERIFY` 包装 | `IBTKvAll` / `IBTKvOnBt` |
+| `bit2` | `_decmpfs_pagein_compressed` | 缺页解压入口，校验若在其内部即命中 | `IBTDecAll` / `IBTDecOnBt` |
+| `bit3` | `_decmpfs_validate_compressed_file` | 整文件校验，唤醒时可能走这条 | `IBTValAll` / `IBTValOnBt` |
+
+`IBTSymMask` 记录哪几条路由成功（找到符号）。所有钩子都是**原样转发**：统一按 9 个参数槽接收并转发，x86_64 SysV 下前 6 个走寄存器、后 3 个走栈，两侧槽位一致即可字节级透传，因此不必精确知道各函数原型；第 1 个参数只做指针比较、不解引用，所以即使原型不同也安全。
+
+判读（一次开机即可）：
+
+- 某个 `*OnBt > 0` → **那就是真正的入口**，下一版把 EBADMSG 吞错挪过去
+- 某个 `*All = 0` 而 `IBTSymMask` 对应位为 1 → 该符号在本内核里没人调用（死符号）
+- 全部 `OnBt = 0` → bluetoothd 的缺页校验根本不经过这四个函数中的任何一个，需要往 UPL/`ubc` 或 APFS 侧找
+
 ## 1.9.6：把「钩子在不在调用路径上」变成一次开机可读的数字
 
 1.9.1~1.9.5 的吞错全部押在一个从未被验证的前提上：**decmpfs 回填缺页后会调 `_VNOP_VERIFY`**。`IBTVnopArmed = Yes` 只证明符号路由成功，不证明它被调用过。如果前提不成立，判据写得再细也是空转，而唯一的反证方式是"等下一次崩溃"，成本极高。
