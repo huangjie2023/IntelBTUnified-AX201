@@ -692,6 +692,27 @@ static uint32_t decmpfsOnBt = 0;
 static uint32_t validateAll = 0;
 static uint32_t validateOnBt = 0;
 
+// 1.9.8: 1.9.7 读数（全 0 + SymMask=13）说明前面四个候选没有一个是入口，于是回头去内核
+// 缓存里枚举真实符号名，挖到 APFS 自己那一层：
+//   _apfs_vnop_verify               ← vnode 操作表里 vop_verify 表项的实现本体。表项里存的是
+//                                     它的地址，所以改它的函数头，走表项的调用同样会落到我们
+//                                     这里——这正是 _VNOP_VERIFY 那个导出包装接不住的原因。
+//   _apfs_pagein_with_verification  ← 名字直说"带校验的 pagein"，压缩页缺页最可能的入口
+//   _apfs_verify_uncompressed_data  ← 明文数据校验
+//   _apfs_verify_rangelist          ← 区间校验
+// 第一个带吞错（这才是可能生效的修复），后三个只计数（定位用）。
+//   bit4 = _apfs_vnop_verify | bit5 = _apfs_pagein_with_verification
+//   bit6 = _apfs_verify_uncompressed_data | bit7 = _apfs_verify_rangelist
+static uint32_t apfsVerAll = 0;
+static uint32_t apfsVerOnBt = 0;
+static uint32_t apfsPiAll = 0;
+static uint32_t apfsPiOnBt = 0;
+static uint32_t apfsUncAll = 0;
+static uint32_t apfsUncOnBt = 0;
+static uint32_t apfsRlAll = 0;
+static uint32_t apfsRlOnBt = 0;
+static bool apfsVerifyArmed = false;
+
 static inline bool isBtVnode(vnode_t vp) {
     uint32_t n = __atomic_load_n(&btVnodeCount, __ATOMIC_ACQUIRE);
     for (uint32_t i = 0; i < n && i < kMaxBtVnodes; i++)
@@ -864,26 +885,11 @@ static void patched_cs_validate_page(vnode_t vp, memory_object_t pager, memory_o
 //   2. 定域顺序改为「路径优先、身份兜底」：路径解析失败时退回 vnode 身份，避免
 //      1.9.4 里"vn_getpath 失败 → 不吞 → 照样崩"的死角；路径成功但不像目标文件的，
 //      仍然放行（防止 vnode 地址被回收后误吞别的文件的真损坏）。
-static mach_vm_address_t orig_vnop_verify {};
-
-static int patched_vnop_verify(vnode_t vp, off_t offset, uint8_t *buf, size_t bufsize, size_t *verifyblksize, void **verifyctxp, uint32_t flags, void *ctx, void *verifykind) {
-    int err = FunctionCast(patched_vnop_verify, orig_vnop_verify)(vp, offset, buf, bufsize, verifyblksize, verifyctxp, flags, ctx, verifykind);
-    // 1.9.7: 总调用数（不看 vnode）。用来区分两种 0：
-    //   总数为 0 → 这个符号在本内核里已经没人调用（死符号），钩它毫无意义；
-    //   总数很大而 bt 命中为 0 → 符号活着，但 bluetoothd 的校验不走它。
-    __atomic_fetch_add(&verifyAllCalls, 1, __ATOMIC_RELAXED);
-    if (vp == nullptr || disableVerifyBypass || !verifyBypassArmed)
-        return err;
-
-    // 1.9.6: 先做身份判定（≤16 次指针比较，无分配、无 I/O、可在缺页上下文安全调用）。
-    // 无论返回值都要计数——IBTVnopCalls 就是"钩子是否真的被调用"的唯一证据。
-    bool onBt = isBtVnode(vp);
-    if (onBt)
-        __atomic_fetch_add(&verifyCallsOnBt, 1, __ATOMIC_RELAXED);
-
-    if (err == 0 || buf == nullptr)
-        return err;
-
+// 1.9.8: 把"这次 EBADMSG 到底吞不吞"从具体钩子里抽出来，_VNOP_VERIFY（历史钩子，实测
+// 是死符号）和 _apfs_vnop_verify（表项实现）共用同一份判定，避免两处逻辑漂移。
+// 判定仍是确定性的三条：钩子已装（由调用方检查）+ 定域命中 + err == EBADMSG。
+// offset/bufsize 只作日志与快照附注，不参与决定——这是 1.9.3 用页偏移当门控失败的教训。
+static int handleBtVerifyError(vnode_t vp, off_t offset, size_t bufsize, int err, bool onBt) {
     // 定域：路径优先（能挡住 vnode 地址被回收后误判），路径解析失败时退回身份判定。
     // 1.9.4 在这里是"路径失败 → 不吞 → 照样崩"，等于给修复留了一个必然失效的角落。
     char path[PATH_MAX] = {};
@@ -907,12 +913,10 @@ static int patched_vnop_verify(vnode_t vp, off_t offset, uint8_t *buf, size_t bu
         return err;
     }
 
-    // 1.9.4: 页偏移比对只作为**日志附注**，不再参与“吞不吞”的决定。
+    // 页偏移比对只作为**日志附注**，不再参与“吞不吞”的决定。
     // 1.9.3 把它当门控，结果又退回到 1.9.1 那类“我们记的页不全 → 一次都不吞”的坑：
     // cs_validate_page 只在页首次从盘 pagein 时被调用，页一旦被改写并驻留进 file cache，
-    // 后续（包括本 boot 内进程重启）都不会再走这条路径，patchedPages[] 完全可能不包含
-    // 真正被污染的那一页。用“记录是否命中”决定吞不吞，等于把结论寄托在一个不可靠的
-    // 采样上。判据回到确定性的三条：armed + 路径命中 + EBADMSG。
+    // 后续都不会再走这条路径，patchedPages[] 完全可能不包含真正被污染的那一页。
     uint64_t oursAt = 0;
     uint32_t recorded = __atomic_load_n(&patchedPageCount, __ATOMIC_ACQUIRE);
     for (uint32_t i = 0; i < recorded && i < kMaxPatchedPages; i++) {
@@ -927,7 +931,7 @@ static int patched_vnop_verify(vnode_t vp, off_t offset, uint8_t *buf, size_t bu
     __atomic_store_n(&lastVerifyOffset, (uint64_t)offset, __ATOMIC_RELAXED);
     __atomic_store_n(&lastVerifySize, (uint64_t)bufsize, __ATOMIC_RELAXED);
     __atomic_store_n(&lastVerifyPage, oursAt, __ATOMIC_RELAXED);
-    // 1.9.5: 日志拿不到，改把计数推给 IORegistry。每 boot 最多 8 次，代价可忽略。
+    // 日志拿不到，改把计数推给 IORegistry。每 boot 最多 8 次，代价可忽略。
     if (n <= 8) {
         ibtDiagPublishLive();
         const char *who = path[0] ? path : "<bt vnode>";
@@ -935,10 +939,34 @@ static int patched_vnop_verify(vnode_t vp, off_t offset, uint8_t *buf, size_t bu
             SYSLOG(MODULE_BTLFX, "swallowed verify mismatch #%u on %s @ 0x%llx (size %zu): patched page 0x%llx inside this group (%u pages recorded)",
                    n, who, (unsigned long long)offset, bufsize, (unsigned long long)oursAt, recorded);
         else
-            SYSLOG(MODULE_BTLFX, "swallowed verify mismatch #%u on %s @ 0x%llx (size %zu): no recorded patched page in this group (%u recorded) - window already evicted/rematerialised, diagnostic only",
+            SYSLOG(MODULE_BTLFX, "swallowed verify mismatch #%u on %s @ 0x%llx (size %zu): no recorded patched page in this group (%u recorded) - diagnostic only",
                    n, who, (unsigned long long)offset, bufsize, recorded);
     }
     return 0;
+}
+
+static mach_vm_address_t orig_vnop_verify {};
+
+static int patched_vnop_verify(vnode_t vp, off_t offset, uint8_t *buf, size_t bufsize, size_t *verifyblksize, void **verifyctxp, uint32_t flags, void *ctx, void *verifykind) {
+    int err = FunctionCast(patched_vnop_verify, orig_vnop_verify)(vp, offset, buf, bufsize, verifyblksize, verifyctxp, flags, ctx, verifykind);
+    // 1.9.7: 总调用数（不看 vnode）。用来区分两种 0：
+    //   总数为 0 → 这个符号在本内核里已经没人调用（死符号），钩它毫无意义；
+    //   总数很大而 bt 命中为 0 → 符号活着，但 bluetoothd 的校验不走它。
+    __atomic_fetch_add(&verifyAllCalls, 1, __ATOMIC_RELAXED);
+    if (vp == nullptr || disableVerifyBypass || !verifyBypassArmed)
+        return err;
+
+    // 1.9.6: 先做身份判定（≤16 次指针比较，无分配、无 I/O、可在缺页上下文安全调用）。
+    // 无论返回值都要计数——IBTVnopCalls 就是"钩子是否真的被调用"的唯一证据。
+    bool onBt = isBtVnode(vp);
+    if (onBt)
+        __atomic_fetch_add(&verifyCallsOnBt, 1, __ATOMIC_RELAXED);
+
+    if (err == 0 || buf == nullptr)
+        return err;
+
+    // 1.9.8: 判定逻辑抽到 handleBtVerifyError，与 _apfs_vnop_verify 共用同一份。
+    return handleBtVerifyError(vp, offset, bufsize, err, onBt);
 }
 
 // ---------------------------------------------------------------------------
@@ -974,6 +1002,60 @@ static int patched_decmpfs_validate(vnode_t vp, off_t offset, uint8_t *buf, size
     if (vp != nullptr && isBtVnode(vp))
         __atomic_fetch_add(&validateOnBt, 1, __ATOMIC_RELAXED);
     return FunctionCast(patched_decmpfs_validate, orig_decmpfs_validate)(vp, offset, buf, bufsize, a, b, c, d, e);
+}
+
+// ---------------------------------------------------------------------------
+// 1.9.8 APFS 侧钩子。
+//
+// _apfs_vnop_verify 是**唯一带吞错**的新钩子。它和前面那些"导出包装"的区别在于：
+// 调用方读 vnode 操作表拿到的是这个函数的地址，所以改它的函数头就等于接住了所有
+// 走表项的校验调用——_VNOP_VERIFY 那个导出包装之所以 0 次调用，正是因为没人经过它。
+// 第二个参数按 off_t 收、原样传回；3~9 槽用 void* 只做字节透传，不解引用。
+// bufsize 未知时传 0，此时页偏移比对退化成"只记 offset"，不影响吞不吞的决定。
+static mach_vm_address_t orig_apfs_vnop_verify {};
+
+static int patched_apfs_vnop_verify(vnode_t vp, off_t offset, void *a3, void *a4, void *a5, void *a6, void *a7, void *a8, void *a9) {
+    int err = FunctionCast(patched_apfs_vnop_verify, orig_apfs_vnop_verify)(vp, offset, a3, a4, a5, a6, a7, a8, a9);
+    __atomic_fetch_add(&apfsVerAll, 1, __ATOMIC_RELAXED);
+    if (vp == nullptr || disableVerifyBypass || !apfsVerifyArmed)
+        return err;
+
+    bool onBt = isBtVnode(vp);
+    if (onBt)
+        __atomic_fetch_add(&apfsVerOnBt, 1, __ATOMIC_RELAXED);
+    if (err == 0)
+        return err;
+
+    return handleBtVerifyError(vp, offset, 0, err, onBt);
+}
+
+// 下面三个只计数，不改变行为——它们是"如果不是 vop_verify，那到底是哪个"的定位探针。
+// 每个都必须有自己独立的 orig 指针，共用会被后一次路由覆盖，先装的钩子转发进错函数。
+static mach_vm_address_t orig_apfs_pagein_verif {};
+
+static int patched_apfs_pagein_verif(vnode_t vp, off_t offset, void *a3, void *a4, void *a5, void *a6, void *a7, void *a8, void *a9) {
+    __atomic_fetch_add(&apfsPiAll, 1, __ATOMIC_RELAXED);
+    if (vp != nullptr && isBtVnode(vp))
+        __atomic_fetch_add(&apfsPiOnBt, 1, __ATOMIC_RELAXED);
+    return FunctionCast(patched_apfs_pagein_verif, orig_apfs_pagein_verif)(vp, offset, a3, a4, a5, a6, a7, a8, a9);
+}
+
+static mach_vm_address_t orig_apfs_verify_unc {};
+
+static int patched_apfs_verify_unc(vnode_t vp, off_t offset, void *a3, void *a4, void *a5, void *a6, void *a7, void *a8, void *a9) {
+    __atomic_fetch_add(&apfsUncAll, 1, __ATOMIC_RELAXED);
+    if (vp != nullptr && isBtVnode(vp))
+        __atomic_fetch_add(&apfsUncOnBt, 1, __ATOMIC_RELAXED);
+    return FunctionCast(patched_apfs_verify_unc, orig_apfs_verify_unc)(vp, offset, a3, a4, a5, a6, a7, a8, a9);
+}
+
+static mach_vm_address_t orig_apfs_verify_rl {};
+
+static int patched_apfs_verify_rl(vnode_t vp, off_t offset, void *a3, void *a4, void *a5, void *a6, void *a7, void *a8, void *a9) {
+    __atomic_fetch_add(&apfsRlAll, 1, __ATOMIC_RELAXED);
+    if (vp != nullptr && isBtVnode(vp))
+        __atomic_fetch_add(&apfsRlOnBt, 1, __ATOMIC_RELAXED);
+    return FunctionCast(patched_apfs_verify_rl, orig_apfs_verify_rl)(vp, offset, a3, a4, a5, a6, a7, a8, a9);
 }
 
 static void processPatcher(KernelPatcher &patcher) {    const bool argOta    = checkKernelArgument("-ibtota");
@@ -1041,6 +1123,33 @@ static void processPatcher(KernelPatcher &patcher) {    const bool argOta    = c
     KernelPatcher::RouteRequest decmpfsValidateRoute("_decmpfs_validate_compressed_file", patched_decmpfs_validate, orig_decmpfs_validate);
     if (patcher.routeMultipleLong(KernelPatcher::KernelID, &decmpfsValidateRoute, 1))
         __atomic_fetch_or(&symMask, 8u, __ATOMIC_RELAXED);
+
+    // 1.9.8: 符号名是从内核缓存里枚举出来的（strings 不可用，用 tr|grep 得到）：
+    //   _apfs_vnop_verify / _apfs_pagein_with_verification / _apfs_verify_uncompressed_data /
+    //   _apfs_verify_rangelist / _apfs_get_verification_info / _apfs_vnodeop_entries ...
+    // 前四条装钩：bit4 带吞错（表项实现，唯一可能真正生效的拦截点），bit5~bit7 只计数。
+    // APFS 是 kext，但 macOS 11+ 所有 kext 编进内核缓存，符号在 KernelID 下同样能解析
+    // （_decmpfs_pagein_compressed 就在 AppleAPFS 里，1.9.7 已验证这条路可行）。
+    KernelPatcher::RouteRequest apfsVerifyRoute("_apfs_vnop_verify", patched_apfs_vnop_verify, orig_apfs_vnop_verify);
+    if (patcher.routeMultipleLong(KernelPatcher::KernelID, &apfsVerifyRoute, 1)) {
+        apfsVerifyArmed = true;
+        __atomic_fetch_or(&symMask, 0x10u, __ATOMIC_RELAXED);
+        SYSLOG(MODULE_BTLFX, "apfs_vnop_verify bypass armed (vnode op table entry, bluetoothd/BlueTool only)");
+    } else {
+        SYSLOG(MODULE_BTLFX, "failed to route apfs_vnop_verify (fallback to _VNOP_VERIFY only)");
+    }
+
+    KernelPatcher::RouteRequest apfsPageinRoute("_apfs_pagein_with_verification", patched_apfs_pagein_verif, orig_apfs_pagein_verif);
+    if (patcher.routeMultipleLong(KernelPatcher::KernelID, &apfsPageinRoute, 1))
+        __atomic_fetch_or(&symMask, 0x20u, __ATOMIC_RELAXED);
+
+    KernelPatcher::RouteRequest apfsUncRoute("_apfs_verify_uncompressed_data", patched_apfs_verify_unc, orig_apfs_verify_unc);
+    if (patcher.routeMultipleLong(KernelPatcher::KernelID, &apfsUncRoute, 1))
+        __atomic_fetch_or(&symMask, 0x40u, __ATOMIC_RELAXED);
+
+    KernelPatcher::RouteRequest apfsRlRoute("_apfs_verify_rangelist", patched_apfs_verify_rl, orig_apfs_verify_rl);
+    if (patcher.routeMultipleLong(KernelPatcher::KernelID, &apfsRlRoute, 1))
+        __atomic_fetch_or(&symMask, 0x80u, __ATOMIC_RELAXED);
 }
 
 #pragma mark - Lilu
@@ -1068,6 +1177,14 @@ void ibtDiagFill(IbtDiagSnapshot *out) {
     out->decOnBt      = __atomic_load_n(&decmpfsOnBt, __ATOMIC_RELAXED);
     out->valAll       = __atomic_load_n(&validateAll, __ATOMIC_RELAXED);
     out->valOnBt      = __atomic_load_n(&validateOnBt, __ATOMIC_RELAXED);
+    out->apfsVerAll   = __atomic_load_n(&apfsVerAll, __ATOMIC_RELAXED);
+    out->apfsVerOnBt  = __atomic_load_n(&apfsVerOnBt, __ATOMIC_RELAXED);
+    out->apfsPiAll    = __atomic_load_n(&apfsPiAll, __ATOMIC_RELAXED);
+    out->apfsPiOnBt   = __atomic_load_n(&apfsPiOnBt, __ATOMIC_RELAXED);
+    out->apfsUncAll   = __atomic_load_n(&apfsUncAll, __ATOMIC_RELAXED);
+    out->apfsUncOnBt  = __atomic_load_n(&apfsUncOnBt, __ATOMIC_RELAXED);
+    out->apfsRlAll    = __atomic_load_n(&apfsRlAll, __ATOMIC_RELAXED);
+    out->apfsRlOnBt   = __atomic_load_n(&apfsRlOnBt, __ATOMIC_RELAXED);
     out->pmEvents     = 0; // 由驱动层覆盖
     out->patchedPages = __atomic_load_n(&patchedPageCount, __ATOMIC_RELAXED);
     out->lastOffset   = __atomic_load_n(&lastVerifyOffset, __ATOMIC_RELAXED);

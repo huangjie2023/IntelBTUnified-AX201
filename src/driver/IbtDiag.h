@@ -30,6 +30,7 @@ struct IbtDiagSnapshot {
     unsigned int pmEvents;      // 睡眠/唤醒回调次数，用来判断快照新鲜度
     // 1.9.7 探针：候选入口是否装上了（按位）、各自总调用数、命中 bt vnode 的次数
     unsigned int symMask;       // bit0 _VNOP_VERIFY, bit1 _vnode_verify, bit2 _decmpfs_pagein_compressed, bit3 _decmpfs_validate_compressed_file
+                                // 1.9.8: bit4 _apfs_vnop_verify, bit5 _apfs_pagein_with_verification, bit6 _apfs_verify_uncompressed_data, bit7 _apfs_verify_rangelist
     unsigned int vnopAll;       // _VNOP_VERIFY 总调用
     unsigned int kvAll;         // _vnode_verify 总调用
     unsigned int kvOnBt;        // _vnode_verify 命中 bt vnode
@@ -37,6 +38,15 @@ struct IbtDiagSnapshot {
     unsigned int decOnBt;       // 同上，命中 bt vnode
     unsigned int valAll;        // _decmpfs_validate_compressed_file 总调用
     unsigned int valOnBt;       // 同上，命中 bt vnode
+    // 1.9.8 APFS 侧：第一个是带吞错的真正钩点，后三个只计数
+    unsigned int apfsVerAll;    // _apfs_vnop_verify 总调用（表项实现）
+    unsigned int apfsVerOnBt;   // 同上，命中 bt vnode —— >0 说明这就是入口
+    unsigned int apfsPiAll;     // _apfs_pagein_with_verification 总调用
+    unsigned int apfsPiOnBt;
+    unsigned int apfsUncAll;    // _apfs_verify_uncompressed_data 总调用
+    unsigned int apfsUncOnBt;
+    unsigned int apfsRlAll;     // _apfs_verify_rangelist 总调用
+    unsigned int apfsRlOnBt;
     unsigned int patchedPages;  // 本 boot 记录到的补丁页数（诊断附注，不作判定）
     unsigned long long lastOffset;  // 最后一次被吞的校验起点
     unsigned long long lastSize;    // 最后一次被吞的校验长度

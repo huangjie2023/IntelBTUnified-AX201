@@ -16,6 +16,51 @@
 
 > 上游 FAQ 明确：**macOS Monterey 及以后不要使用 `IntelBluetoothInjector.kext`**（"Do NOT use this Kext on macOS Monterey and newer"）。Monterey+ 靠的是驱动把 USB 设备改名为 `Bluetooth USB Host Controller` 来绕过 bluetoothd/BlueTool 的 board-id 检查，所以单 kext 里**不该**有那条 Broadcom transport 注入 personality。本包结构对应全量包的 `IntelBluetoothFirmware` + `IntelBTPatcher` + `BlueToolFixup`，不含 Injector。
 
+## 1.9.8：找到真正的那一层——`_apfs_vnop_verify`
+
+1.9.7 实机读数（2026-11-06 17:32）：
+
+| 属性 | 值 | 含义 |
+|---|---|---|
+| `IBTSymMask` | 13（`1101`） | bit1 `_vnode_verify` **符号不存在**；其余三条路由成功 |
+| `IBTVnopAll` | **0** | `_VNOP_VERIFY` 全系统调用数 0 → 导出了但内核自己不用 |
+| `IBTDecAll` / `DecOnBt` | 27 / **0** | `_decmpfs_pagein_compressed` 活着，但 bluetoothd 的解压不走它 |
+| `IBTValAll` / `ValOnBt` | 2 / **0** | 同上 |
+
+两件事因此确定：
+
+1. **`_VNOP_VERIFY` 是兼容性空壳。** XNU 内部调用者用 `(*vp->v_op->vop_verify)()` 直接跳 vnode 操作表，绕开这个导出包装。1.9.1~1.9.6 六版钩的都是它，所以从来没有被调用过——这不是判据问题，是钩错了对象。
+2. **bluetoothd 的解压不在 decmpfs 里。** `IBTPatchedPages = 4` 证明压缩页确实 pagein 过；若走 decmpfs，必然产生 ≥4 次 `decmpfs_pagein_compressed(bt vnode)`，实测 0。
+
+于是从内核缓存里枚举符号名（`strings` 属 CLT，用 `tr -c '[:graph:]' '\n'` 等价替代），在 `BootKernelExtensions.kc` 的 899 个 `apfs_*`/`decmpfs_*` 符号里找到直接答案：
+
+```
+_apfs_vnop_verify                  ← vnode 操作表里 vop_verify 的表项实现（本版吞错目标）
+_apfs_pagein_with_verification     ← 名字直说"带校验的 pagein"
+_apfs_verify_uncompressed_data     ← 明文数据校验
+_apfs_verify_rangelist             ← 区间校验
+_apfs_get_verification_info / _apfs_get_verification_kind / _apfs_rangelist_verification_mode
+```
+
+**关键机制**：表项里存的就是 `_apfs_vnop_verify` 的地址。改它的函数头，走表项的调用同样会落到我们这里——所以这一版的钩子不需要经过任何导出包装，这是 1.9.1 以来第一次真正站在调用路径上。
+
+本版新增：
+
+- `_apfs_vnop_verify`：**带 EBADMSG 吞错**（`symMask` bit4）。判定逻辑与旧钩子共用 `handleBtVerifyError()`，定域规则不变（路径优先、vnode 身份兜底、三条确定性条件）。
+- `_apfs_pagein_with_verification` / `_apfs_verify_uncompressed_data` / `_apfs_verify_rangelist`：只计数（bit5~bit7），用于"如果不是 vop_verify 那到底是哪个"的定位。
+- 新属性：`IBTApfsVerAll/OnBt`、`IBTApfsPiAll/OnBt`、`IBTApfsUncAll/OnBt`、`IBTApfsRlAll/OnBt`。
+
+读法：
+
+```bash
+ioreg -r -c IntelBluetoothFirmware -l -w0 | grep -E '"IBTApfs|"IBTSymMask|"IBTSwallowed'
+```
+
+- `IBTApfsVerOnBt > 0` → **入口确认**，这就是该钩的地方；若同时 `IBTSwallowed > 0`，说明真的拦下了一次崩溃。
+- `IBTApfsVerOnBt > 0` 但 `IBTApfsVerAll` 远大于它 → 钩子在正常工作，其他文件不受影响（定域正确）。
+- `IBTApfsVerOnBt = 0` 而 `IBTApfsPiOnBt > 0` → 校验在 pagein 内部完成，下版把吞错挪到 `_apfs_pagein_with_verification`（该路径返回 0 而不填数据有风险，届时要单独设计）。
+- 四个全 0 → 继续往 `_apfs_get_verification_info` 或 UPL/`ubc` 一侧找。
+
 ## 1.9.7：1.9.6 实测判定——`_VNOP_VERIFY` 不是入口，改为三路探针
 
 1.9.6 首次实机读数（2026-11-06 17:17，装好后一次合盖唤醒）：
