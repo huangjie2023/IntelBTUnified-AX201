@@ -892,7 +892,7 @@ static void processPatcher(KernelPatcher &patcher) {
     KernelPatcher::RouteRequest verifyRoute("_VNOP_VERIFY", patched_vnop_verify, orig_vnop_verify);
     if (patcher.routeMultipleLong(KernelPatcher::KernelID, &verifyRoute, 1)) {
         verifyBypassArmed = true;
-        SYSLOG(MODULE_BTLFX, "VNOP_VERIFY bypass armed (bluetoothd/BlueTool only, swallows only when our patched page is inside the failing range)");
+        SYSLOG(MODULE_BTLFX, "VNOP_VERIFY bypass armed (bluetoothd/BlueTool only, any EBADMSG will be swallowed)");
     } else {
         SYSLOG(MODULE_BTLFX, "failed to route VNOP_VERIFY (crash fix INACTIVE - symbol missing)");
     }
