@@ -104,6 +104,25 @@ A1 B1 A2 B2 A3 B3      <- 三个事件一组，每组带同一个 connection han
 
 验证方法：装 1.9.1 后正常使用 + 合盖睡眠几轮；`log show --last boot | grep -i "swallowed verify"` 应能看到吞错记录（出现即说明曾经命中故障条件且被拦下），同时不应再出现新的 bluetoothd SIGBUS 崩溃报告。bt-probe 的 `purge + kickstart` 自愈作为后手保留。
 
+### 1.9.2：修掉 1.9.1 吞错的顺序依赖 bug（2026-11-06）
+
+**1.9.1 实测无效，且能定位到确切原因。** 2026-11-05 21:29 的崩溃报告里 `consecutiveCrashCount: 6`——bluetoothd 连续崩 6 次，每次只活 88 ms，日志里 `swallowed` 一条都没有。翻源码发现是判据 3 被写反了顺序：
+
+- 判据 3 要求“**本 boot 我们确实改写过它的页**”才允许吞；
+- 该标志只在“某一页命中 pattern 并替换成功”时置位；
+- 真实执行顺序是「**先缺页 → 先对 16KiB 组做 `VNOP_VERIFY` → 之后才轮到含 pattern 的页被访问**」；
+- 于是崩溃发生的那一刻标志必然是 `false`，条件永远不成立——吞错功能等于没装。
+
+本机崩溃点 `0x10964eb50 - 0x109315000 = 0x339B50`（第 0x339 页），而补丁命中页在 0x17F/0x184/0x516 一片，正好走不到“先命中”这条路。
+
+**1.9.2 改动**：
+
+1. 删除判据 3。门控改为“钩子已 armed（`routeMultipleLong` 成功）+ `vn_getpath` 精确匹配这两个文件 + 错误码 `EBADMSG`”。`-ibtota` 下钩子根本不会安装，所以这个门控本来就是冗余的；真正的范围限制由路径判定完成。
+2. **成功也打日志**：`cs_validate page hook armed` / `VNOP_VERIFY bypass armed` / `failed to route VNOP_VERIFY (...INACTIVE...)`。1.9.1 只在失败时打，导致“到底挂上没有”只能推断——这正是本次排查被卡住的地方。
+3. 新增三类一次性证据行：`swallowed verify mismatch #N on <path> @ 0x...`（前 8 次）、`verify error %d but vn_getpath failed`、`verify returned %d on <path> (not EBADMSG)`。
+
+**这一版顺带把“补丁导致”还是“盘上真坏”彻底分清**：吞错日志里的 `@ 0x...` 是失败 16KiB 组的起始偏移，和同一份日志里 `patched /usr/sbin/bluetoothd: ... file offset 0x...` 一比对即可——组内有我们的补丁页 = 补丁的预期副作用（本修复正当）；组内一个补丁页都没有 = 与补丁无关，是盘上数据真的读错了。
+
 ### 2026-11-04：bluetoothd 变成崩溃循环，~~根因在系统卷而不是驱动~~（结论已被 1.9.1 推翻）
 
 新现象与上面那份 `EXC_GUARD` **不是一回事**：`EXC_BAD_ACCESS (SIGBUS)` + `KERN_MEMORY_ERROR`，内核 triage 是 `APFS - Encountered a compressed data hash mismatch` / `Pagein of compressed inode failed` / `VM - Filesystem pagein returned an error in vnode_pagein`，落点仍在 bluetoothd 的 `__TEXT`。
@@ -250,7 +269,7 @@ IntelFirmware: Intel boot failed
 | `-ibtplegacy` | 恢复老式无条件补丁（等价 BlueToolFixup，会破坏 OTA 校验） |
 | `-ibtleoff` | 关闭 LE Read Remote Features 事件改写（隔离「连不上又没崩溃」用） |
 | `-ibtphy2m` | 假 PHY Update 恢复上报 LE 2M（1.9.0 之前的行为，仅用于对照） |
-| `-ibtnovb` | 关闭 1.9.1 的 `_VNOP_VERIFY` EBADMSG 吞错（诊断对照用；默认开启，勿关） |
+| `-ibtnovb` | 关闭 `_VNOP_VERIFY` EBADMSG 吞错（诊断对照用；默认开启，勿关） |
 | `-ibtpdbg` | 打开 LE 槽位/事件改写诊断日志（默认关闭，热路径零输出） |
 | `-btlfxboardid` / `-btlfxallowanyaddr` / `-btlfxnvramcheck` | 同 BlueToolFixup 原有开关 |
 
