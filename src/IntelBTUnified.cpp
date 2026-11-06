@@ -712,6 +712,14 @@ static uint32_t apfsUncOnBt = 0;
 static uint32_t apfsRlAll = 0;
 static uint32_t apfsRlOnBt = 0;
 static bool apfsVerifyArmed = false;
+// 1.9.9: 1.9.8 实机 SymMask=13（只有 bit0/2/3），四条 APFS 路由全部失败、计数器全 0。
+// 原因不是符号不存在（字符串枚举确认过），而是**查错了符号表**：
+// APFS 是 kext，它的内部函数是局部符号（只被同文件的 vnode 操作表引用，不进内核导出表），
+// 而 KernelPatcher::KernelID 走的是内核导出符号表。Lilu 的正规做法是先用 bundle id 取到
+// 该 kext 的 kinfo（loadKinfo → prelink/KC 里按 id 找），再用这个 id 解析符号与路由。
+// 记录两件事：bit8 = APFS kinfo 是否拿到；apfsSolveMask = 四个符号各自是否解析成功
+// （这样才能区分“kext 没找到”“符号没找到”“符号找到但路由失败”三种失败）。
+static uint32_t apfsSolveMask = 0;
 
 static inline bool isBtVnode(vnode_t vp) {
     uint32_t n = __atomic_load_n(&btVnodeCount, __ATOMIC_ACQUIRE);
@@ -1124,14 +1132,39 @@ static void processPatcher(KernelPatcher &patcher) {    const bool argOta    = c
     if (patcher.routeMultipleLong(KernelPatcher::KernelID, &decmpfsValidateRoute, 1))
         __atomic_fetch_or(&symMask, 8u, __ATOMIC_RELAXED);
 
-    // 1.9.8: 符号名是从内核缓存里枚举出来的（strings 不可用，用 tr|grep 得到）：
-    //   _apfs_vnop_verify / _apfs_pagein_with_verification / _apfs_verify_uncompressed_data /
-    //   _apfs_verify_rangelist / _apfs_get_verification_info / _apfs_vnodeop_entries ...
-    // 前四条装钩：bit4 带吞错（表项实现，唯一可能真正生效的拦截点），bit5~bit7 只计数。
-    // APFS 是 kext，但 macOS 11+ 所有 kext 编进内核缓存，符号在 KernelID 下同样能解析
-    // （_decmpfs_pagein_compressed 就在 AppleAPFS 里，1.9.7 已验证这条路可行）。
+    // 1.9.9: 改用 APFS 自己的 kinfo id 解析符号。1.9.8 用 KernelID 试这四条全部失败
+    // （SymMask 没有 bit4~7），而符号确实存在于内核缓存里——差别只在"哪个符号表"。
+    // bit8 记录是否拿到 APFS kinfo；IBTApfsSolve 的 0..3 位记录四个符号各自是否解析成功。
+    static const char *apfsPaths[] { "/System/Library/Extensions/AppleAPFS.kext" };
+    patcher.clearError();
+    size_t apfsId = patcher.loadKinfo("com.apple.filesystems.apfs", apfsPaths, arrsize(apfsPaths), false);
+    bool apfsKext = apfsId < 32;   // INVALID 是 SIZE_MAX，任何真实下标都远小于 32
+    if (apfsKext)
+        __atomic_fetch_or(&symMask, 0x100u, __ATOMIC_RELAXED);
+    size_t apfsSymId = apfsKext ? apfsId : KernelPatcher::KernelID;
+
+    const char *apfsSyms[4] {
+        "_apfs_vnop_verify",
+        "_apfs_pagein_with_verification",
+        "_apfs_verify_uncompressed_data",
+        "_apfs_verify_rangelist",
+    };
+    for (size_t i = 0; i < arrsize(apfsSyms); i++)
+        if (patcher.solveSymbol(apfsSymId, apfsSyms[i]))
+            __atomic_fetch_or(&apfsSolveMask, 1u << i, __ATOMIC_RELAXED);
+
+    // 路由统一走一个小包装：先按 APFS kinfo 的 id 试，失败再退回 KernelID（1.9.8 的路径）。
+    // 两条都失败才算真失败，这样 bit4~7 的含义保持"这条钩子到底装上没有"。
+    auto routeApfs = [&](KernelPatcher::RouteRequest &req) -> bool {
+        if (patcher.routeMultipleLong(apfsSymId, &req, 1))
+            return true;
+        if (apfsKext && apfsSymId != KernelPatcher::KernelID)
+            return patcher.routeMultipleLong(KernelPatcher::KernelID, &req, 1);
+        return false;
+    };
+
     KernelPatcher::RouteRequest apfsVerifyRoute("_apfs_vnop_verify", patched_apfs_vnop_verify, orig_apfs_vnop_verify);
-    if (patcher.routeMultipleLong(KernelPatcher::KernelID, &apfsVerifyRoute, 1)) {
+    if (routeApfs(apfsVerifyRoute)) {
         apfsVerifyArmed = true;
         __atomic_fetch_or(&symMask, 0x10u, __ATOMIC_RELAXED);
         SYSLOG(MODULE_BTLFX, "apfs_vnop_verify bypass armed (vnode op table entry, bluetoothd/BlueTool only)");
@@ -1140,15 +1173,15 @@ static void processPatcher(KernelPatcher &patcher) {    const bool argOta    = c
     }
 
     KernelPatcher::RouteRequest apfsPageinRoute("_apfs_pagein_with_verification", patched_apfs_pagein_verif, orig_apfs_pagein_verif);
-    if (patcher.routeMultipleLong(KernelPatcher::KernelID, &apfsPageinRoute, 1))
+    if (routeApfs(apfsPageinRoute))
         __atomic_fetch_or(&symMask, 0x20u, __ATOMIC_RELAXED);
 
     KernelPatcher::RouteRequest apfsUncRoute("_apfs_verify_uncompressed_data", patched_apfs_verify_unc, orig_apfs_verify_unc);
-    if (patcher.routeMultipleLong(KernelPatcher::KernelID, &apfsUncRoute, 1))
+    if (routeApfs(apfsUncRoute))
         __atomic_fetch_or(&symMask, 0x40u, __ATOMIC_RELAXED);
 
     KernelPatcher::RouteRequest apfsRlRoute("_apfs_verify_rangelist", patched_apfs_verify_rl, orig_apfs_verify_rl);
-    if (patcher.routeMultipleLong(KernelPatcher::KernelID, &apfsRlRoute, 1))
+    if (routeApfs(apfsRlRoute))
         __atomic_fetch_or(&symMask, 0x80u, __ATOMIC_RELAXED);
 }
 
@@ -1185,6 +1218,7 @@ void ibtDiagFill(IbtDiagSnapshot *out) {
     out->apfsUncOnBt  = __atomic_load_n(&apfsUncOnBt, __ATOMIC_RELAXED);
     out->apfsRlAll    = __atomic_load_n(&apfsRlAll, __ATOMIC_RELAXED);
     out->apfsRlOnBt   = __atomic_load_n(&apfsRlOnBt, __ATOMIC_RELAXED);
+    out->apfsSolve    = __atomic_load_n(&apfsSolveMask, __ATOMIC_RELAXED);
     out->pmEvents     = 0; // 由驱动层覆盖
     out->patchedPages = __atomic_load_n(&patchedPageCount, __ATOMIC_RELAXED);
     out->lastOffset   = __atomic_load_n(&lastVerifyOffset, __ATOMIC_RELAXED);

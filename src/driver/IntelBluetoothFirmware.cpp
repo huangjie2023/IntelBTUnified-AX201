@@ -69,6 +69,7 @@ void ibtDiagPublishLive()
     svc->setProperty("IBTApfsUncOnBt", (unsigned long long)s.apfsUncOnBt, 32);
     svc->setProperty("IBTApfsRlAll", (unsigned long long)s.apfsRlAll, 32);
     svc->setProperty("IBTApfsRlOnBt", (unsigned long long)s.apfsRlOnBt, 32);
+    svc->setProperty("IBTApfsSolve", (unsigned long long)s.apfsSolve, 32);
     svc->setProperty("IBTPmEvents", (unsigned long long)s.pmEvents, 32);
     svc->setProperty("IBTPatchedPages", (unsigned long long)s.patchedPages, 32);
     svc->setProperty("IBTLastOffset", s.lastOffset, 64);

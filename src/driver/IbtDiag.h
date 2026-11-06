@@ -47,6 +47,7 @@ struct IbtDiagSnapshot {
     unsigned int apfsUncOnBt;
     unsigned int apfsRlAll;     // _apfs_verify_rangelist 总调用
     unsigned int apfsRlOnBt;
+    unsigned int apfsSolve;     // 1.9.9: 四个 APFS 符号各自是否解析成功（0..3 位），区分"kext 没找到/符号没找到"
     unsigned int patchedPages;  // 本 boot 记录到的补丁页数（诊断附注，不作判定）
     unsigned long long lastOffset;  // 最后一次被吞的校验起点
     unsigned long long lastSize;    // 最后一次被吞的校验长度

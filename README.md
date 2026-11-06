@@ -16,6 +16,41 @@
 
 > 上游 FAQ 明确：**macOS Monterey 及以后不要使用 `IntelBluetoothInjector.kext`**（"Do NOT use this Kext on macOS Monterey and newer"）。Monterey+ 靠的是驱动把 USB 设备改名为 `Bluetooth USB Host Controller` 来绕过 bluetoothd/BlueTool 的 board-id 检查，所以单 kext 里**不该**有那条 Broadcom transport 注入 personality。本包结构对应全量包的 `IntelBluetoothFirmware` + `IntelBTPatcher` + `BlueToolFixup`，不含 Injector。
 
+## 1.9.9：APFS 的符号要走 kext 的 kinfo，不是 `KernelID`
+
+1.9.8 实机读数（2026-11-06 17:54）：`IBTSymMask = 13`（二进制 `1101`），**bit4~7 全部没有**，`IBTApfs*` 八个计数器全 0。也就是说四条 APFS 路由一条都没装上，那一版的吞错等于没编译进去。
+
+原因不是符号名写错（字符串枚举已经确认它们在 `BootKernelExtensions.kc` 里），而是**查错了符号表**：
+
+- `KernelPatcher::KernelID`（0）解析的是**内核导出符号表**。`_decmpfs_pagein_compressed` 能解析，是因为它是导出符号（1.9.7 里三条路由成功即为证）。
+- `_apfs_vnop_verify` 这类是 **kext 内部函数**：只被同文件的 `apfs_vnodeop_entries[]` 表引用，不导出。导出表里没有它，查表必然失败——这就是 bit4~7 全 0 的机制性原因。
+
+Lilu 的正规做法（`kern_patcher.cpp` 里的 `loadKinfo` + `solveSymbol(id, sym)`）：先用 bundle id 拿到该 kext 的 kinfo 下标，再用这个下标解析符号与路由。
+
+本版改动：
+
+```cpp
+size_t apfsId = patcher.loadKinfo("com.apple.filesystems.apfs", apfsPaths, 1, false);
+// apfsId < 32 即成功；之后 solveSymbol(apfsId, ...) / routeMultipleLong(apfsId, ...)
+```
+
+- 失败兜底：APFS kinfo 拿到之后若路由仍失败，退回 `KernelID` 再试一次（1.9.8 的路径），两条都失败才置位失败
+- `IBTSymMask` 新增 bit8 = APFS kinfo 是否拿到
+- 新增 `IBTApfsSolve`：0~3 位分别表示四个符号是否解析成功。这样才能区分三种失败：**kext 没找到** / **符号没找到** / **符号找到但路由失败（比如函数头太短）**
+
+读法：
+
+```bash
+ioreg -r -c IntelBluetoothFirmware -l -w0 | grep -E '"IBTSymMask|"IBTApfsSolve|"IBTApfsVer'
+```
+
+| `IBTSymMask` | `IBTApfsSolve` | 结论 |
+|---|---|---|
+| bit8 = 1，bit4 = 1 | ≥ 1 | APFS kinfo 生效、钩子装上，等 `IBTApfsVerOnBt` 涨即可 |
+| bit8 = 1，bit4 = 0 | ≥ 1 | 符号能找到但路由失败 → 函数头不适合 inline hook，得改用表项改写 |
+| bit8 = 1 | 0 | kext 找到了但符号不在它的符号表里 → 只剩"从 `vp->v_op` 表项拿地址"这一条路 |
+| bit8 = 0 | 0 | `loadKinfo("com.apple.filesystems.apfs")` 失败（KC 里 kext 不带 kinfo？）→ 同样走表项路 |
+
 ## 1.9.8：找到真正的那一层——`_apfs_vnop_verify`
 
 1.9.7 实机读数（2026-11-06 17:32）：
