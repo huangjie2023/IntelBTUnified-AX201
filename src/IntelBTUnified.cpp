@@ -39,6 +39,14 @@
 //
 //  Solo macOS 12 (Monterey) o posterior: los parches de macOS 11 y anteriores se han eliminado.
 //
+//  1.9.2: 修掉 1.9.1 吞错的实际失效原因（顺序依赖 bug）。
+//  1.9.1 要求“本 boot 真的补丁过该文件”才允许吞错，而该标志只在某页命中 pattern 时
+//  才置位。真实顺序是「先缺页 → 先做 16KiB 组校验 → 才轮到后面含 pattern 的页」，
+//  崩溃发生时标志必然还是 false，条件永远不成立——本机实测：连续崩 6 次、同一
+//  offset、日志里零条 swallowed。1.9.2 把门控改成“钩子已 armed + vnode 路径精确匹配
+//  这两个文件 + 错误码 EBADMSG”，并补上成功路径的日志（armed / swallowed #n /
+//  vn_getpath 失败 / 非 EBADMSG），下次崩溃后日志本身就能给出结论。
+//
 //  SPDX-License-Identifier: GPL-3.0-only
 //
 
@@ -600,12 +608,24 @@ static uint32_t appliedPatches = 0;
 // es justamente una de las que tocamos nosotros o no.
 static uint64_t currentPageOffset = 0;
 
-// 1.9.1: 本 boot 是否真的改写过这两个文件的页（只有改写过才允许吞 VNOP_VERIFY 的
-// EBADMSG）。set-once，用原子写保证 VNOP_VERIFY 钩子（任意进程上下文）能读到。
-static bool patchedBluetoothdPages = false;
-static bool patchedBlueToolPages = false;
-// -ibtnovb: 关闭 1.9.1 的 VNOP_VERIFY 吞错（诊断开关）。
+// 1.9.2: 去掉 1.9.1“本 boot 确实补丁过该文件”这个前置门控——它是顺序依赖的 bug：
+// 该标志只在“某一页命中 pattern 并替换成功”时才置位，而 bluetoothd 启动时先缺页的
+// 往往是不含 pattern 的页（本机崩溃点就在 0x339 的类型编码字符串页），等崩溃发生的
+// 那一刻标志仍是 false，条件 3 不成立 → 一次都不会吞。这与实测完全吻合：连崩 6 次、
+// 同一个 offset、零条 swallowed。
+//
+// 现在 arming 只表达“钩子确实挂上了”：cs 打补丁总闸 (-ibtota) 关闭时 processPatcher
+// 会直接 return，VNOP_VERIFY 钩子根本不会被安装，所以这个门控不再有存在意义；
+// 真正的范围限制由运行时 vnode 路径判定完成（仍然只认那两个文件）。
+static bool verifyBypassArmed = false;
+// -ibtnovb: 关闭 VNOP_VERIFY 吞错（诊断开关）。
 static bool disableVerifyBypass = false;
+// 计数：命中（吞掉）次数、路径解析失败次数、非 EBADMSG 错误次数。首次发生时各打一行，
+// 这样下次崩溃后 log 里一定有可判读的证据，不用再靠推断。
+static uint32_t verifySwallowed = 0;
+static uint32_t verifyPathFailures = 0;
+static uint32_t verifyOtherErrors = 0;
+static uint32_t patchedPageHits = 0;
 static constexpr size_t kSbinDirLength = sizeof("/usr/sbin/") - 1;
 
 static inline void notePatch(PatchId id, const char *name, const char *path, size_t off) {
@@ -626,7 +646,7 @@ static inline size_t findPatternOffset(const void *haystack, size_t haystackSize
 }
 
 // 1.9.1: 返回是否真的改到了字节（findAndReplace 找到并替换才为 true）。
-// 调用方据此置位 patchedBluetoothdPages / patchedBlueToolPages。
+// 1.9.2: 返回值只用于计数（patchedPageHits），不再参与吞错门控。
 static inline bool searchAndPatch(PatchId id, const char *name, const void *haystack, size_t haystackSize, const char *path, const void *needle, size_t findSize, const void *patch, size_t replaceSize) {
     size_t off = findPatternOffset(haystack, haystackSize, needle, findSize);
     if (KernelPatcher::findAndReplace(const_cast<void *>(haystack), haystackSize, needle, findSize, patch, replaceSize)) {
@@ -677,7 +697,7 @@ static void patched_cs_validate_page(vnode_t vp, memory_object_t pager, memory_o
             if (shouldPatchBoardId)
                 any |= searchAndPatch(PatchBlueToolBid, "board-id", data, PAGE_SIZE, path, boardIdsWithUSBBluetooth[0], kBoardIdSize, BaseDeviceInfo::get().boardIdentifier, kBoardIdSize);
             if (any)
-                __atomic_store_n(&patchedBlueToolPages, true, __ATOMIC_RELEASE);
+                __atomic_add_fetch(&patchedPageHits, 1, __ATOMIC_RELAXED);
         }
         else if (strcmp(path + kSbinDirLength, "bluetoothd") == 0) {
             if (!legacyCsPatching && !currentProcIs("bluetoothd"))
@@ -696,7 +716,7 @@ static void patched_cs_validate_page(vnode_t vp, memory_object_t pager, memory_o
             if (shouldPatchAddress)
                 any |= searchAndPatchWithMask(PatchAddress, "same-address check", data, PAGE_SIZE, path, kSkipAddressCheckOriginal, sizeof(kSkipAddressCheckOriginal), kSkipAddressCheckMask, sizeof(kSkipAddressCheckMask), kSkipAddressCheckPatched, sizeof(kSkipAddressCheckPatched));
             if (any)
-                __atomic_store_n(&patchedBluetoothdPages, true, __ATOMIC_RELEASE);
+                __atomic_add_fetch(&patchedPageHits, 1, __ATOMIC_RELAXED);
         }
     }
 }
@@ -717,30 +737,47 @@ static void patched_cs_validate_page(vnode_t vp, memory_object_t pager, memory_o
 // 错误 abort → vm_fault 失败 → bluetoothd SIGBUS（Time Since Wake ~20-30s 的
 // 固定签名）。
 //
-// 吞掉的判据（全部满足才动手）：
-//   1. 返回 EBADMSG（唯一关心的错误；真实 I/O 错误不受影响）；
-//   2. buf != NULL（是对实际数据的校验，不是块大小查询）；
-//   3. 本 boot 我们确实改写过 bluetoothd 或 BlueTool 的页（未打补丁就绝不吞，
-//      -ibtota 下该标志恒为 false）；
-//   4. vn_getpath 精确匹配这两个路径——系统其余文件的校验一丝不减。
+// 1.9.2 的判据（按顺序短路，正常情况下每条热路径只多一次返回值比较）：
+//   1. 返回非 0 且 buf != NULL（是对实际数据的校验，不是块大小查询）；
+//   2. 钩子确实 armed（-ibtota 下钩子根本不会安装，这道只是兜底）；
+//   3. vn_getpath 精确匹配 /usr/sbin/bluetoothd 或 /usr/sbin/BlueTool
+//      ——系统其余文件的校验一丝不减，其它错误也照原样返回；
+//   4. 只有 EBADMSG 才吞。
+// 1.9.1 里“本 boot 补丁过才允许吞”的前置条件已删除：它依赖“先有页命中 pattern、
+// 后有缺页校验”的顺序，实际顺序相反（先缺页→先校验→才可能命中后面的页），
+// 等于永久性关掉了吞错。
+//
 // 吞掉后 decmpfs 走正常 commit 路径，回填的页内容是解压出的原始字节，正确。
 static mach_vm_address_t orig_vnop_verify {};
 
 static int patched_vnop_verify(vnode_t vp, off_t offset, uint8_t *buf, size_t bufsize, size_t *verifyblksize, void **verifyctxp, uint32_t flags, void *ctx, void *verifykind) {
     int err = FunctionCast(patched_vnop_verify, orig_vnop_verify)(vp, offset, buf, bufsize, verifyblksize, verifyctxp, flags, ctx, verifykind);
-    if (err == EBADMSG && buf != nullptr && vp != nullptr &&
-        !disableVerifyBypass &&
-        (__atomic_load_n(&patchedBluetoothdPages, __ATOMIC_ACQUIRE) || __atomic_load_n(&patchedBlueToolPages, __ATOMIC_ACQUIRE))) {
-        char path[PATH_MAX];
-        int pathlen = PATH_MAX;
-        if (vn_getpath(vp, path, &pathlen) == 0 && strncmp(path, "/usr/sbin/", kSbinDirLength) == 0 &&
-            (strcmp(path + kSbinDirLength, "bluetoothd") == 0 || strcmp(path + kSbinDirLength, "BlueTool") == 0)) {
-            SYSLOG(MODULE_BTLFX, "swallowed verify mismatch on %s @ 0x%llx (size %zu): patched page resident in this 16K group",
-                   path, (unsigned long long)offset, bufsize);
-            return 0;
-        }
+    if (err == 0 || buf == nullptr || vp == nullptr || disableVerifyBypass || !verifyBypassArmed)
+        return err;
+
+    char path[PATH_MAX];
+    int pathlen = PATH_MAX;
+    if (vn_getpath(vp, path, &pathlen) != 0) {
+        // 只有真出错时才会走到这里（err != 0），量很小。
+        if (__atomic_fetch_add(&verifyPathFailures, 1, __ATOMIC_RELAXED) == 0)
+            SYSLOG(MODULE_BTLFX, "verify error %d but vn_getpath failed: cannot scope, not swallowing (further ones silent)", err);
+        return err;
     }
-    return err;
+    if (strncmp(path, "/usr/sbin/", kSbinDirLength) != 0 ||
+        (strcmp(path + kSbinDirLength, "bluetoothd") != 0 && strcmp(path + kSbinDirLength, "BlueTool") != 0))
+        return err;
+
+    if (err != EBADMSG) {
+        if (__atomic_fetch_add(&verifyOtherErrors, 1, __ATOMIC_RELAXED) == 0)
+            SYSLOG(MODULE_BTLFX, "verify returned %d on %s (not EBADMSG, propagated)", err, path);
+        return err;
+    }
+
+    uint32_t n = __atomic_add_fetch(&verifySwallowed, 1, __ATOMIC_RELAXED);
+    if (n <= 8)
+        SYSLOG(MODULE_BTLFX, "swallowed verify mismatch #%u on %s @ 0x%llx (size %zu): patched page resident in this 16K group",
+               n, path, (unsigned long long)offset, bufsize);
+    return 0;
 }
 
 static void processPatcher(KernelPatcher &patcher) {
@@ -777,13 +814,21 @@ static void processPatcher(KernelPatcher &patcher) {
     if (disableVerifyBypass)
         SYSLOG(MODULE_BTLFX, "VNOP_VERIFY EBADMSG bypass OFF (-ibtnovb)");
     KernelPatcher::RouteRequest csRoute("_cs_validate_page", patched_cs_validate_page, orig_cs_validate);
-    if (!patcher.routeMultipleLong(KernelPatcher::KernelID, &csRoute, 1))
+    // 1.9.2: 成功也打一行。1.9.1 只在失败时打，导致“到底挂上没有”只能靠推断，
+    // 这次实测就是被这一点拖住的——日志里没有行，无法区分“没挂上”和“没触发”。
+    if (patcher.routeMultipleLong(KernelPatcher::KernelID, &csRoute, 1))
+        SYSLOG(MODULE_BTLFX, "cs_validate page hook armed");
+    else
         SYSLOG(MODULE_BTLFX, "failed to route cs validation pages");
-    // 两条路由分开提交：符号缺失只影响自己，不影响另一条（ Tahoe 上 _VNOP_VERIFY
-    // 解析失败 = 1.9.1 修复不生效，退回 1.9.0 行为，不会更糟）。
+    // 两条路由分开提交：符号缺失只影响自己，不影响另一条（Tahoe 上 _VNOP_VERIFY
+    // 解析失败 = 修复不生效，退回 1.9.0 行为，不会更糟）。
     KernelPatcher::RouteRequest verifyRoute("_VNOP_VERIFY", patched_vnop_verify, orig_vnop_verify);
-    if (!patcher.routeMultipleLong(KernelPatcher::KernelID, &verifyRoute, 1))
-        SYSLOG(MODULE_BTLFX, "failed to route VNOP_VERIFY (1.9.1 crash fix inactive)");
+    if (patcher.routeMultipleLong(KernelPatcher::KernelID, &verifyRoute, 1)) {
+        verifyBypassArmed = true;
+        SYSLOG(MODULE_BTLFX, "VNOP_VERIFY bypass armed (path-scoped to bluetoothd/BlueTool, no patch-order gate)");
+    } else {
+        SYSLOG(MODULE_BTLFX, "failed to route VNOP_VERIFY (crash fix INACTIVE - symbol missing)");
+    }
 }
 
 #pragma mark - Lilu
