@@ -180,6 +180,42 @@ ls -lt ~/Library/Logs/DiagnosticReports/bluetoothd* 2>/dev/null | head
 
 ---
 
+## 附：故障 B（EXC_GUARD namespc 18）的定性——通用问题，不在本仓范围
+
+本机唤醒时另有一类崩溃，与故障 A（APFS 校验失败 SIGBUS）**完全独立**：
+
+```
+Exception Type:   EXC_GUARD
+Exception Subtype: GUARD_TYPE_USER
+Exception Message: namespc 18 reason_code 0x0000000000000002
+Termination Reason: Namespace LIBSYSTEM, Code 2, Application Triggered Fault
+Time Since Wake:  15~18 秒
+is_simulated: 1（进程主动触发，不是访存错误）
+固定六帧偏移：1414646 / 951136 / 5312934 / 5319185 / 5175992 / 5174993，r14=1201
+```
+
+**外部对照（决定性）**：同签名在**完全不同的蓝牙硬件和 macOS 版本**上都能复现——
+
+| 出处 | 硬件 | 系统 | 症状 |
+|---|---|---|---|
+| 黑苹果星球 qa/23813 | BCM94360CD（博通，原生系） | macOS 14.0 | 同 `0x6000000000000012, 0x2`，`Namespace LIBSYSTEM, Code 2` |
+| 远景 tid-1992825 | 同上 | macOS 14.3 | `Time Since Wake: 15 seconds`，同签名 |
+| 远景 tid-2053514 | 同上 | macOS 15.1 | `Time Since Wake: 16 seconds`，同签名，官方回复"解决不了、不影响使用" |
+
+结论：**这是黑苹果环境下 bluetoothd 唤醒时的通用自断言，与 AX201 固件驱动、与本仓的补丁都无关。** 它 `is_simulated`、崩一次自愈、不触发 launchd 节流，也不会造成"蓝牙打不开"——那是故障 A（连崩 4~6 次 → `consecutiveCrashCount` → `throttleTimeout:10`）的后果。
+
+因此本仓不处理故障 B。它与唤醒时刻 **A2DP 音频流是否还活着**强相关（合盖瞬间音乐停在 0 秒 → 不崩；还放 5~6 秒 → 崩），但那是 bluetoothd 自己的状态机断言，不是我们能修的层次。
+
+排查时请先区分这两类，别把 B 当成 A 复发：
+
+```bash
+ls -lt /Library/Logs/DiagnosticReports/ | grep bluetoothd | head -3
+grep -l "EXC_GUARD" /Library/Logs/DiagnosticReports/bluetoothd*.ips    # 故障 B，忽略
+grep -l "SIGBUS"     /Library/Logs/DiagnosticReports/bluetoothd*.ips    # 故障 A，必须查
+```
+
+---
+
 ## 参考
 
 - acidanthera/bugtracker#2228 — https://github.com/acidanthera/bugtracker/issues/2228
