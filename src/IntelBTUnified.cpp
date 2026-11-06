@@ -654,6 +654,40 @@ static uint32_t verifyOtherErrors = 0;
 static uint64_t lastVerifyOffset = 0;
 static uint64_t lastVerifySize = 0;
 static uint64_t lastVerifyPage = 0;
+
+// 1.9.6: 「钩子到底在不在调用路径上」——这是不用等故障 A 复现就能判定的唯一办法。
+//
+// 问题：1.9.1~1.9.5 的吞错全都建立在「decmpfs 回填缺页后会调 VNOP_VERIFY」这个前提上，
+// 但从来没有证据证明这句话在 Tahoe 上成立。armed=Yes 只说明符号路由成功，不说明它被调用。
+// 若前提不成立，那么写多少判据都是空转，而结论只能靠"下次崩溃再看"来反证，成本极高。
+//
+// 做法：cs_validate 钩子里已经解析出了路径，判定 vp 属于 bluetoothd/BlueTool 时把 vnode
+// 指针记进 btVnodes[]（≤16 个，普通指针，不做 retain，只在进程生命周期内有效）；
+// VNOP_VERIFY 钩子每次进来先做 ≤16 次指针比较，命中就计数（**不论返回值**）。
+// 于是：bluetoothd 启动并完成缺页之后
+//   IBTVnopCalls > 0  → 前提成立，钩子确实被调用过，之后的 swallowed=0 是"没出错"；
+//   IBTVnopCalls == 0 → 前提不成立，拦截面选错了，必须换钩点（decmpfs/APFS 一侧）。
+// 这是"一次开机即可定性"的判据，不再需要撞运气。
+static constexpr uint32_t kMaxBtVnodes = 16;
+static vnode_t btVnodes[kMaxBtVnodes] {};
+static uint32_t btVnodeCount = 0;
+static uint32_t verifyCallsOnBt = 0;
+
+static inline bool isBtVnode(vnode_t vp) {
+    uint32_t n = __atomic_load_n(&btVnodeCount, __ATOMIC_ACQUIRE);
+    for (uint32_t i = 0; i < n && i < kMaxBtVnodes; i++)
+        if (__atomic_load_n(&btVnodes[i], __ATOMIC_RELAXED) == vp)
+            return true;
+    return false;
+}
+
+static inline void rememberBtVnode(vnode_t vp) {
+    if (vp == nullptr || isBtVnode(vp))
+        return;
+    uint32_t slot = __atomic_fetch_add(&btVnodeCount, 1, __ATOMIC_ACQ_REL);
+    if (slot < kMaxBtVnodes)
+        __atomic_store_n(&btVnodes[slot], vp, __ATOMIC_RELEASE);
+}
 // 被我们改写过的 4K 页（文件偏移）。写入只发生在 cs_validate 上下文，读取在任意进程
 // 上下文的 VNOP_VERIFY 里，所以走原子。0 表示空槽（offset 0 是 Mach-O 头所在页，
 // 永远不含我们要匹配的指令序列）。
@@ -736,6 +770,7 @@ static void patched_cs_validate_page(vnode_t vp, memory_object_t pager, memory_o
     currentPageOffset = page_offset;
     if (vn_getpath(vp, path, &pathlen) == 0 && UNLIKELY(strncmp(path, "/usr/sbin/", kSbinDirLength) == 0)) {
         if (strcmp(path + kSbinDirLength, "BlueTool") == 0) {
+            rememberBtVnode(vp);
             if (!legacyCsPatching && !currentProcIs("BlueTool"))
                 return;
             bool any = false;
@@ -747,6 +782,7 @@ static void patched_cs_validate_page(vnode_t vp, memory_object_t pager, memory_o
             (void)any;
         }
         else if (strcmp(path + kSbinDirLength, "bluetoothd") == 0) {
+            rememberBtVnode(vp);
             if (!legacyCsPatching && !currentProcIs("bluetoothd"))
                 return;
             bool any = false;
@@ -802,28 +838,49 @@ static void patched_cs_validate_page(vnode_t vp, memory_object_t pager, memory_o
 // 内容”处理是站得住的，日志里的 inside/no-recorded-page 只是用来做根因归类。
 //
 // 吞掉后 decmpfs 走正常 commit 路径，回填的页内容是解压出的原始字节，正确。
+//
+// 1.9.6 只做两件事，都不改上面的判定语义：
+//   1. 加 verifyCallsOnBt 计数：每进钩子就按 vnode 身份统计，**不看返回值**。它的作用是
+//      把"钩子在不在调用路径上"从猜测变成一次开机可读的数字（判据见 btVnodes 处的注释）。
+//   2. 定域顺序改为「路径优先、身份兜底」：路径解析失败时退回 vnode 身份，避免
+//      1.9.4 里"vn_getpath 失败 → 不吞 → 照样崩"的死角；路径成功但不像目标文件的，
+//      仍然放行（防止 vnode 地址被回收后误吞别的文件的真损坏）。
 static mach_vm_address_t orig_vnop_verify {};
 
 static int patched_vnop_verify(vnode_t vp, off_t offset, uint8_t *buf, size_t bufsize, size_t *verifyblksize, void **verifyctxp, uint32_t flags, void *ctx, void *verifykind) {
     int err = FunctionCast(patched_vnop_verify, orig_vnop_verify)(vp, offset, buf, bufsize, verifyblksize, verifyctxp, flags, ctx, verifykind);
-    if (err == 0 || buf == nullptr || vp == nullptr || disableVerifyBypass || !verifyBypassArmed)
+    if (vp == nullptr || disableVerifyBypass || !verifyBypassArmed)
         return err;
 
-    char path[PATH_MAX];
+    // 1.9.6: 先做身份判定（≤16 次指针比较，无分配、无 I/O、可在缺页上下文安全调用）。
+    // 无论返回值都要计数——IBTVnopCalls 就是"钩子是否真的被调用"的唯一证据。
+    bool onBt = isBtVnode(vp);
+    if (onBt)
+        __atomic_fetch_add(&verifyCallsOnBt, 1, __ATOMIC_RELAXED);
+
+    if (err == 0 || buf == nullptr)
+        return err;
+
+    // 定域：路径优先（能挡住 vnode 地址被回收后误判），路径解析失败时退回身份判定。
+    // 1.9.4 在这里是"路径失败 → 不吞 → 照样崩"，等于给修复留了一个必然失效的角落。
+    char path[PATH_MAX] = {};
     int pathlen = PATH_MAX;
-    if (vn_getpath(vp, path, &pathlen) != 0) {
-        // 只有真出错时才会走到这里（err != 0），量很小。
-        if (__atomic_fetch_add(&verifyPathFailures, 1, __ATOMIC_RELAXED) == 0)
-            SYSLOG(MODULE_BTLFX, "verify error %d but vn_getpath failed: cannot scope, not swallowing (further ones silent)", err);
+    bool scoped = false;
+    if (vn_getpath(vp, path, &pathlen) == 0)
+        scoped = strncmp(path, "/usr/sbin/", kSbinDirLength) == 0 &&
+                 (strcmp(path + kSbinDirLength, "bluetoothd") == 0 || strcmp(path + kSbinDirLength, "BlueTool") == 0);
+    else
+        scoped = onBt;   // 解析不出来但身份确认过，仍然定域
+
+    if (!scoped) {
+        if (path[0] == 0)
+            __atomic_fetch_add(&verifyPathFailures, 1, __ATOMIC_RELAXED);
         return err;
     }
-    if (strncmp(path, "/usr/sbin/", kSbinDirLength) != 0 ||
-        (strcmp(path + kSbinDirLength, "bluetoothd") != 0 && strcmp(path + kSbinDirLength, "BlueTool") != 0))
-        return err;
 
     if (err != EBADMSG) {
         if (__atomic_fetch_add(&verifyOtherErrors, 1, __ATOMIC_RELAXED) == 0)
-            SYSLOG(MODULE_BTLFX, "verify returned %d on %s (not EBADMSG, propagated)", err, path);
+            SYSLOG(MODULE_BTLFX, "verify returned %d on %s (not EBADMSG, propagated)", err, path[0] ? path : "<bt vnode>");
         return err;
     }
 
@@ -850,12 +907,13 @@ static int patched_vnop_verify(vnode_t vp, off_t offset, uint8_t *buf, size_t bu
     // 1.9.5: 日志拿不到，改把计数推给 IORegistry。每 boot 最多 8 次，代价可忽略。
     if (n <= 8) {
         ibtDiagPublishLive();
+        const char *who = path[0] ? path : "<bt vnode>";
         if (oursAt)
             SYSLOG(MODULE_BTLFX, "swallowed verify mismatch #%u on %s @ 0x%llx (size %zu): patched page 0x%llx inside this group (%u pages recorded)",
-                   n, path, (unsigned long long)offset, bufsize, (unsigned long long)oursAt, recorded);
+                   n, who, (unsigned long long)offset, bufsize, (unsigned long long)oursAt, recorded);
         else
             SYSLOG(MODULE_BTLFX, "swallowed verify mismatch #%u on %s @ 0x%llx (size %zu): no recorded patched page in this group (%u recorded) - window already evicted/rematerialised, diagnostic only",
-                   n, path, (unsigned long long)offset, bufsize, recorded);
+                   n, who, (unsigned long long)offset, bufsize, recorded);
     }
     return 0;
 }
@@ -927,6 +985,8 @@ void ibtDiagFill(IbtDiagSnapshot *out) {
     out->swallowed    = __atomic_load_n(&verifySwallowed, __ATOMIC_RELAXED);
     out->pathFailures = __atomic_load_n(&verifyPathFailures, __ATOMIC_RELAXED);
     out->otherErrors  = __atomic_load_n(&verifyOtherErrors, __ATOMIC_RELAXED);
+    out->callsOnBt    = __atomic_load_n(&verifyCallsOnBt, __ATOMIC_RELAXED);
+    out->btVnodes     = __atomic_load_n(&btVnodeCount, __ATOMIC_RELAXED);
     out->pmEvents     = 0; // 由驱动层覆盖
     out->patchedPages = __atomic_load_n(&patchedPageCount, __ATOMIC_RELAXED);
     out->lastOffset   = __atomic_load_n(&lastVerifyOffset, __ATOMIC_RELAXED);

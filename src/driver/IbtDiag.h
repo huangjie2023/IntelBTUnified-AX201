@@ -25,6 +25,8 @@ struct IbtDiagSnapshot {
     unsigned int swallowed;     // 累计吞掉的 EBADMSG 次数
     unsigned int pathFailures;  // vn_getpath 失败次数（无法定域，未吞）
     unsigned int otherErrors;   // bluetoothd/BlueTool 上非 EBADMSG 的错误次数
+    unsigned int callsOnBt;     // 1.9.6: _VNOP_VERIFY 被 bluetoothd/BlueTool vnode 调用过的次数（不看返回值）
+    unsigned int btVnodes;      // 1.9.6: 已记录的 bluetoothd/BlueTool vnode 数（>0 说明 cs_validate 确实见过它们）
     unsigned int pmEvents;      // 睡眠/唤醒回调次数，用来判断快照新鲜度
     unsigned int patchedPages;  // 本 boot 记录到的补丁页数（诊断附注，不作判定）
     unsigned long long lastOffset;  // 最后一次被吞的校验起点

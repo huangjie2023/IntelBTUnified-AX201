@@ -16,6 +16,27 @@
 
 > 上游 FAQ 明确：**macOS Monterey 及以后不要使用 `IntelBluetoothInjector.kext`**（"Do NOT use this Kext on macOS Monterey and newer"）。Monterey+ 靠的是驱动把 USB 设备改名为 `Bluetooth USB Host Controller` 来绕过 bluetoothd/BlueTool 的 board-id 检查，所以单 kext 里**不该**有那条 Broadcom transport 注入 personality。本包结构对应全量包的 `IntelBluetoothFirmware` + `IntelBTPatcher` + `BlueToolFixup`，不含 Injector。
 
+## 1.9.6：把「钩子在不在调用路径上」变成一次开机可读的数字
+
+1.9.1~1.9.5 的吞错全部押在一个从未被验证的前提上：**decmpfs 回填缺页后会调 `_VNOP_VERIFY`**。`IBTVnopArmed = Yes` 只证明符号路由成功，不证明它被调用过。如果前提不成立，判据写得再细也是空转，而唯一的反证方式是"等下一次崩溃"，成本极高。
+
+1.9.6 直接把这个前提做成可测的：
+
+- `cs_validate` 钩子里已经解析出路径，判定 `vp` 属于 `bluetoothd`/`BlueTool` 时把 vnode 指针记进 `btVnodes[]`（≤16 个，普通指针，不 retain）
+- `_VNOP_VERIFY` 钩子每次进入先做 ≤16 次指针比较（无分配、无 I/O，可在缺页上下文安全执行），命中就 `++IBTVnopCalls`，**不看返回值**
+
+判据（每次开机即可读，不需要撞运气）：
+
+| `IBTBtVnodes` | `IBTVnopCalls` | 结论 |
+|---|---|---|
+| 0 | 0 | `cs_validate` 没见过这两个文件 → 补丁链早就断了，回到 1.9.0 的问题 |
+| >0 | **0** | **前提不成立**：它们的缺页校验不经过 `_VNOP_VERIFY`，1.9.x 的拦截面选错，必须换钩点（`decmpfs_pagein_compressed` 或 APFS 一侧） |
+| >0 | >0 | 前提成立，钩子确实被调用；此后 `IBTSwallowed = 0` 的含义就是"真的没出错"，而不是"没生效" |
+
+同时修掉 1.9.4 遗留的一个死角：定域改为**路径优先、身份兜底**。原来 `vn_getpath` 失败时直接放行（不吞），等于给修复留了一个必然失效的角落；现在解析失败会退回 vnode 身份判定。反过来，路径解析成功但不像目标文件的仍然放行，避免 vnode 地址被回收后误吞别的文件的真损坏。
+
+新增属性：`IBTVnopCalls`、`IBTBtVnodes`。
+
 ## 1.9.5：诊断出口改走 IORegistry（日志通道全线不可用）
 
 **先记结论：本机 macOS 26 上，kext 日志一条都读不到——与代码无关，是通道问题。**

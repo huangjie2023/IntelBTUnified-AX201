@@ -50,6 +50,8 @@ void ibtDiagPublishLive()
     svc->setProperty("IBTSwallowed", (unsigned long long)s.swallowed, 32);
     svc->setProperty("IBTPathFail", (unsigned long long)s.pathFailures, 32);
     svc->setProperty("IBTOtherErr", (unsigned long long)s.otherErrors, 32);
+    svc->setProperty("IBTVnopCalls", (unsigned long long)s.callsOnBt, 32);
+    svc->setProperty("IBTBtVnodes", (unsigned long long)s.btVnodes, 32);
     svc->setProperty("IBTPmEvents", (unsigned long long)s.pmEvents, 32);
     svc->setProperty("IBTPatchedPages", (unsigned long long)s.patchedPages, 32);
     svc->setProperty("IBTLastOffset", s.lastOffset, 64);
