@@ -39,13 +39,14 @@ PATTERNS = [
     ("board-id (Mac-F60...) ",  b"Mac-F60DEB81FF30ACF6", None),
 ]
 
-# 2026-11-05 17:40:55 崩溃报告里 bluetoothd 的 imageOffset（= 文件偏移）
+# 2026-11-05 17:40 与 2026-11-06 15:17 两次 SIGBUS 的崩溃地址，减去 base 后
+# 完全相同的 0x339B50（APFS 16KiB 压缩验证组校验失败，Kernel Triage 有
+# "compressed data hash mismatch"）。这里按“失败 16KiB 组”比对，而不是按单页。
 DEFAULT_CRASH = [
-    ("递归函数入口", 1592056),   # 0x184AF8
-    ("日志调用点",   1591558),   # 0x184906
-    ("递归函数",     1570056),   # 0x17F508
-    ("递归函数",     5335207),   # 0x5168A7
+    ("SIGBUS 11-05 21:29", 0x339B50),
+    ("SIGBUS 11-06 15:17", 0x339B50),
 ]
+GROUP = 0x4000
 
 
 def find_masked(data, pat, mask):
@@ -112,34 +113,37 @@ def main():
                                                ("共 %d 处" % len(hits)) if i == 0 else ""))
     print()
 
-    print("== 崩溃栈偏移比对")
-    print("%-14s %-12s %-12s %s" % ("", "文件偏移", "4K 页", "该页是否被我们改过"))
+    print("== 崩溃偏移 vs 16KiB 校验组")
+    print("%-20s %-11s %-24s %s" % ("", "4K 页", "16KiB 校验组", "组内是否有我们改过的页"))
     overlap = False
     for label, off in crash:
         page = off & ~(PAGE - 1)
-        names = patched_pages.get(page)
-        if names:
+        grp = off & ~(GROUP - 1)
+        inside = [pg for pg in sorted(patched_pages) if grp <= pg < grp + GROUP]
+        if inside:
             overlap = True
-            note = "是 -> " + ", ".join(sorted(set(names)))
+            note = "是 -> " + ", ".join("0x%X" % pg for pg in inside)
         else:
             note = "否"
-        print("%-14s 0x%-10X 0x%-10X %s" % (label, off, page, note))
+        print("%-20s 0x%-9X 0x%-9X-0x%-9X %s" % (label, page, grp, grp + GROUP - 1, note))
     print()
 
     print("== 被改过的页清单 (按偏移排序)")
     if patched_pages:
         for page in sorted(patched_pages):
-            print("  0x%X  %s" % (page, ", ".join(sorted(set(patched_pages[page])))))
+            print("  0x%-8X 组 0x%-8X  %s" % (page, page & ~(GROUP - 1),
+                                              ", ".join(sorted(set(patched_pages[page])))))
     else:
         print("  (无。可能该系统版本 pattern 已变化，或文件不是预期版本)")
     print()
 
     if overlap:
-        print("结论: 崩溃偏移与被改写的页【重叠】——补丁所在的那段代码就在递归环里，")
-        print("      需要先排除补丁本身（收紧 pattern / 换等价改法）再谈别的。")
+        print("结论: 失败的那个 16KiB 组里有我们改过的页 -> 典型“混合内容”哈希不符，")
+        print("      1.9.3 的判定会命中并吞掉，属于补丁的预期副作用，方向正确。")
     else:
-        print("结论: 崩溃偏移与被改写的页【完全不重叠】——递归环不在我们改过的代码里，")
-        print("      问题指向伪造的 HCI 事件或 bluetoothd 自身逻辑。")
+        print("结论: 失败的那个 16KiB 组里【一个我们改过的页都没有】-> 与补丁无关，")
+        print("      是这一组压缩数据本身读出来/解压出来不对（介质或读路径），")
+        print("      1.9.3 会拒吞并打 real data corruption，这属于硬件侧问题。")
     return 0
 
 
