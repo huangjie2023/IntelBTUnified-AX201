@@ -1286,6 +1286,17 @@ void ibtDiagFill(IbtDiagSnapshot *out) {
     out->csPathFail   = __atomic_load_n(&csPathFailures, __ATOMIC_RELAXED);
     out->csSbin       = __atomic_load_n(&csSbinMisses, __ATOMIC_RELAXED);
     out->csMatch      = __atomic_load_n(&csBtMatches, __ATOMIC_RELAXED);
+    // 1.9.14：board-id 补丁到底有没有尝试、有没有命中。
+    out->patchMask    = __atomic_load_n(&appliedPatches, __ATOMIC_RELAXED);
+    out->bidArmed     = shouldPatchBoardId ? 1u : 0u;
+    {
+        const char *bid = BaseDeviceInfo::get().boardIdentifier;
+        size_t n = 0;
+        if (bid)
+            for (; bid[n] && n + 1 < sizeof(out->boardId); n++)
+                out->boardId[n] = bid[n];
+        out->boardId[n] = '\0';
+    }
 }
 
 static void pluginStart() {

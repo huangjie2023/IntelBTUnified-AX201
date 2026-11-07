@@ -16,6 +16,39 @@
 
 > 上游 FAQ 明确：**macOS Monterey 及以后不要使用 `IntelBluetoothInjector.kext`**（"Do NOT use this Kext on macOS Monterey and newer"）。Monterey+ 靠的是驱动把 USB 设备改名为 `Bluetooth USB Host Controller` 来绕过 bluetoothd/BlueTool 的 board-id 检查，所以单 kext 里**不该**有那条 Broadcom transport 注入 personality。本包结构对应全量包的 `IntelBluetoothFirmware` + `IntelBTPatcher` + `BlueToolFixup`，不含 Injector。
 
+## 1.9.14：board-id 补丁到底有没有命中，第一次有读数
+
+1.9.10 把故障 B 的链路定死在 `bluetoothd` 等 `/dev/cu.BLTH` 满 15 秒后 `os_crash()`。但为什么它非要去等一个串口，一直没解释清楚——Intel 蓝牙是 USB 的，本来不该走 UART。
+
+答案在 bluetoothd 的 board-id 查表：
+
+```
+hostControllerTransportForBoardID(board_id) →
+    board_id 命中 UART 列表 → UART transport，打开 /dev/cu.BLTH
+    board_id 命中 USB  列表 → USB transport
+    两者都不命中            → 默认 UART
+```
+
+`MacBookPro16,2` 真机的蓝牙是 T2 管理的 Broadcom，board-id 落在 **UART 列表**里。于是 bluetoothd 每轮唤醒都去等那个串口，而 Intel 蓝牙要等 Apple 的 `IOBluetoothHostControllerUSBTransport` 把节点建出来，实测要 20~27 秒。15 < 20，必崩。
+
+本仓库 1.7.0 起就有对应补丁（`boardIdsWithUSBBluetooth[0]` → 本机 board-id，见 `src/IntelBTUnified.cpp:599` 与 854 / 874 行），但 26.7.3 的日志里始终是 `FindTransportType -- UART Transport`，说明补丁很可能没命中。此前没有任何读数能证实——`IBTPatchedPages` 按页去重，同一页里多个补丁只算 1 页，无法反推是哪一个。
+
+新增三个属性：
+
+| 属性 | 含义 |
+|---|---|
+| `IBTPatchMask` | `appliedPatches` 原样。bit0 skip-update / **bit1 BlueTool board-id** / bit2 vendor / bit3 chipset / bit4 chipset13 / bit5 chipset15 / bit6 nvram / **bit7 bluetoothd board-id** / bit8 address |
+| `IBTBidArmed` | 本机 board-id 是否通过了前置判定（长度 18 或 12 字节、且不在 USB 列表里） |
+| `IBTBoardId` | 实际读到的 boardIdentifier，用来核对长度判定为什么成立或不成立 |
+
+判读：
+
+- `IBTBidArmed = No` → 前置条件没过，补丁根本没尝试。先用 `-btlfxboardid` 强制开启（代码 1125 行支持），不用改代码就能验证
+- `IBTBidArmed = Yes` 但 `IBTPatchMask` 没有 bit1 / bit7 → 补丁尝试了，但 `Mac-F60DEB81FF30ACF6` 这个字符串在 26.7.3 的 BlueTool / bluetoothd 里已经不存在，needle 过期，需要重新定位
+- 两个 bit 都在，却仍然 `UART Transport` → 替换位置不对（字符串还在表里，但不是查表用的那一份）
+
+另外说明一件此前容易误判的事：`notePatch` 里那行 `SYSLOG(... "patched %s: %s")` 在本机**永远查不到**。`IbtDiag.h` 开头已经记录过，本机 `IOLog` 不落统一日志；用 `log show | grep btlfx` 得到空结果不代表补丁没打，只能说明日志通道不可用。这也是为什么判据必须做成 IORegistry 属性。
+
 ## 1.9.13：真正被调用的校验入口是 `_decmpfs_validate_compressed_file`
 
 1.9.12 把快照改成定时刷新之后，一次睡眠唤醒就拿到了此前一直读不到的真实读数：

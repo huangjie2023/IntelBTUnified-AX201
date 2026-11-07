@@ -76,6 +76,29 @@ struct IbtDiagSnapshot {
     unsigned int decOk;      // 返回 0（校验通过）
     unsigned int decBad;     // 返回 EBADMSG（压缩块哈希不匹配）
     unsigned int decOther;   // 返回其它非 0
+
+    // 1.9.14：按补丁位图，以及 board-id patch 的前置条件。
+    //
+    // 起因：bluetoothd 用 board-id 查表决定 transport——
+    //   hostControllerTransportForBoardID(bid) →
+    //     命中 UART 列表 → 等 /dev/cu.BLTH；命中 USB 列表 → 用 USB transport；
+    //     都不命中 → 默认 UART。
+    // MacBookPro16,2 的真机蓝牙是 T2 管理的 Broadcom，board-id 落在 UART 列表，
+    // 于是 bluetoothd 每轮唤醒都去等那个串口，等不到 15 秒就 os_crash()。
+    // 本仓库 1.7.0 起就有对应的替换补丁（把 boardIdsWithUSBBluetooth[0] 换成
+    // 本机 board-id），但 26.7.3 上日志里始终是 "FindTransportType -- UART
+    // Transport"，说明补丁大概率没命中，而此前没有任何读数能证实这一点：
+    // PatchedPages 只按页去重，同一页里 7 个补丁只算 1 页，无法反推。
+    //
+    // 这三个字段是唯一能定性的判据：
+    //   bidArmed = 0                → 前置条件没过，补丁根本没尝试
+    //   bidArmed = 1 且 patchMask 无 bit1/bit7 → 尝试了但字符串没匹配上
+    //   bidArmed = 1 且 patchMask 有 bit1/bit7 → 补丁打上了，问题在别处
+    unsigned int patchMask;  // appliedPatches 原样：bit0 skip-update, bit1 BlueTool board-id,
+                             // bit2 vendor, bit3 chipset, bit4 chipset13, bit5 chipset15,
+                             // bit6 nvram, bit7 bluetoothd board-id, bit8 address
+    unsigned int bidArmed;   // 1 = shouldPatchBoardId，board-id 补丁本次是否启用
+    char boardId[24];        // 实际 boardIdentifier（null 结尾），用来核对长度判定是否成立
 };
 
 // ---------------------------------------------------------------------------
