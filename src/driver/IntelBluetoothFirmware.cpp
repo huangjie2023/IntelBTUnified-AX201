@@ -58,7 +58,9 @@ void ibtTimingAdd(unsigned int slot, unsigned int delta)
 
 // 1.9.12：诊断快照刷新周期。bluetoothd 的补丁页在 start() 之后才出现，
 // 30 秒足够覆盖一次冷启动后的进程加载，又不会给 workloop 造成可见负担。
-static constexpr unsigned int kDiagRefreshMs = 30000;
+// 1.9.17：缩短到 15 秒——这个定时器同时负责处理 wire 队列，缩短间隔能把
+// pager port 的有效窗口（bluetoothd vnode 存活期）压得更紧。
+static constexpr unsigned int kDiagRefreshMs = 15000;
 
 void ibtDiagPublishLive()
 {
@@ -113,6 +115,14 @@ void ibtDiagPublishLive()
     svc->setProperty("IBTBidMiss", (unsigned long long)s.bidMiss, 32);
     svc->setProperty("IBTBoardId", (const char *)s.boardId);
     svc->setProperty("IBTWireSolve", (unsigned long long)s.wireSolve, 32);
+    // 1.9.17: 映射 wire 执行状态。判读见 IbtDiag.h。
+    svc->setProperty("IBTWireArmed", (bool)(s.wireArmed != 0));
+    svc->setProperty("IBTWireQueued", (unsigned long long)s.wireQueued, 32);
+    svc->setProperty("IBTWireOk", (unsigned long long)s.wireOk, 32);
+    svc->setProperty("IBTWireEnterFail", (unsigned long long)s.wireEnterFail, 32);
+    svc->setProperty("IBTWireWireFail", (unsigned long long)s.wireWireFail, 32);
+    svc->setProperty("IBTWireActive", (unsigned long long)s.wireActive, 32);
+    svc->setProperty("IBTWireLastErr", (unsigned long long)s.wireLastErr, 32);
     // 1.9.11：cs_validate_page 入口漏斗。判读见 IbtDiag.h。
     svc->setProperty("IBTCsAll", (unsigned long long)s.csAll, 32);
     svc->setProperty("IBTCsPathFail", (unsigned long long)s.csPathFail, 32);
@@ -256,6 +266,10 @@ bool IntelBluetoothFirmware::start(IOService *provider)
 // 也不改任何状态，只是把已有的原子变量读出来写进属性表。
 void IntelBluetoothFirmware::diagTimerFired()
 {
+    // 1.9.17: wire 队列必须在 workloop 上下文处理（cs_validate_page 钩子持有
+    // pager/对象锁，在钩子里直接 vm_map_wire 会死锁）。处理完再刷新 ioreg 快照，
+    // 这样 WireOk/WireActive 与属性表始终同步。
+    ibtWireProcess();
     ibtDiagPublishLive();
     if (m_pDiagTimer)
         m_pDiagTimer->setTimeoutMS(kDiagRefreshMs);
@@ -298,6 +312,8 @@ void IntelBluetoothFirmware::stop(IOService *provider)
 {
     XYLog("Driver Stop()\n");
     ibtDiagPublishLive();
+    // 1.9.17: 先回收 wire 映射再摘定时器，避免页在 kext 卸载后保持虚假的 wire_count。
+    ibtWireTeardown();
     // 先停定时器再摘 gDiagSvc，避免回调在 service 释放之后仍去 setProperty。
     if (m_pDiagTimer) {
         m_pDiagTimer->cancelTimeout();
