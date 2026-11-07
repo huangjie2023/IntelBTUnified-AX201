@@ -19,6 +19,15 @@ STATE="$STATE_DIR/state"
 HEART="$STATE_DIR/heart"
 MAXLOG=2097152
 
+# 2026-11-07：仅靠“bluetoothd 不在”抓不到崩溃后的坏页状态。launchd 会在
+# 10 秒 throttle 后自动把 bluetoothd 拉起来，探针 60 秒一轮，看到的永远是
+# “进程在、设备在、电源开”= 正常三元组，于是 autorecover 一次都不会触发。
+# 新增触发源：诊断报告目录里出现新的 bluetoothd / ExcUserFault 报告。
+CRASH_DIR=/Library/Logs/DiagnosticReports
+CRASHMARK="$STATE_DIR/crashmark"
+RECOVERMARK="$STATE_DIR/recover-at"
+RECOVER_COOLDOWN=120
+
 AUTORECOVER=0
 for a in "$@"; do
     case "$a" in
@@ -54,6 +63,27 @@ cur="usb=$usb btd=$btd pw=$pw"
 prev=$(cat "$STATE" 2>/dev/null || echo "")
 printf '%s\n' "$cur" > "$STATE"
 
+# ---------------- 新崩溃报告 ----------------
+# 崩溃报告落盘比崩溃本身滞后约 13 秒，60 秒轮询足够。
+latest_crash=$(ls -t "$CRASH_DIR"/bluetoothd*.ips "$CRASH_DIR"/ExcUserFault*.ips 2>/dev/null | head -1)
+crm=0
+if [ -n "${latest_crash:-}" ]; then
+    crm=$(stat -f %m "$latest_crash" 2>/dev/null || echo 0)
+    case "$crm" in ''|*[!0-9]*) crm=0 ;; esac
+fi
+prev_crm=$(cat "$CRASHMARK" 2>/dev/null || echo 0)
+case "$prev_crm" in ''|*[!0-9]*) prev_crm=0 ;; esac
+
+new_crash=0
+if [ -f "$CRASHMARK" ]; then
+    [ "$crm" -gt "$prev_crm" ] && new_crash=1
+else
+    # 首次只建基线，不触发。注意这里必须无条件落盘（crm 可能是 0）：
+    # 若首跑时目录里还没有任何报告就不写文件，那么第一份真崩溃会被
+    # 误当成“首次”吃掉，自愈永远晚一份报告。
+    printf '%s\n' "$crm" > "$CRASHMARK"
+fi
+
 uptime_str=$(uptime 2>/dev/null | sed 's/^ *//')
 
 # ---------------- 上下文转储 ----------------
@@ -84,7 +114,7 @@ if [ -z "$prev" ]; then
     exit 0
 fi
 
-if [ "$cur" = "$prev" ]; then
+if [ "$cur" = "$prev" ] && [ "$new_crash" = 0 ]; then
     th=$(cat "$HEART" 2>/dev/null || echo 0)
     case "$th" in ''|*[!0-9]*) th=0 ;; esac
     tn=$(epoch)
@@ -95,35 +125,68 @@ if [ "$cur" = "$prev" ]; then
     exit 0
 fi
 
-logline "TRANSITION | $prev -> $cur"
-dump_context
+if [ "$cur" != "$prev" ]; then
+    logline "TRANSITION | $prev -> $cur"
+    dump_context
+fi
+if [ "$new_crash" = 1 ]; then
+    logline "NEW-CRASH | $(basename "$latest_crash") (btd=$btd usb=$usb pw=$pw)"
+fi
 
-# ---------------- 实验性自愈 ----------------
-# 2026-11-05 实测验证：purge + kickstart 组合成功恢复“蓝牙在但连不上”的状态。
-# 机制：IntelBTUnified 的 patched_cs_validate_page 钩子会在内存里改 bluetoothd 的代码页；
-# 内存压力下该页（或其所在 APFS 16KB 压缩验证组的相邻页）被逐出，再 pagein 时
-# 组内哈希校验失败 → SIGBUS / 加载到坏页。purge 把整个 page cache 冲掉，
-# 让 bluetoothd 下次从盘上重新加载“干净原始页”，kickstart 重新拉起进程。
-# 单独 kickstart 在部分场景（坏页仍在 UBC 里）不够，必须先 purge。
-if [ "$AUTORECOVER" = 1 ] && [ "$usb" = 1 ] && [ "$pw" = 1 ] && [ "$btd" = 0 ]; then
-    logline "AUTORECOVER: device on bus, power on, bluetoothd missing -> purge + kickstart"
+# ---------------- 自愈 ----------------
+# 两个触发源，任一满足即可：
+#   1. 设备在总线上、电源开、但 bluetoothd 进程不在（老的判据）
+#   2. 出现新的崩溃报告 —— 这条才是主力。launchd 抢在探针前面把 bluetoothd
+#      拉起来了，进程活着但代码页是崩溃前那一份混合态，表现为“蓝牙能开、
+#      连不上设备、一连就自动开关”。老的判据看不到这种情况。
+dorecover() {
+    r="$1"
+    logline "AUTORECOVER($r): purge + kickstart"
+    t0=$(epoch)
+    /usr/sbin/purge >> "$LOG" 2>&1 || true
+    logline "AUTORECOVER: purge finished in $(( $(epoch) - t0 ))s"
+    sleep 1
+    launchctl kickstart -k system/com.apple.bluetoothd >> "$LOG" 2>&1 || true
+    sleep 4
+    if pgrep -x bluetoothd >/dev/null 2>&1; then
+        logline "AUTORECOVER: ok, bluetoothd pid $(pgrep -x bluetoothd | head -1)"
+        return 0
+    fi
+    # 有些场景 purge 后第一次 kickstart 仍会撞上校验，隔 10s 再来一轮
+    logline "AUTORECOVER: 1st attempt failed, retrying in 10s"
+    sleep 10
     /usr/sbin/purge >> "$LOG" 2>&1 || true
     launchctl kickstart -k system/com.apple.bluetoothd >> "$LOG" 2>&1 || true
-    sleep 3
+    sleep 4
     if pgrep -x bluetoothd >/dev/null 2>&1; then
-        logline "AUTORECOVER: ok, bluetoothd is back"
+        logline "AUTORECOVER: ok on 2nd attempt, bluetoothd pid $(pgrep -x bluetoothd | head -1)"
     else
-        # 第二次尝试：有些场景 purge 后第一次 kickstart 仍会撞上校验，隔 10s 再来一次
-        sleep 10
-        /usr/sbin/purge >> "$LOG" 2>&1 || true
-        launchctl kickstart -k system/com.apple.bluetoothd >> "$LOG" 2>&1 || true
-        sleep 3
-        if pgrep -x bluetoothd >/dev/null 2>&1; then
-            logline "AUTORECOVER: ok on 2nd attempt, bluetoothd is back"
+        logline "AUTORECOVER: failed, still no bluetoothd"
+    fi
+}
+
+if [ "$AUTORECOVER" = 1 ] && [ "$usb" = 1 ] && [ "$pw" = 1 ]; then
+    need=0
+    reason=""
+    [ "$btd" = 0 ] && { need=1; reason="bluetoothd missing"; }
+    if [ "$new_crash" = 1 ]; then
+        need=1
+        if [ -z "$reason" ]; then reason="new crash report"; else reason="$reason; new crash report"; fi
+    fi
+    if [ "$need" = 1 ]; then
+        tn=$(epoch)
+        last=$(cat "$RECOVERMARK" 2>/dev/null || echo 0)
+        case "$last" in ''|*[!0-9]*) last=0 ;; esac
+        if [ $((tn - last)) -lt "$RECOVER_COOLDOWN" ]; then
+            logline "AUTORECOVER: skipped ($reason), $((RECOVER_COOLDOWN - (tn - last)))s cooldown left"
         else
-            logline "AUTORECOVER: failed, still no bluetoothd"
+            dorecover "$reason"
+            printf '%s\n' "$tn" > "$RECOVERMARK"
         fi
     fi
 fi
+
+# 同一份报告只触发一次：无论是否真的恢复，都把基线推平
+[ "$crm" -gt 0 ] && printf '%s\n' "$crm" > "$CRASHMARK"
 
 exit 0

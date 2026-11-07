@@ -89,21 +89,25 @@ sudo launchctl kickstart -k system/com.apple.bluetoothd
 
 ## 关于 `autorecover`（实验性）
 
-默认关闭。开启后，只在同时满足三个条件时才动手：
+默认关闭。开启后，**两个触发源任一满足**就动手，且都要求 `usb=1`（设备在总线上）`pw=1`（用户希望开着）：
 
 ```
-usb=1（设备在总线上） && pw=1（用户希望开着） && btd=0（进程没了）
+A. btd=0                                  进程没了（老判据）
+B. 出现新的崩溃报告                        1.9.11 起新增，主力判据
 ```
 
-动作序列（2026-11-05 起升级为 purge + kickstart，与「验证有效的手动自救」一致）：
+B 的来源是 `/Library/Logs/DiagnosticReports/` 下 `bluetoothd*.ips` 与 `ExcUserFault*.ips` 的最新 mtime 变化。首次运行只建基线，不会立刻触发；同一份报告只触发一次；两次恢复之间至少隔 120 秒。
 
-1. `purge` 冲掉 page cache（清掉可能存在的坏页）
+**为什么必须加 B**：崩溃后 launchd 会在 10 秒 throttle 后自己把 bluetoothd 拉起来，探针 60 秒一轮，看到的永远是 `usb=1 btd=1 pw=1` 这个「正常」三元组。老判据在这个窗口里一次都不会触发，于是「蓝牙能开、连不上设备、一连就自动开关」这种带坏页的活体状态永远是手动处理。B 把「进程在不在」换成「有没有崩过」，才真正盖住这一段。
+
+动作序列（2026-11-05 起为 purge + kickstart，2026-11-07 加崩溃触发）：
+
+1. `purge` 冲掉 page cache（清掉可能存在的坏页），并记录耗时
 2. `launchctl kickstart -k system/com.apple.bluetoothd`
-3. 3 秒后复查；若失败，隔 10 秒再完整来一轮，仍失败才记 `AUTORECOVER: failed`
+3. 4 秒后复查；若失败，隔 10 秒再完整来一轮，仍失败才记 `AUTORECOVER: failed`
 
-- 如果上一节的表格落到第一行，它能把「只能重启」变成「一分钟内自己回来」。
-- 「蓝牙在但连不上」这种 bluetoothd 活着的故障态，探针看不到（pgrep 是 1），仍需手动跑上面两条命令。
-- 如果设备真的掉出了总线，它什么也做不了，只会在日志里留下 `AUTORECOVER: failed`——这也是有用的信息。
+- 如果设备真的掉出了总线（`usb=0`），它什么也不做，只在日志里留下原因——这也是有用的信息。
+- 冷却是必需的：连续崩溃会连着产生多份报告，purge 本身很重，不能每 60 秒来一次。
 
 现在可以开了：purge + kickstart 序列已经实测验证。
 
