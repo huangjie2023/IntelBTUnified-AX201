@@ -1,13 +1,15 @@
 #!/usr/bin/perl
 #
-# 定位 bluetoothd 里 "port failed to appear ... seconds" 那句日志的引用点。
+# 定位 bluetoothd 里 transport 初始化超时日志的引用点（故障 B 根治第一步）。
 #
-# 背景：睡眠唤醒后 bluetoothd 等 /dev/cu.BLTH 15 秒，超时就 os_crash（故障 B）。
-# 串口真正就绪要 20~26 秒，所以每次唤醒必崩。把那个 15 秒放宽到 90 秒即可。
+# 背景：睡眠唤醒后控制器就绪 >15 秒，bluetoothd 等 15 秒超时后 os_crash
+# （EXC_GUARD）。实测崩溃路径是 USB transport："Failed to initialize transport"
+# （×4 处）日志紧邻崩溃。目标：找到引用这些字符串的代码，从上下文字节里
+# 解出 15 秒常量（15 / 15000 / 15e9 ns / 15<<20 任意形态），设计字节补丁。
 #
 # 用法：
 #   cp /usr/sbin/bluetoothd /tmp/btd
-#   perl find-uart-timeout.pl /tmp/btd
+#   perl find-timeout.pl /tmp/btd
 #
 # 只用 perl 自带模块，不需要 Xcode 命令行工具。
 
@@ -42,7 +44,7 @@ if ($magic == 0xcafebabe || $magic == 0xcafebabf) {
 my $m = u32($base);
 die sprintf("bad mach magic 0x%08x at %d\n", $m, $base) unless $m == 0xfeedfacf;
 my $ncmds = u32($base + 16);
-my $p     = $base + 32;
+my $p     = $base + 28;    # mach_header_64 共 28 字节（含 reserved），load commands 紧随其后
 my ($vmaddr, $fileoff, $filesize) = (0, 0, 0);
 
 for (1 .. $ncmds) {
@@ -64,9 +66,14 @@ die "no __TEXT segment\n" unless $filesize;
 printf "TEXT vmaddr=0x%x fileoff=%d size=%d\n", $vmaddr, $fileoff, $filesize;
 
 # ---- 找字符串 ----
-# 日志原文是 "port failed to appear after 15 seconds"，但格式串可能拆成两段，
-# 所以按具体到宽泛依次试。
-my @needles = ('port failed to appear', 'failed to appear after', '/dev/cu.BLTH');
+# 实测（17:11）：USB 路径 "Failed to initialize transport" ×4；UART 时代的
+# "port failed to appear" 可能也还在。所有 needle 全扫，全部报告。
+my @needles = (
+    'Failed to initialize transport',
+    'port failed to appear',
+    'failed to appear after',
+    '/dev/cu.BLTH',
+);
 my @hits;
 for my $needle (@needles) {
     my $pos = 0;
@@ -77,8 +84,11 @@ for my $needle (@needles) {
         $n++;
     }
     printf "needle '%s' hits=%d\n", $needle, $n;
-    last if $n;
 }
+# 同一字符串可能被多个 needle 命中（前缀重叠），按位置去重。
+my %seen;
+@hits = grep { !$seen{$_}++ } @hits;
+@hits = sort { $a <=> $b } @hits;
 die "no candidate string found\n" unless @hits;
 
 my %tgt;
@@ -86,17 +96,19 @@ for my $h (@hits) {
     next unless $h >= $fileoff && $h < $fileoff + $filesize;
     my $va = $vmaddr + ($h - $fileoff);
     printf "  hit file=%d va=0x%x\n", $h, $va;
-    my $s = substr($b, $h, 96);
+    my $s = substr($b, $h, 128);
     $s =~ s/[^\x20-\x7e]/./g;
     print "    text: $s\n";
     $tgt{$va} = 1;
 }
 die "string only outside __TEXT\n" unless %tgt;
+
 # ---- 扫 RIP-relative lea 引用 ----
-# lea r64, [rip+disp32] = 48 8D /r，modrm 的 mod=00 rm=101，reg 任意
+# lea r64, [rip+disp32]：REX.W 前缀 48（r8~r15 用 4C），modrm mod=00 rm=101，
+# reg 任意 → 05 0D 15 1D 25 2D 35 3D。
 my $tend = $fileoff + $filesize;
 my @refs;
-while ($b =~ /\x48\x8D([\x05\x0D\x15\x1D\x25\x2D\x35\x3D])/g) {
+while ($b =~ /([\x48\x4C])\x8D([\x05\x0D\x15\x1D\x25\x2D\x35\x3D])/g) {
     my $i = pos($b) - 3;
     next if $i < $fileoff;
     next if $i + 7 > $tend;
@@ -110,11 +122,15 @@ printf "refs=%d\n", scalar(@refs);
 for my $r (@refs) {
     my ($i, $ia) = @$r;
     printf "\nref va=0x%x file=%d\n", $ia, $i;
-    my $start = $i - 48;
+    # 前后各留足上下文：引用点前 64 字节（常见 mov esi,imm32 / cmp /
+    # dispatch_after 参数都在 lea 之后几个字节内），后 160 字节。
+    my $start = $i - 64;
     $start = $fileoff if $start < $fileoff;
-    my $hex = unpack('H*', substr($b, $start, 144));
+    my $len = $i - $start + 160;
+    $len = $tend - $start if $start + $len > $tend;
+    my $hex = unpack('H*', substr($b, $start, $len));
     $hex =~ s/(..)/$1 /g;
-    printf "  from 0x%x:\n  %s\n", $vmaddr + ($start - $fileoff), $hex;
+    printf "  from 0x%x (ref at +%d):\n  %s\n", $vmaddr + ($start - $fileoff), $i - $start, $hex;
 }
 
 print "\ndone\n";
