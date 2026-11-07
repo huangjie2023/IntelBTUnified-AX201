@@ -78,6 +78,9 @@
 #include <sys/proc.h>
 #include <sys/random.h>
 #include <sys/errno.h>
+// 1.9.18: ubc_create_upl / ubc_upl_abort / vnode_ref 钉页路线
+#include <sys/ubc.h>
+#include <sys/vnode.h>
 
 #include "Devices.h"
 #include "driver/IbtDiag.h"
@@ -736,88 +739,83 @@ static uint32_t apfsSolveMask = 0;
 static uint32_t wireSolveMask = 0;
 
 // ---------------------------------------------------------------------------
-// 1.9.17: kernel_map 映射 wire —— A 类崩溃（APFS compressed data hash mismatch
-// → SIGBUS）的修复本体。
+// 1.9.18: UPL 钉页 —— A 类崩溃（APFS compressed data hash mismatch → SIGBUS）
+// 的修复本体（v3 路线）。
 //
 // 机制（acidanthera/bugtracker#2228 复现者方向，实测证据见 2026-11-07 工作日志）：
 // 补丁页驻留在 file cache，同 16KB 压缩组的相邻页被逐出后重读时，组校验把「内存里
 // 改过的页」和「盘上原始页」混在一起算哈希，必然不匹配 → pagein 失败 → SIGBUS。
 // 唯一正解是把被补丁的 16KB 组整组钉在内存里。
 //
-// 1.9.16 实测 IBTWireSolve=28：_ubc_range_wire/_ubc_range_unwire（组级 wire 的
-// 官方入口）不在 26.x 内核符号表；_vm_page_wire 在，但拿不到 vm_page_t——
-// ubc_getobject 返回 memory_object_control_t（不能映射），vm_page_lookup 还要求
-// 对象锁（无法从 kext 获取）。两条路都死。
+// 路线史：
+//   v0 _ubc_range_wire            1.9.16 探测：26.x 符号表没有（bit0/1 缺）
+//   v1 逐页 vm_page_wire          拿不到 vm_page_t：ubc_getobject 返回 control_t，
+//                                 vm_page_lookup 要求对象锁（1.9.16 排除）
+//   v2 kernel_map 映射 wire       1.9.17 实测：符号齐（WireSolve=508）但
+//                                 vm_map_enter_mem_object 对 8/8 组返回
+//                                 KERN_INVALID_ADDRESS(1)——新 XNU 拒绝把
+//                                 外部（文件后端）对象映射进 kernel_map，死路
+//   v3 本版：公开 KPI ubc_create_upl 持有钉住组
 //
-// 本版走第三条路，全部使用导出的经典 Mach VM API：
-//   1. cs_validate_page 钩子的第 2 参 pager 就是该 vnode 的 memory object port；
-//   2. 命中补丁后把 (pager, 页偏移 & ~0x3FFF) 入队（16KB 压缩组基址）；
-//   3. 驱动定时器在 workloop 上下文（脱离 pager 锁，否则 vm_map_wire 会去 fault
-//      同一个 pager → 死锁）里：
-//        vm_map_enter_mem_object(kernel_map, &addr, 0x4000, ANYWHERE, pager, base)
-//        + vm_map_wire(kernel_map, addr, addr+0x4000, VM_PROT_READ, FALSE)
-//      wire 会把整组 4 页 fault 进内存并 wire_count++，pageout 从此不逐出它们；
-//   4. stop 时 unwire + remove。
-// 任何关键符号缺失 → wireArmed=0，行为与 1.9.16 完全一致。-ibtnowire 关闭。
+// ubc_create_upl(vp, base, 0x4000, &upl, &pl, flags)，flags 抄内核同款：
+//   UPL_FILE_IO | UPL_COPYOUT_FROM | UPL_NO_SYNC | UPL_SET_LITE | UPL_SET_IO_WIRE
+// 这是 IOMemoryDescriptor::prepare / cluster IO 给 DMA 钉页的标准组合：
+//   IO_WIRE → 组内页 wire_count++（非驻留页默认 fault 进来，正好再过一遍
+//             cs_validate 钩子）；LITE → 页不置 busy，bluetoothd 照常 fault，
+//             不会像普通 UPL 那样把页锁死到 commit/abort。
+// 持有 UPL 不 commit/abort，组就一直钉着；stop 时 ubc_upl_abort 回收。
+// UPL 持有 object 引用，比 1.9.17 的裸 pager 指针安全；vnode 再用
+// vnode_ref/vnode_rele 配对保活。-ibtnowire 关闭。
 // ---------------------------------------------------------------------------
 static bool disableWire = false;
 static bool wireArmed = false;
-// _kernel_map 是全局变量：solveSymbol 返回它的地址，用前先解引用。
-static uintptr_t kernelMapAddr = 0;
-static int (*t_vm_map_enter_mem_object)(void *, uint64_t *, uint64_t, uint64_t, int, void *, uint64_t, int, int, int, int);
-static int (*t_vm_map_wire)(void *, uint64_t, uint64_t, int, int);
-static int (*t_vm_map_unwire)(void *, uint64_t, uint64_t, int);
-static int (*t_vm_map_remove)(void *, uint64_t, uint64_t);
-static constexpr int kVmProtRead = 0x01;        // VM_PROT_READ
-static constexpr int kVmFlagsAnywhere = 0x0001; // VM_FLAGS_ANYWHERE
-static constexpr int kVmInheritCopy = 1;        // VM_INHERIT_COPY
-static constexpr int kVmUserWireFalse = 0;      // 内核级 wire
 static constexpr uint64_t kWiredRangeSize = 0x4000; // 16KB 压缩组
+static constexpr int kUplFlags =
+    UPL_FILE_IO | UPL_COPYOUT_FROM | UPL_NO_SYNC | UPL_SET_LITE | UPL_SET_IO_WIRE;
+static constexpr int kUplAbortFlags = UPL_ABORT_FREE_ON_EMPTY;
 
 static constexpr uint32_t kMaxWireEntries = 32;
 struct WireEntry {
-    void    *pager;   // cs_validate_page 传入的 memory object port（原始指针，
-                      // 与 btVnodes 同一风险面：只在 bluetoothd 生命周期内有效）
+    vnode_t  vp;      // 建组时的 vnode（vnode_ref 保活，teardown 时 vnode_rele）
     uint64_t base;    // 16KB 组基址（文件偏移）
     bool     done;    // 已处理（含失败，不重试）
-    bool     wired;   // 成功 wire，teardown 需回收
-    uint64_t mapAddr; // kernel_map 内的映射地址
+    bool     wired;   // 已持有 upl，teardown 需回收
+    void    *upl;     // 持有的 upl_t（mach_port_t）
 };
 static WireEntry wireEntries[kMaxWireEntries] {};
 static uint32_t wireEntryCount = 0;
 static uint32_t wireQueuedCount = 0;
 static uint32_t wireOkCount = 0;
-static uint32_t wireEnterFail = 0;
-static uint32_t wireWireFail = 0;
+static uint32_t wirePagesCount = 0;   // 实际钉住的 4K 页数（page list present 统计）
+static uint32_t wireCreateFail = 0;
+static uint32_t wireAbortFail = 0;
 static uint32_t wireActiveCount = 0;
 static uint32_t wireLastError = 0;
 
 // 写入在 cs_validate 上下文（可能并发），读取在 workloop 上下文，全部走原子。
-// 去重是尽力而为：竞态下同一组可能入队两次，后果只是多一个映射、页 wire_count=2，
-// teardown 各自 remove，无害。
-static inline void wireEnqueue(void *pager, uint64_t pageOffset) {
-    if (!pager || !__atomic_load_n(&wireArmed, __ATOMIC_ACQUIRE))
+// 去重是尽力而为：竞态下同一组可能入队两次，后果只是多持有一个 UPL，无害。
+static inline void wireEnqueue(vnode_t vp, uint64_t pageOffset) {
+    if (!vp || !__atomic_load_n(&wireArmed, __ATOMIC_ACQUIRE))
         return;
     uint64_t base = pageOffset & ~0x3Full;
     uint32_t n = __atomic_load_n(&wireEntryCount, __ATOMIC_ACQUIRE);
     for (uint32_t i = 0; i < n && i < kMaxWireEntries; i++)
-        if (wireEntries[i].pager == pager && wireEntries[i].base == base)
+        if (wireEntries[i].vp == vp && wireEntries[i].base == base)
             return;
     uint32_t slot = __atomic_fetch_add(&wireEntryCount, 1, __ATOMIC_ACQ_REL);
-    __atomic_fetch_add(&wireQueuedCount, 1, __ATOMIC_RELAXED);
     if (slot >= kMaxWireEntries)
+        return;                        // 表满：不存、不引用
+    if (vnode_ref(vp) != 0) {          // 拿不到引用：本 boot 内 vnode 将死，放弃
+        __atomic_store_n(&wireEntries[slot].done, true, __ATOMIC_RELEASE);
         return;
-    wireEntries[slot].pager = pager;
+    }
+    wireEntries[slot].vp = vp;
     wireEntries[slot].base = base;
+    __atomic_fetch_add(&wireQueuedCount, 1, __ATOMIC_RELAXED);
 }
 
 void ibtWireProcess() {
     if (!__atomic_load_n(&wireArmed, __ATOMIC_ACQUIRE))
-        return;
-    if (!kernelMapAddr || !t_vm_map_enter_mem_object || !t_vm_map_wire)
-        return;
-    void *km = *reinterpret_cast<void **>(kernelMapAddr);
-    if (!km)
         return;
     uint32_t n = __atomic_load_n(&wireEntryCount, __ATOMIC_ACQUIRE);
     for (uint32_t i = 0; i < n && i < kMaxWireEntries; i++) {
@@ -825,49 +823,47 @@ void ibtWireProcess() {
         if (__atomic_load_n(&e.done, __ATOMIC_ACQUIRE))
             continue;
         __atomic_store_n(&e.done, true, __ATOMIC_RELEASE);
-        uint64_t addr = 0;
-        int kr = t_vm_map_enter_mem_object(km, &addr, kWiredRangeSize, 0,
-            kVmFlagsAnywhere, e.pager, e.base, 0 /*copy=false*/,
-            kVmProtRead, kVmProtRead, kVmInheritCopy);
-        if (kr != 0) {
-            __atomic_fetch_add(&wireEnterFail, 1, __ATOMIC_RELAXED);
+        upl_t upl = nullptr;
+        upl_page_info_t *pl = nullptr;
+        int kr = ubc_create_upl(e.vp, (off_t)e.base, (int)kWiredRangeSize, &upl, &pl, kUplFlags);
+        if (kr != 0 || upl == nullptr) {
+            __atomic_fetch_add(&wireCreateFail, 1, __ATOMIC_RELAXED);
             __atomic_store_n(&wireLastError, (uint32_t)kr, __ATOMIC_RELAXED);
+            vnode_rele(e.vp);
+            e.vp = nullptr;
             continue;
         }
-        // wire 内部会 fault 整组 4 页：未驻留的页经 vnode pager pagein，
-        // 正好再过一遍 cs_validate 钩子（补丁照常命中）。
-        kr = t_vm_map_wire(km, addr, addr + kWiredRangeSize, kVmProtRead, kVmUserWireFalse);
-        if (kr != 0) {
-            __atomic_fetch_add(&wireWireFail, 1, __ATOMIC_RELAXED);
-            __atomic_store_n(&wireLastError, (uint32_t)kr, __ATOMIC_RELAXED);
-            if (t_vm_map_remove)
-                t_vm_map_remove(km, addr, addr + kWiredRangeSize);
-            continue;
-        }
-        e.wired = true;
-        e.mapAddr = addr;
+        // page list 统计实际钉住的页（组内非驻留页若未被 fault 进来则不计）
+        int present = 0;
+        if (pl)
+            for (int p = 0; p < (int)(kWiredRangeSize / 0x1000); p++)
+                if (upl_page_present(pl, p))
+                    present++;
+        __atomic_fetch_add(&wirePagesCount, (uint32_t)present, __ATOMIC_RELAXED);
+        e.upl = upl;
+        __atomic_store_n(&e.wired, true, __ATOMIC_RELEASE);
         __atomic_fetch_add(&wireOkCount, 1, __ATOMIC_RELAXED);
         __atomic_fetch_add(&wireActiveCount, 1, __ATOMIC_RELAXED);
     }
 }
 
 void ibtWireTeardown() {
-    if (!kernelMapAddr)
-        return;
-    void *km = *reinterpret_cast<void **>(kernelMapAddr);
-    if (!km)
-        return;
     uint32_t n = __atomic_load_n(&wireEntryCount, __ATOMIC_ACQUIRE);
     for (uint32_t i = 0; i < n && i < kMaxWireEntries; i++) {
         WireEntry &e = wireEntries[i];
-        if (!__atomic_load_n(&e.wired, __ATOMIC_ACQUIRE))
+        if (e.vp == nullptr)
             continue;
-        if (t_vm_map_unwire)
-            t_vm_map_unwire(km, e.mapAddr, e.mapAddr + kWiredRangeSize, kVmUserWireFalse);
-        if (t_vm_map_remove)
-            t_vm_map_remove(km, e.mapAddr, e.mapAddr + kWiredRangeSize);
-        __atomic_store_n(&e.wired, false, __ATOMIC_RELEASE);
-        __atomic_fetch_sub(&wireActiveCount, 1, __ATOMIC_RELAXED);
+        if (__atomic_load_n(&e.wired, __ATOMIC_ACQUIRE)) {
+            int kr = ubc_upl_abort(static_cast<upl_t>(e.upl), kUplAbortFlags);
+            __atomic_store_n(&e.wired, false, __ATOMIC_RELEASE);
+            if (kr != 0) {
+                __atomic_fetch_add(&wireAbortFail, 1, __ATOMIC_RELAXED);
+                __atomic_store_n(&wireLastError, (uint32_t)kr, __ATOMIC_RELAXED);
+            } else
+                __atomic_fetch_sub(&wireActiveCount, 1, __ATOMIC_RELAXED);
+        }
+        vnode_rele(e.vp);
+        e.vp = nullptr;
     }
 }
 
@@ -1003,7 +999,7 @@ static void patched_cs_validate_page(vnode_t vp, memory_object_t pager, memory_o
             // workloop 上下文里整组 wire（为什么不能在这里直接 wire：钩子持有
             // pager/对象锁，vm_map_wire 会去 fault 同一个 pager → 死锁）。
             if (any)
-                wireEnqueue(pager, page_offset);
+                wireEnqueue(vp, page_offset);
         }
         else if (strcmp(path + kSbinDirLength, "bluetoothd") == 0) {
             __atomic_fetch_add(&csBtMatches, 1, __ATOMIC_RELAXED);
@@ -1031,7 +1027,7 @@ static void patched_cs_validate_page(vnode_t vp, memory_object_t pager, memory_o
             // workloop 上下文里整组 wire（为什么不能在这里直接 wire：钩子持有
             // pager/对象锁，vm_map_wire 会去 fault 同一个 pager → 死锁）。
             if (any)
-                wireEnqueue(pager, page_offset);
+                wireEnqueue(vp, page_offset);
         }
     }
 }
@@ -1373,37 +1369,18 @@ static void processPatcher(KernelPatcher &patcher) {    const bool argOta    = c
     for (size_t i = 0; i < arrsize(wireSyms); i++)
         if (patcher.solveSymbol(KernelPatcher::KernelID, wireSyms[i]))
             __atomic_fetch_or(&wireSolveMask, 1u << i, __ATOMIC_RELAXED);
-    // 1.9.17: kernel_map 映射 wire 需要的符号（bit5~bit9）。_kernel_map 是全局
-    // 变量，solveSymbol 返回它的地址；vm_map_* 是经典导出 API。关键项（bit5~7）
-    // 缺一即 wireArmed=0，行为退回 1.9.16。
+    // 1.9.17→1.9.18: 这组探测是 kernel_map 映射 wire 路线的存档（实测 bit5~8 有、
+    // bit9 _vm_map_remove 缺，且 vm_map_enter_mem_object 全部 KERN_INVALID_ADDRESS，
+    // 路线废弃）。1.9.18 改用公开 KPI ubc_create_upl，无需符号，探测结果只作历史。
     static const char *wireSyms2[5] {
         "_kernel_map", "_vm_map_enter_mem_object", "_vm_map_wire", "_vm_map_unwire", "_vm_map_remove",
     };
-    for (size_t i = 0; i < arrsize(wireSyms2); i++) {
-        mach_vm_address_t a = patcher.solveSymbol(KernelPatcher::KernelID, wireSyms2[i]);
-        if (a) {
+    for (size_t i = 0; i < arrsize(wireSyms2); i++)
+        if (patcher.solveSymbol(KernelPatcher::KernelID, wireSyms2[i]))
             __atomic_fetch_or(&wireSolveMask, 1u << (i + 5), __ATOMIC_RELAXED);
-            switch (i) {
-                case 0:
-                    kernelMapAddr = a;
-                    break;
-                case 1:
-                    t_vm_map_enter_mem_object = reinterpret_cast<decltype(t_vm_map_enter_mem_object)>(a);
-                    break;
-                case 2:
-                    t_vm_map_wire = reinterpret_cast<decltype(t_vm_map_wire)>(a);
-                    break;
-                case 3:
-                    t_vm_map_unwire = reinterpret_cast<decltype(t_vm_map_unwire)>(a);
-                    break;
-                case 4:
-                    t_vm_map_remove = reinterpret_cast<decltype(t_vm_map_remove)>(a);
-                    break;
-            }
-        }
-    }
     disableWire = checkKernelArgument("-ibtnowire");
-    wireArmed = !disableWire && kernelMapAddr && t_vm_map_enter_mem_object && t_vm_map_wire;
+    // ubc_create_upl/ubc_upl_abort 是公开 KPI，恒可链接；门控只看 boot-arg。
+    wireArmed = !disableWire;
 
     // 路由统一走一个小包装：先按 APFS kinfo 的 id 试，失败再退回 KernelID（1.9.8 的路径）。
     // 两条都失败才算真失败，这样 bit4~7 的含义保持"这条钩子到底装上没有"。
@@ -1488,12 +1465,13 @@ void ibtDiagFill(IbtDiagSnapshot *out) {
     out->bidArmed     = shouldPatchBoardId ? 1u : 0u;
     out->bidMiss      = __atomic_load_n(&bidMissCount, __ATOMIC_RELAXED);
     out->wireSolve    = __atomic_load_n(&wireSolveMask, __ATOMIC_RELAXED);
-    // 1.9.17: 映射 wire 执行状态
+    // 1.9.18: UPL 钉页执行状态
     out->wireArmed    = __atomic_load_n(&wireArmed, __ATOMIC_RELAXED) ? 1u : 0u;
     out->wireQueued   = __atomic_load_n(&wireQueuedCount, __ATOMIC_RELAXED);
     out->wireOk       = __atomic_load_n(&wireOkCount, __ATOMIC_RELAXED);
-    out->wireEnterFail = __atomic_load_n(&wireEnterFail, __ATOMIC_RELAXED);
-    out->wireWireFail = __atomic_load_n(&wireWireFail, __ATOMIC_RELAXED);
+    out->wirePages    = __atomic_load_n(&wirePagesCount, __ATOMIC_RELAXED);
+    out->wireCreateFail = __atomic_load_n(&wireCreateFail, __ATOMIC_RELAXED);
+    out->wireAbortFail = __atomic_load_n(&wireAbortFail, __ATOMIC_RELAXED);
     out->wireActive   = __atomic_load_n(&wireActiveCount, __ATOMIC_RELAXED);
     out->wireLastErr  = __atomic_load_n(&wireLastError, __ATOMIC_RELAXED);
     {

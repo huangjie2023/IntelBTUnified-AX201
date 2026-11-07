@@ -115,23 +115,26 @@ struct IbtDiagSnapshot {
     //   bit2 _vm_page_wire        备选：逐页 wire（1.9.16 实测有）
     //   bit3 _vm_page_unwire      （1.9.16 实测有）
     //   bit4 _ubc_msync           对照组，公开 KPI，理应恒为 1；若它是 0 说明探测本身有问题
-    // 1.9.17: bit0/1 实测不存在，改走 kernel_map 映射 wire，追加 5 位：
-    //   bit5 _kernel_map（全局变量）bit6 _vm_map_enter_mem_object bit7 _vm_map_wire
-    //   bit8 _vm_map_unwire        bit9 _vm_map_remove
+    // 1.9.17→1.9.18: wireSolve 是符号探测的存档（bit5~8 有、bit9 缺）。
+    // kernel_map 映射路线已废弃：vm_map_enter_mem_object 对 8/8 组返回
+    // KERN_INVALID_ADDRESS——新 XNU 拒绝把外部对象映射进 kernel_map。
+    // 1.9.18 改用公开 KPI ubc_create_upl（UPL_FILE_IO|COPYOUT_FROM|NO_SYNC|
+    // SET_LITE|SET_IO_WIRE，IOMemoryDescriptor::prepare 同款组合），无需符号。
     unsigned int wireSolve;
 
-    // 1.9.17: kernel_map 映射 wire 的执行状态。判读：
-    //   wireArmed=0 且 wireSolve 缺 bit5~7 之一 → 符号缺失，本路线不可用（行为同 1.9.16）
-    //   wireArmed=1 且 wireEnterFail 增长       → pager port 不能这样映射，路线失败
-    //   wireOk 增长且 wireActive 稳定          → 组已钉住，观察 A 类（SIGBUS + ktriage
-    //                                             hash mismatch）是否绝迹
-    // wireActive 应恒等于 wireOk - teardown 次数；stop 后归 0。
+    // 1.9.18: UPL 钉页执行状态。判读：
+    //   wireArmed=0                          → 只可能被 -ibtnowire 关掉
+    //   wireOk=0 且 wireCreateFail 增长       → ubc_create_upl 失败，看 wireLastErr
+    //   wireOk>0 且 wirePages≈4×wireOk        → 组已钉住（每 4K 页计 1）
+    //   wireActive 稳定、不再增长             → 正常，teardown 前应等于 wireOk
+    // 之后观察 A 类（SIGBUS + ktriage hash mismatch）是否绝迹。
     unsigned int wireArmed;
-    unsigned int wireQueued;    // 累计入队的 16KB 组数（含表满溢出，>32 时多的进不来）
-    unsigned int wireOk;        // 成功 wire 的组数
-    unsigned int wireEnterFail; // vm_map_enter_mem_object 失败次数
-    unsigned int wireWireFail;  // vm_map_wire 失败次数
-    unsigned int wireActive;    // 当前保持 wire 的组数
+    unsigned int wireQueued;    // 累计入队的 16KB 组数（表满 >32 溢出）
+    unsigned int wireOk;        // 成功创建并持有的 UPL 数
+    unsigned int wirePages;     // 实际钉住的 4K 页数（page list present 统计）
+    unsigned int wireCreateFail;// ubc_create_upl 失败次数
+    unsigned int wireAbortFail; // stop 时 ubc_upl_abort 失败次数
+    unsigned int wireActive;    // 当前持有中的 UPL 数
     unsigned int wireLastErr;   // 最后一次非 0 的 kern_return_t
 };
 
@@ -172,8 +175,8 @@ void ibtDiagFill(IbtDiagSnapshot *out);
 // 未注册前调用是空操作。
 void ibtDiagPublishLive();
 
-// 1.9.17: 由 IntelBTUnified.cpp 实现。process() 在 workloop 上下文调用
-// （cs_validate_page 持有 pager/对象锁，不能在钩子里直接 vm_map_wire，会死锁）；
-// teardown 在 stop() 里调用，unwire 并移除全部 kernel_map 映射。
+// 1.9.17→1.9.18: 由 IntelBTUnified.cpp 实现。process() 在 workloop 上下文调用
+// （cs_validate_page 持有 pager/对象锁，不能在钩子里直接建 UPL/fault 页，会死锁）；
+// teardown 在 stop() 里调用，abort 全部 UPL 并释放 vnode 引用。
 void ibtWireProcess();
 void ibtWireTeardown();
