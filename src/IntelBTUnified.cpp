@@ -585,6 +585,37 @@ static const uint8_t kSkipInternalControllerNVRAMCheckPatched13_3[] = {
     0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90
 };
 
+// ---------------------------------------------------------------------------
+// 1.9.19: B 类根治 —— bluetoothd 传输等待循环的睡眠间隔补丁（默认启用，-ibtnowaits 关）。
+//
+// 证据链（tools/find-callers.pl + find-waits.pl 对 26.7.3 x86_64 切片的实测输出）：
+//   usleep_ms thunk（imul edi,edi,1000 尾调 usleep）只有 1 个 @0x1000f2409；
+//   14 个 mov edi,imm; call 调用点里只有 2 个带循环边界，全在同一函数的两个分支：
+//     site1 @0x100159251: 41 83 ff 6d (cmp r15d,109) ... bf 64 00 00 00 (100ms)
+//     site2 @0x10015930c: 83 f8 6d    (cmp eax,109)  ... bf 64 00 00 00 (100ms)
+//   109 × 100ms ≈ 10.9s + 每轮 probe 开销 ≈ 观测的 15~16.4s 超时；耗尽后调
+//   "Failed to initialize transport %s" 报错函数 → os_crash（B 类崩溃本体）。
+//
+// 补丁：mov edi,100 → mov edi,500（bf 64 00 00 00 → bf f4 01 00 00）。
+// 循环次数 0x6d 是 imm8（上限 127 次 = 12.7s，不够），改睡眠间隔把预算
+// 提到 109 × 500ms ≈ 54.5s；控制器就绪时循环照常立即退出，只是轮询粒度变粗。
+// needle 为 15 字节实测序列（含两条 call rel32，与该 bluetoothd 构建逐字节绑定）；
+// macOS 更新后 needle 失配 = 补丁静默不生效（PatchMask 无 bit9/bit10），无副作用。
+// ---------------------------------------------------------------------------
+static const uint8_t kBtdWaitSite1Original[] = {
+    0xE8, 0x95, 0xEF, 0xF8, 0xFF, 0xBF, 0x64, 0x00, 0x00, 0x00, 0xE8, 0xAE, 0x91, 0xF9, 0xFF,
+};
+static const uint8_t kBtdWaitSite1Patched[] = {
+    0xE8, 0x95, 0xEF, 0xF8, 0xFF, 0xBF, 0xF4, 0x01, 0x00, 0x00, 0xE8, 0xAE, 0x91, 0xF9, 0xFF,
+};
+static const uint8_t kBtdWaitSite2Original[] = {
+    0xE8, 0xDA, 0xEE, 0xF8, 0xFF, 0xBF, 0x64, 0x00, 0x00, 0x00, 0xE8, 0xF3, 0x90, 0xF9, 0xFF,
+};
+static const uint8_t kBtdWaitSite2Patched[] = {
+    0xE8, 0xDA, 0xEE, 0xF8, 0xFF, 0xBF, 0xF4, 0x01, 0x00, 0x00, 0xE8, 0xF3, 0x90, 0xF9, 0xFF,
+};
+static bool shouldPatchWaits = false;
+
 static bool shouldPatchBoardId = false;
 static bool shouldPatchAddress = false;
 static bool shouldPatchNvramCheck = false;
@@ -621,6 +652,8 @@ enum PatchId : uint32_t {
     PatchNvram       = 1u << 6,
     PatchBtdBid      = 1u << 7,
     PatchAddress     = 1u << 8,
+    PatchBtdWait1    = 1u << 9,
+    PatchBtdWait2    = 1u << 10,
 };
 static uint32_t appliedPatches = 0;
 // 1.9.15: board-id 补丁执行了、但页里找不到 needle 的次数。macOS 26.7.3 上
@@ -1023,6 +1056,11 @@ static void patched_cs_validate_page(vnode_t vp, memory_object_t pager, memory_o
             }
             if (shouldPatchAddress)
                 any |= searchAndPatchWithMask(PatchAddress, "same-address check", data, PAGE_SIZE, path, kSkipAddressCheckOriginal, sizeof(kSkipAddressCheckOriginal), kSkipAddressCheckMask, sizeof(kSkipAddressCheckMask), kSkipAddressCheckPatched, sizeof(kSkipAddressCheckPatched));
+            // 1.9.19: 传输等待循环 100ms→500ms（B 类根治，见 kBtdWaitSite1* 注释）。
+            if (shouldPatchWaits) {
+                any |= searchAndPatch(PatchBtdWait1, "transport wait 100->500ms (site1)", data, PAGE_SIZE, path, kBtdWaitSite1Original, kBtdWaitSite1Patched);
+                any |= searchAndPatch(PatchBtdWait2, "transport wait 100->500ms (site2)", data, PAGE_SIZE, path, kBtdWaitSite2Original, kBtdWaitSite2Patched);
+            }
             // 1.9.17: 本页命中补丁 → 把它所在的 16KB 压缩组入队，由驱动定时器在
             // workloop 上下文里整组 wire（为什么不能在这里直接 wire：钩子持有
             // pager/对象锁，vm_map_wire 会去 fault 同一个 pager → 死锁）。
@@ -1278,6 +1316,8 @@ static void processPatcher(KernelPatcher &patcher) {    const bool argOta    = c
     // 本包自称替代 BlueToolFixup，就不该再要求用户额外加 BlueToolFixup 的
     // boot-arg，改为默认启用；需要关闭时用 -ibtnobid。
     shouldPatchBoardId = !checkKernelArgument("-ibtnobid");
+    // 1.9.19: 传输等待循环间隔补丁，默认启用；-ibtnowaits 关闭（诊断用）。
+    shouldPatchWaits = !checkKernelArgument("-ibtnowaits");
     // 长度必须严格等于 needle 长度：replaceSize 传的是 kBoardIdSize，
     // 若本机 board-id 更短，findAndReplace 会按 21 字节读 patch 缓冲，越界。
     if (shouldPatchBoardId) {

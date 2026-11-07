@@ -96,7 +96,9 @@ struct IbtDiagSnapshot {
     //   bidArmed = 1 且 patchMask 有 bit1/bit7 → 补丁打上了，问题在别处
     unsigned int patchMask;  // appliedPatches 原样：bit0 skip-update, bit1 BlueTool board-id,
                              // bit2 vendor, bit3 chipset, bit4 chipset13, bit5 chipset15,
-                             // bit6 nvram, bit7 bluetoothd board-id, bit8 address
+                             // bit6 nvram, bit7 bluetoothd board-id, bit8 address,
+                             // bit9/bit10 transport wait 100->500ms site1/site2 (1.9.19，
+                             // B 类根治；bluetoothd 跑过之后无 bit9/bit10 = needle 过期)
     unsigned int bidArmed;   // 1 = shouldPatchBoardId，board-id 补丁本次是否启用
     unsigned int bidMiss;    // board-id 补丁执行了但没找到 needle 的次数（>0 且 patchMask 无 bit1/7 = needle 过期）
     char boardId[24];        // 实际 boardIdentifier（null 结尾），用来核对长度判定是否成立
