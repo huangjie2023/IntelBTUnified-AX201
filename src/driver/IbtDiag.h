@@ -138,6 +138,16 @@ struct IbtDiagSnapshot {
     unsigned int wireAbortFail; // stop 时 ubc_upl_abort 失败次数
     unsigned int wireActive;    // 当前持有中的 UPL 数
     unsigned int wireLastErr;   // 最后一次非 0 的 kern_return_t
+
+    // 1.9.20: teardown 独立性判据。背景：本驱动是 USB 服务，睡眠时系统会
+    // stop()、唤醒再 start()；1.9.18/19 把 UPL 回收放在 stop() 里，等于每次
+    // 睡眠都拆掉 A 类保护（实测：第三次唤醒 SIGBUS 复发，WireActive 9→0）。
+    // 1.9.20 起回收点移到 free()（仅 kext 卸载）。判读：
+    //   睡眠若干次后 IBTStopCount 增长、IBTWireTeardown 仍为 0、wireActive
+    //   保持 = 修复生效；Teardown>0 且 Active 掉到 0 = 又有卸载路径在拆。
+    unsigned int wireTeardown;        // teardown 执行次数（正常 boot 应恒为 0）
+    unsigned int wireTeardownAborted; // teardown 累计回收的 UPL 数
+    unsigned int stopCount;           // 服务 stop() 次数（睡眠会 +1，正常）
 };
 
 // ---------------------------------------------------------------------------

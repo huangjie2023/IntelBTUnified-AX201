@@ -824,6 +824,10 @@ static uint32_t wireCreateFail = 0;
 static uint32_t wireAbortFail = 0;
 static uint32_t wireActiveCount = 0;
 static uint32_t wireLastError = 0;
+// 1.9.20: teardown 次数与累计回收的 UPL 数。正常 boot 里两者应恒为 0
+// （teardown 只在 kext 卸载的 free() 里跑）；>0 说明发生过真正的卸载。
+static uint32_t wireTeardownCount = 0;
+static uint32_t wireTeardownAborted = 0;
 
 // 写入在 cs_validate 上下文（可能并发），读取在 workloop 上下文，全部走原子。
 // 去重是尽力而为：竞态下同一组可能入队两次，后果只是多持有一个 UPL，无害。
@@ -881,6 +885,7 @@ void ibtWireProcess() {
 }
 
 void ibtWireTeardown() {
+    __atomic_fetch_add(&wireTeardownCount, 1, __ATOMIC_RELAXED);
     uint32_t n = __atomic_load_n(&wireEntryCount, __ATOMIC_ACQUIRE);
     for (uint32_t i = 0; i < n && i < kMaxWireEntries; i++) {
         WireEntry &e = wireEntries[i];
@@ -892,8 +897,10 @@ void ibtWireTeardown() {
             if (kr != 0) {
                 __atomic_fetch_add(&wireAbortFail, 1, __ATOMIC_RELAXED);
                 __atomic_store_n(&wireLastError, (uint32_t)kr, __ATOMIC_RELAXED);
-            } else
+            } else {
                 __atomic_fetch_sub(&wireActiveCount, 1, __ATOMIC_RELAXED);
+                __atomic_fetch_add(&wireTeardownAborted, 1, __ATOMIC_RELAXED);
+            }
         }
         vnode_rele(e.vp);
         e.vp = nullptr;
@@ -1514,6 +1521,8 @@ void ibtDiagFill(IbtDiagSnapshot *out) {
     out->wireAbortFail = __atomic_load_n(&wireAbortFail, __ATOMIC_RELAXED);
     out->wireActive   = __atomic_load_n(&wireActiveCount, __ATOMIC_RELAXED);
     out->wireLastErr  = __atomic_load_n(&wireLastError, __ATOMIC_RELAXED);
+    out->wireTeardown = __atomic_load_n(&wireTeardownCount, __ATOMIC_RELAXED);
+    out->wireTeardownAborted = __atomic_load_n(&wireTeardownAborted, __ATOMIC_RELAXED);
     {
         const char *bid = BaseDeviceInfo::get().boardIdentifier;
         size_t n = 0;

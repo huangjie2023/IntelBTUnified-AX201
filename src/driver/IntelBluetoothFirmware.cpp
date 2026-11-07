@@ -31,6 +31,9 @@ OSDefineMetaClassAndStructors(IntelBluetoothFirmware, IOService)
 // 用 ioreg 读，不需要 root、不写盘、不依赖日志子系统。
 static IOService *gDiagSvc = nullptr;
 static unsigned int gPmEvents = 0;
+// 1.9.20: stop() 次数。USB 驱动在睡眠时会被系统 stop（唤醒再 start），
+// 这个数 + IBTWireTeardown 一起判定 teardown 是否还跟着睡眠走。
+static unsigned int gServiceStopCount = 0;
 // 1.9.10：唤醒竞态计时槽位，见 IbtDiag.h
 static unsigned int gIbtTiming[kIbtT_Slots] = {};
 
@@ -71,6 +74,7 @@ void ibtDiagPublishLive()
     IbtDiagSnapshot s {};
     ibtDiagFill(&s);
     s.pmEvents = gPmEvents;
+    s.stopCount = gServiceStopCount;
 
     // 前三个是“修复到底生效没有”的判据：csHookArmed 决定补丁页写得进去，
     // vnopArmed 决定 EBADMSG 吞不吞得掉。任何一个为 0，1.9.x 的修复都是空转。
@@ -124,6 +128,11 @@ void ibtDiagPublishLive()
     svc->setProperty("IBTWireAbortFail", (unsigned long long)s.wireAbortFail, 32);
     svc->setProperty("IBTWireActive", (unsigned long long)s.wireActive, 32);
     svc->setProperty("IBTWireLastErr", (unsigned long long)s.wireLastErr, 32);
+    // 1.9.20: stop/teardown 计数——实证「睡眠时 USB 服务被 stop → teardown 拆掉
+    // A 类保护」。判读：睡眠后 StopCount 增长而 TeardownCount 不动 = 修复生效。
+    svc->setProperty("IBTStopCount", (unsigned long long)s.stopCount, 32);
+    svc->setProperty("IBTWireTeardown", (unsigned long long)s.wireTeardown, 32);
+    svc->setProperty("IBTWireTeardownAborted", (unsigned long long)s.wireTeardownAborted, 32);
     // 1.9.11：cs_validate_page 入口漏斗。判读见 IbtDiag.h。
     svc->setProperty("IBTCsAll", (unsigned long long)s.csAll, 32);
     svc->setProperty("IBTCsPathFail", (unsigned long long)s.csPathFail, 32);
@@ -167,6 +176,10 @@ bool IntelBluetoothFirmware::init(OSDictionary *dictionary)
 
 void IntelBluetoothFirmware::free() {
     XYLog("Driver free()\n");
+    // 1.9.20: UPL/vnode 引用的回收点从 stop() 挪到这里——free() 只在实例真正
+    // 销毁（kext 卸载）时调用，睡眠触发的 USB 服务 stop/start 不再拆 A 类保护。
+    // 见 stop() 里的分析。
+    ibtWireTeardown();
     // stop() 正常路径已经摘掉；这里只是兜底，防止 start() 失败时残留的定时器
     // 在实例释放后仍被 workloop 回访。
     if (m_pDiagTimer) {
@@ -312,9 +325,13 @@ IOReturn IntelBluetoothFirmware::setPowerState(unsigned long powerStateOrdinal, 
 void IntelBluetoothFirmware::stop(IOService *provider)
 {
     XYLog("Driver Stop()\n");
+    ++gServiceStopCount;
     ibtDiagPublishLive();
-    // 1.9.17→1.9.18: 先回收 UPL/vnode 引用再摘定时器，避免页在 kext 卸载后保持虚假的 wire_count。
-    ibtWireTeardown();
+    // 1.9.20: 这里不再 teardown！实测（19:07 第三次唤醒崩溃）发现本驱动是 USB
+    // 服务，睡眠时系统会 stop()、唤醒再 start()——旧代码在 stop 里回收全部
+    // UPL，等于每次睡眠都亲手拆掉 A 类保护，唤醒后补丁页被逐出重读即
+    // SIGBUS（WireActive 9→0 就是证据）。UPL 持有 object+vnode 引用，跨
+    // 服务 stop/start 持有完全安全，teardown 改到 free()（仅 kext 卸载时）。
     // 先停定时器再摘 gDiagSvc，避免回调在 service 释放之后仍去 setProperty。
     if (m_pDiagTimer) {
         m_pDiagTimer->cancelTimeout();
