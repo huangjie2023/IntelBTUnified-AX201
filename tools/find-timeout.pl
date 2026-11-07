@@ -48,8 +48,21 @@ if ($magic == 0xbebafeca || $magic == 0xbfbafeca) {
 my $m = u32($base);
 die sprintf("bad mach magic 0x%08x at %d（没找到 x86_64 切片？）\n", $m, $base)
     unless $m == 0xfeedfacf;
+# load commands 起始偏移：传统 mach_header_64 共 28 字节，commands 在 +28。
+# Tahoe 实测（17:38 真机 bluetoothd）：头部多 4 字节——+28 处为 0x00000000，
+# +32 处才是第一条 LC_SEGMENT_64(0x19)。自适应判定：+28 处 cmd=0 而 +32 处
+# 像合法命令（cmd≠0 且 size 合理）→ 用 +32。
+sub cmd_start {
+    my $off = 28;
+    if (u32($base + 28) == 0) {
+        my ($c, $s) = (u32($base + 32), u32($base + 36));
+        $off = 32 if $c != 0 && $s >= 8 && $s <= 0x100000;
+    }
+    return $off;
+}
+
 my $ncmds = u32($base + 16);
-my $p     = $base + 28;    # mach_header_64 共 28 字节（含 reserved），load commands 紧随其后
+my $p     = $base + cmd_start();
 my ($vmaddr, $fileoff, $filesize) = (0, 0, 0);
 
 for (1 .. $ncmds) {
@@ -78,9 +91,9 @@ printf "TEXT vmaddr=0x%x fileoff=%d(abs %d) size=%d\n", $vmaddr, $fileoff, $base
 sub dump_commands {
     my $ft        = u32($base + 12);
     my $sizeofcmds = u32($base + 20);
-    printf "mach filetype=%d (2=EXECUTE 6=DYLIB 13=FILESET) ncmds=%d sizeofcmds=%d\n",
-        $ft, $ncmds, $sizeofcmds;
-    my $q = $base + 28;
+    printf "mach filetype=%d (2=EXECUTE 6=DYLIB 13=FILESET) ncmds=%d sizeofcmds=%d cmd_start=+%d\n",
+        $ft, $ncmds, $sizeofcmds, cmd_start();
+    my $q = $base + cmd_start();
     my $end = $base + 28 + $sizeofcmds;
     $end = $base + $size if $end > $base + $size;
     my $shown = 0;
