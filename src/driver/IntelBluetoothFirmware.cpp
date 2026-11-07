@@ -90,6 +90,9 @@ void ibtDiagPublishLive()
     svc->setProperty("IBTDecOnBt", (unsigned long long)s.decOnBt, 32);
     svc->setProperty("IBTValAll", (unsigned long long)s.valAll, 32);
     svc->setProperty("IBTValOnBt", (unsigned long long)s.valOnBt, 32);
+    svc->setProperty("IBTDecOk", (unsigned long long)s.decOk, 32);
+    svc->setProperty("IBTDecBad", (unsigned long long)s.decBad, 32);
+    svc->setProperty("IBTDecOther", (unsigned long long)s.decOther, 32);
     svc->setProperty("IBTApfsVerAll", (unsigned long long)s.apfsVerAll, 32);
     svc->setProperty("IBTApfsVerOnBt", (unsigned long long)s.apfsVerOnBt, 32);
     svc->setProperty("IBTApfsPiAll", (unsigned long long)s.apfsPiAll, 32);

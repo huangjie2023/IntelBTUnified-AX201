@@ -16,6 +16,51 @@
 
 > 上游 FAQ 明确：**macOS Monterey 及以后不要使用 `IntelBluetoothInjector.kext`**（"Do NOT use this Kext on macOS Monterey and newer"）。Monterey+ 靠的是驱动把 USB 设备改名为 `Bluetooth USB Host Controller` 来绕过 bluetoothd/BlueTool 的 board-id 检查，所以单 kext 里**不该**有那条 Broadcom transport 注入 personality。本包结构对应全量包的 `IntelBluetoothFirmware` + `IntelBTPatcher` + `BlueToolFixup`，不含 Injector。
 
+## 1.9.13：真正被调用的校验入口是 `_decmpfs_validate_compressed_file`
+
+1.9.12 把快照改成定时刷新之后，一次睡眠唤醒就拿到了此前一直读不到的真实读数：
+
+```
+IBTPmEvents      3
+IBTBtVnodes      2      ← bluetoothd + BlueTool 都被认出来了
+IBTPatchedPages  4      ← 4 个页真的被改写
+IBTValOnBt      64      ← _decmpfs_validate_compressed_file 命中 bt vnode 64 次
+IBTDecOnBt       0      ← _decmpfs_pagein_compressed 一次没命中
+IBTVnopAll       0      ← _VNOP_VERIFY 全系统 0 次调用
+```
+
+两个结论：
+
+1. **补丁一直在打。** 之前连续几轮读到的 `BtVnodes=0 / PatchedPages=0` 不是“没生效”，
+   而是快照停留在 `start()` 时刻——那时 bluetoothd 还没启动。这个假 0 直接导致 1.9.11
+   围绕「钩错了地方」改方向，是错的。
+2. **`_VNOP_VERIFY` 是死符号。** 全系统 0 次调用，1.9.1~1.9.5 围绕它写的整条“吞掉
+   EBADMSG”从未执行过一次。真正处理 bluetoothd/BlueTool 压缩页校验的是
+   `_decmpfs_validate_compressed_file`（64 次命中）。
+
+所以 1.9.13 把吞错从 `_VNOP_VERIFY` 挪到这里：对 bt vnode 返回 EBADMSG 时返回 0，
+其余返回值原样透传。同时新增三个返回值分布计数：
+
+| 属性 | 含义 |
+|---|---|
+| `IBTDecOk` | 返回 0（校验通过） |
+| `IBTDecBad` | 返回 EBADMSG（压缩块哈希不匹配） |
+| `IBTDecOther` | 返回其它非 0 |
+
+判读：若崩溃前 `DecBad` 增长，说明吞错落在了对的地方；若 `DecBad` 恒 0 而崩溃照旧，
+说明错误发生在更下层（APFS 内部），这条钩子再改也没用，得换 `_apfs_vnop_verify`
+（该符号 1.9.9 起解析失败，`SymMask` 无 bit4）。
+
+## 1.9.12：诊断快照改为定时刷新（修读数污染）
+
+`IBT*` 那组计数从 1.9.6 起只在 `start()` / `setPowerState()` / `stop()` 三处发布。
+`start()` 跑在 kext 加载早期，那时 bluetoothd 一页都没读过，所以第一次发布必然是
+全 0；之后没有任何东西再刷新它，除非用户恰好睡眠唤醒一次。
+
+这解释了为什么 `-ibtota` 明明能让蓝牙失效（证明补丁生效），`PatchedPages` 却两次都是 0。
+1.9.12 在 workloop 上挂 30 秒 `IOTimerEventSource`，回调只做 `ibtDiagPublishLive()`，
+不碰 IO 路径；取不到 workloop 时降级为原行为。
+
 ## 1.9.10：定位到唤醒崩溃的真实原因——`/dev/cu.BLTH` 等不到
 
 此前 1.9.1~1.9.9 全部在查 APFS 解压与页面签名校验，方向是错的。统一日志把真相写得很清楚：

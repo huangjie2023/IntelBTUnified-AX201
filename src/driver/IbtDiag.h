@@ -65,6 +65,17 @@ struct IbtDiagSnapshot {
     unsigned int csPathFail; // vn_getpath 返回非 0
     unsigned int csSbin;     // 路径解析成功但不在 /usr/sbin/ 下（未计入 /usr/sbin 内的）
     unsigned int csMatch;    // 命中 bluetoothd 或 BlueTool 的次数（≥ btVnodes，后者去重）
+
+    // 1.9.13：_decmpfs_validate_compressed_file 对 bluetoothd/BlueTool 的返回值分布。
+    //
+    // 1.9.12 定时刷新后的实测读数：BtVnodes=2 / PatchedPages=4 / ValOnBt=64 /
+    // VnopAll=0。补丁确实在打，而整条占位最久的 _VNOP_VERIFY 全系统 0 次调用
+    // （死符号），真正处理压缩页校验的是 _decmpfs_validate_compressed_file。
+    // 这三个数用来确认它就是崩溃出口：如果 decBad 随崩溃增长，吞错就落在这里；
+    // 如果 decBad 恒 0，说明错误发生在更下层（APFS 内部），还得继续往下挖。
+    unsigned int decOk;      // 返回 0（校验通过）
+    unsigned int decBad;     // 返回 EBADMSG（压缩块哈希不匹配）
+    unsigned int decOther;   // 返回其它非 0
 };
 
 // ---------------------------------------------------------------------------

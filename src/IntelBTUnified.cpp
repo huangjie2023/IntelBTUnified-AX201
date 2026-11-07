@@ -691,6 +691,13 @@ static uint32_t decmpfsAll = 0;
 static uint32_t decmpfsOnBt = 0;
 static uint32_t validateAll = 0;
 static uint32_t validateOnBt = 0;
+// 1.9.13：_decmpfs_validate_compressed_file 的返回值分布（仅 bt vnode）。
+// 1.9.12 定时刷新后的实测：ValOnBt=64 而 VnopAll=0 —— 说明 bt 的压缩页校验
+// 走的是这个函数，不是 _VNOP_VERIFY（后者是全系统 0 次调用的死符号）。
+static uint32_t decOkCount = 0;
+static uint32_t decBadCount = 0;
+static uint32_t decOtherCount = 0;
+static bool decmpfsBypassArmed = false;
 
 // 1.9.8: 1.9.7 读数（全 0 + SymMask=13）说明前面四个候选没有一个是入口，于是回头去内核
 // 缓存里枚举真实符号名，挖到 APFS 自己那一层：
@@ -1026,11 +1033,32 @@ static int patched_decmpfs_pagein(vnode_t vp, off_t offset, uint8_t *buf, size_t
 
 // 第三个候选独立一份 orig/计数：绝不能和上面共用 orig 指针——第二次路由会把它覆盖成
 // 自己的原函数地址，先装的钩子就会转发到错误的函数里。
+//
+// 1.9.13：这里从“只计数”升级为“计数 + 吞错”。依据是 1.9.12 定时刷新后的实测：
+//   BtVnodes=2 / PatchedPages=4 / ValOnBt=64 / VnopAll=0
+// 补丁确实在打（4 页），而占位最久的 _VNOP_VERIFY 全系统 0 次调用——死符号，
+// 1.9.1~1.9.5 围绕它写的吞错逻辑从未执行过。真正被 bluetoothd/BlueTool 的压缩页
+// 校验调用 64 次的是这个函数，所以 EBADMSG 只能在这里接。
 static int patched_decmpfs_validate(vnode_t vp, off_t offset, uint8_t *buf, size_t bufsize, size_t *a, void **b, uint32_t c, void *d, void *e) {
+    int err = FunctionCast(patched_decmpfs_validate, orig_decmpfs_validate)(vp, offset, buf, bufsize, a, b, c, d, e);
     __atomic_fetch_add(&validateAll, 1, __ATOMIC_RELAXED);
-    if (vp != nullptr && isBtVnode(vp))
-        __atomic_fetch_add(&validateOnBt, 1, __ATOMIC_RELAXED);
-    return FunctionCast(patched_decmpfs_validate, orig_decmpfs_validate)(vp, offset, buf, bufsize, a, b, c, d, e);
+    bool onBt = (vp != nullptr && isBtVnode(vp));
+    if (!onBt)
+        return err;
+    __atomic_fetch_add(&validateOnBt, 1, __ATOMIC_RELAXED);
+    if (err == 0) {
+        __atomic_fetch_add(&decOkCount, 1, __ATOMIC_RELAXED);
+        return err;
+    }
+    // 返回值分布：这三个数决定“吞错是不是落在对的地方”。若 decBad 恒 0 而崩溃照旧，
+    // 说明错误发生在更下层（APFS 内部），这条钩子再改也没用。
+    if (err == EBADMSG || err == -EBADMSG)
+        __atomic_fetch_add(&decBadCount, 1, __ATOMIC_RELAXED);
+    else
+        __atomic_fetch_add(&decOtherCount, 1, __ATOMIC_RELAXED);
+    if (disableVerifyBypass || !decmpfsBypassArmed)
+        return err;
+    return handleBtVerifyError(vp, offset, bufsize, err, onBt);
 }
 
 // ---------------------------------------------------------------------------
@@ -1152,8 +1180,12 @@ static void processPatcher(KernelPatcher &patcher) {    const bool argOta    = c
         __atomic_fetch_or(&symMask, 4u, __ATOMIC_RELAXED);
 
     KernelPatcher::RouteRequest decmpfsValidateRoute("_decmpfs_validate_compressed_file", patched_decmpfs_validate, orig_decmpfs_validate);
-    if (patcher.routeMultipleLong(KernelPatcher::KernelID, &decmpfsValidateRoute, 1))
+    if (patcher.routeMultipleLong(KernelPatcher::KernelID, &decmpfsValidateRoute, 1)) {
         __atomic_fetch_or(&symMask, 8u, __ATOMIC_RELAXED);
+        // 1.9.13：这条路是实测唯一被 bt vnode 命中的校验入口（ValOnBt=64），
+        // 吞错只在路由成功时才允许发生。
+        decmpfsBypassArmed = true;
+    }
 
     // 1.9.9: 改用 APFS 自己的 kinfo id 解析符号。1.9.8 用 KernelID 试这四条全部失败
     // （SymMask 没有 bit4~7），而符号确实存在于内核缓存里——差别只在"哪个符号表"。
@@ -1233,6 +1265,9 @@ void ibtDiagFill(IbtDiagSnapshot *out) {
     out->decOnBt      = __atomic_load_n(&decmpfsOnBt, __ATOMIC_RELAXED);
     out->valAll       = __atomic_load_n(&validateAll, __ATOMIC_RELAXED);
     out->valOnBt      = __atomic_load_n(&validateOnBt, __ATOMIC_RELAXED);
+    out->decOk        = __atomic_load_n(&decOkCount, __ATOMIC_RELAXED);
+    out->decBad       = __atomic_load_n(&decBadCount, __ATOMIC_RELAXED);
+    out->decOther     = __atomic_load_n(&decOtherCount, __ATOMIC_RELAXED);
     out->apfsVerAll   = __atomic_load_n(&apfsVerAll, __ATOMIC_RELAXED);
     out->apfsVerOnBt  = __atomic_load_n(&apfsVerOnBt, __ATOMIC_RELAXED);
     out->apfsPiAll    = __atomic_load_n(&apfsPiAll, __ATOMIC_RELAXED);
