@@ -56,6 +56,10 @@ void ibtTimingAdd(unsigned int slot, unsigned int delta)
         gIbtTiming[slot] += delta;
 }
 
+// 1.9.12：诊断快照刷新周期。bluetoothd 的补丁页在 start() 之后才出现，
+// 30 秒足够覆盖一次冷启动后的进程加载，又不会给 workloop 造成可见负担。
+static constexpr unsigned int kDiagRefreshMs = 30000;
+
 void ibtDiagPublishLive()
 {
     IOService *svc = gDiagSvc;
@@ -143,6 +147,12 @@ bool IntelBluetoothFirmware::init(OSDictionary *dictionary)
 
 void IntelBluetoothFirmware::free() {
     XYLog("Driver free()\n");
+    // stop() 正常路径已经摘掉；这里只是兜底，防止 start() 失败时残留的定时器
+    // 在实例释放后仍被 workloop 回访。
+    if (m_pDiagTimer) {
+        m_pDiagTimer->cancelTimeout();
+        OSSafeReleaseNULL(m_pDiagTimer);
+    }
     super::free();
 }
 
@@ -212,8 +222,34 @@ bool IntelBluetoothFirmware::start(IOService *provider)
     // onPatcherLoad 回调，早于本函数的 start()，所以此刻 armed 标志已是最终值。
     gDiagSvc = this;
     ibtDiagPublishLive();
+    // 1.9.12：一次性快照不够用。bluetoothd 的页补丁发生在 start() 之后几十秒，
+    // 只靠 start/pm/stop 发布时，ioreg 里那组计数永远是“进程还没起来”的 0——
+    // 1.9.6~1.9.11 的读数全被这一点污染过。这里挂一个 30 秒的轮询，
+    // 只做 setProperty，不触碰任何 IO 路径。
+    if (getWorkLoop()) {
+        m_pDiagTimer = IOTimerEventSource::timerEventSource(this,
+            OSMemberFunctionCast(IOTimerEventSource::Action, this, &IntelBluetoothFirmware::diagTimerFired));
+        if (m_pDiagTimer) {
+            if (getWorkLoop()->addEventSource(m_pDiagTimer) == kIOReturnSuccess) {
+                m_pDiagTimer->setTimeoutMS(kDiagRefreshMs);
+            } else {
+                OSSafeReleaseNULL(m_pDiagTimer);
+            }
+        }
+    }
+    if (!m_pDiagTimer)
+        XYLog("diag timer unavailable, snapshot stays at start-time values\n");
     cleanUp();
     return true;
+}
+
+// 1.9.12：定时把内核侧的计数刷进 ioreg。跑在 workloop 线程，不涉及 page fault，
+// 也不改任何状态，只是把已有的原子变量读出来写进属性表。
+void IntelBluetoothFirmware::diagTimerFired()
+{
+    ibtDiagPublishLive();
+    if (m_pDiagTimer)
+        m_pDiagTimer->setTimeoutMS(kDiagRefreshMs);
 }
 
 void IntelBluetoothFirmware::publishReg(bool isSucceed, const char *fwName)
@@ -253,6 +289,13 @@ void IntelBluetoothFirmware::stop(IOService *provider)
 {
     XYLog("Driver Stop()\n");
     ibtDiagPublishLive();
+    // 先停定时器再摘 gDiagSvc，避免回调在 service 释放之后仍去 setProperty。
+    if (m_pDiagTimer) {
+        m_pDiagTimer->cancelTimeout();
+        if (getWorkLoop())
+            getWorkLoop()->removeEventSource(m_pDiagTimer);
+        OSSafeReleaseNULL(m_pDiagTimer);
+    }
     gDiagSvc = nullptr;
     if (m_pmStarted) {
         PMstop();

@@ -17,6 +17,7 @@
 #include <IOKit/IOLib.h>
 #include <IOKit/IOService.h>
 #include <IOKit/IOLocks.h>
+#include <IOKit/IOTimerEventSource.h>
 #include <IOKit/usb/USB.h>
 #include <libkern/OSKextLib.h>
 #include <IOKit/usb/IOUSBHostDevice.h>
@@ -58,6 +59,11 @@ private:
     BtIntel *m_pBTIntel {nullptr};
     IOUSBHostDevice* m_pDevice {nullptr};
     bool m_pmStarted {false};
+    // 1.9.12：诊断快照的定时刷新。此前只在 start()/setPowerState()/stop() 发布，
+    // 而 start() 发生在 bluetoothd 启动之前，于是 ioreg 读到的永远是“进程还没起来”
+    // 的那一份全 0 快照——连续几轮实验都被这一点误导。
+    IOTimerEventSource *m_pDiagTimer {nullptr};
+    void diagTimerFired();
 };
 
 #endif
