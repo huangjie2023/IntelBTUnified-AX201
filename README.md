@@ -16,6 +16,58 @@
 
 > 上游 FAQ 明确：**macOS Monterey 及以后不要使用 `IntelBluetoothInjector.kext`**（"Do NOT use this Kext on macOS Monterey and newer"）。Monterey+ 靠的是驱动把 USB 设备改名为 `Bluetooth USB Host Controller` 来绕过 bluetoothd/BlueTool 的 board-id 检查，所以单 kext 里**不该**有那条 Broadcom transport 注入 personality。本包结构对应全量包的 `IntelBluetoothFirmware` + `IntelBTPatcher` + `BlueToolFixup`，不含 Injector。
 
+## 1.9.15：board-id 补丁在 macOS 14+ 从未执行过（故障 B 的根因）
+
+1.9.14 上线后第一次读到：
+
+```
+IBTBoardId     Mac-5F9802EFE386AA28
+IBTBidArmed    No
+IBTPatchMask   45        = 0b101101
+```
+
+45 展开是 bit0(skip-update) + bit2(vendor) + bit3(chipset) + bit5(chipset15)。**bit1 和 bit7 都不在**，也就是 BlueTool 与 bluetoothd 的 board-id 替换一次都没发生。回到代码，原因一目了然：
+
+```cpp
+if (getKernelVersion() >= KernelVersion::Sonoma) {
+    shouldPatchBoardId = checkKernelArgument("-btlfxboardid");  // 只看 boot-arg
+} else {
+    ...自动判定（长度 + 列表排除）...
+}
+```
+
+**macOS 14 起自动判定整段被跳过，只认 `-btlfxboardid`。** macOS 26.7.3 走的是第一个分支，而默认配置里没有这个 boot-arg，于是 `shouldPatchBoardId` 恒为 false。上游 BlueToolFixup 是 Lilu 插件、要求用户显式加参数；本包既然自称替代它，就不该继承这个前提。
+
+这条链正好闭合故障 B：
+
+```
+board-id 补丁不执行
+  → bluetoothd 拿 Mac-5F9802EFE386AA28 查表，命中 UART 列表
+  → 打开 /dev/cu.BLTH，等 15 秒
+  → 该节点实测 20~27 秒才由 IOBluetoothHostControllerUSBTransport 建出来
+  → 超时 → os_crash()（EXC_GUARD namespc 18 reason 2，isSimulated 1）
+  → launchd 拉起第二个 bluetoothd，此时串口已在，一次成功
+```
+
+改动：
+
+- 默认启用 board-id 补丁，关闭用 `-ibtnobid`。保留 `-btlfxboardid` 兼容（它现在只是冗余的"再确认一次"）
+- 启用前校验 `strlen(boardIdentifier) + 1 == kBoardIdSize`（= 21）。原代码在 Sonoma+ 分支不做长度检查，而 `replaceSize` 传的是 `kBoardIdSize`，board-id 更短的机型会越界读 patch 缓冲
+- 新增 `IBTBidMiss`：补丁执行了但页里找不到 needle 的次数
+- 删除 `kBoardIdSizeLegacy`（只服务 2013~2015 的 12 字符 board-id，AX201 平台用不到）
+
+判读（开机 35 秒后）：
+
+```bash
+ioreg -r -c IntelBluetoothFirmware -l -w0 | grep -E 'IBT(BidArmed|BidMiss|PatchMask|BoardId)'
+```
+
+| 读数 | 结论 |
+|---|---|
+| `BidArmed = Yes`、`PatchMask` 有 bit1 或 bit7 | needle 命中了。接着看唤醒是否还崩——不崩即闭环 |
+| `BidArmed = Yes`、`BidMiss > 0`、`PatchMask` 仍无 bit1/bit7 | needle `Mac-F60DEB81FF30ACF6` 在 26.7.3 里已不存在，需要重新定位 |
+| `BidArmed = No`、`IBTBoardId` 长度不是 20 | 长度校验挡住了，属于 ABM/OC 平台信息没注入对 |
+
 ## 1.9.14：board-id 补丁到底有没有命中，第一次有读数
 
 1.9.10 把故障 B 的链路定死在 `bluetoothd` 等 `/dev/cu.BLTH` 满 15 秒后 `os_crash()`。但为什么它非要去等一个串口，一直没解释清楚——Intel 蓝牙是 USB 的，本来不该走 UART。
@@ -38,12 +90,12 @@ hostControllerTransportForBoardID(board_id) →
 | 属性 | 含义 |
 |---|---|
 | `IBTPatchMask` | `appliedPatches` 原样。bit0 skip-update / **bit1 BlueTool board-id** / bit2 vendor / bit3 chipset / bit4 chipset13 / bit5 chipset15 / bit6 nvram / **bit7 bluetoothd board-id** / bit8 address |
-| `IBTBidArmed` | 本机 board-id 是否通过了前置判定（长度 18 或 12 字节、且不在 USB 列表里） |
+| `IBTBidArmed` | 本机 board-id 是否通过了前置判定（实测 macOS 26 上该值恒为 No，原因见 1.9.15） |
 | `IBTBoardId` | 实际读到的 boardIdentifier，用来核对长度判定为什么成立或不成立 |
 
 判读：
 
-- `IBTBidArmed = No` → 前置条件没过，补丁根本没尝试。先用 `-btlfxboardid` 强制开启（代码 1125 行支持），不用改代码就能验证
+- `IBTBidArmed = No` → 前置条件没过，补丁根本没尝试（macOS 14+ 只认 `-btlfxboardid`，1.9.15 已改为默认启用）
 - `IBTBidArmed = Yes` 但 `IBTPatchMask` 没有 bit1 / bit7 → 补丁尝试了，但 `Mac-F60DEB81FF30ACF6` 这个字符串在 26.7.3 的 BlueTool / bluetoothd 里已经不存在，needle 过期，需要重新定位
 - 两个 bit 都在，却仍然 `UART Transport` → 替换位置不对（字符串还在表里，但不是查表用的那一份）
 

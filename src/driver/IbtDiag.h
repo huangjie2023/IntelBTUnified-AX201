@@ -98,6 +98,7 @@ struct IbtDiagSnapshot {
                              // bit2 vendor, bit3 chipset, bit4 chipset13, bit5 chipset15,
                              // bit6 nvram, bit7 bluetoothd board-id, bit8 address
     unsigned int bidArmed;   // 1 = shouldPatchBoardId，board-id 补丁本次是否启用
+    unsigned int bidMiss;    // board-id 补丁执行了但没找到 needle 的次数（>0 且 patchMask 无 bit1/7 = needle 过期）
     char boardId[24];        // 实际 boardIdentifier（null 结尾），用来核对长度判定是否成立
 };
 

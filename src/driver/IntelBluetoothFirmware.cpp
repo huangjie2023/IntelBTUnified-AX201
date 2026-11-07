@@ -110,6 +110,7 @@ void ibtDiagPublishLive()
     // 1.9.14：补丁位图 + board-id 前置条件。判读见 IbtDiag.h。
     svc->setProperty("IBTPatchMask", (unsigned long long)s.patchMask, 32);
     svc->setProperty("IBTBidArmed", (bool)(s.bidArmed != 0));
+    svc->setProperty("IBTBidMiss", (unsigned long long)s.bidMiss, 32);
     svc->setProperty("IBTBoardId", (const char *)s.boardId);
     // 1.9.11：cs_validate_page 入口漏斗。判读见 IbtDiag.h。
     svc->setProperty("IBTCsAll", (unsigned long long)s.csAll, 32);

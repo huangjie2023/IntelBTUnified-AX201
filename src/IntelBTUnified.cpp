@@ -594,7 +594,8 @@ static bool disableCsPatching = false;
 static bool legacyCsPatching = false;
 
 static constexpr size_t kBoardIdSize = sizeof("Mac-F60DEB81FF30ACF6");
-static constexpr size_t kBoardIdSizeLegacy = sizeof("Mac-F22586C8");
+// 1.9.15: 删掉 kBoardIdSizeLegacy。它只服务 2013~2015 年那种 12 字符 board-id，
+// 而本驱动只支持 AX201（2019 年后平台），判定分支里已不再引用。
 
 static const char boardIdsWithUSBBluetooth[][kBoardIdSize] = {
     "Mac-F60DEB81FF30ACF6", "Mac-9F18E312C5C2BF0B", "Mac-937CB26E2E02BB01", "Mac-E43C1C25D4880AD6",
@@ -619,6 +620,9 @@ enum PatchId : uint32_t {
     PatchAddress     = 1u << 8,
 };
 static uint32_t appliedPatches = 0;
+// 1.9.15: board-id 补丁执行了、但页里找不到 needle 的次数。macOS 26.7.3 上
+// 这个数和 patchMask 的 bit1/bit7 合起来才能区分"没启用"和"启用了但字符串没了"。
+static uint32_t bidMissCount = 0;
 
 // 1.7.0: se registra el offset de fichero de cada parche aplicado. Sirve para
 // saber si la pagina que falla al reanudar (APFS compressed data hash mismatch)
@@ -850,8 +854,12 @@ static void patched_cs_validate_page(vnode_t vp, memory_object_t pager, memory_o
                 return;
             bool any = false;
             any |= searchAndPatch(PatchSkipUpdate, "skip firmware auto-update", data, PAGE_SIZE, path, kSkipUpdateFilePathOriginal, kSkipUpdateFilePathPatched);
-            if (shouldPatchBoardId)
-                any |= searchAndPatch(PatchBlueToolBid, "board-id", data, PAGE_SIZE, path, boardIdsWithUSBBluetooth[0], kBoardIdSize, BaseDeviceInfo::get().boardIdentifier, kBoardIdSize);
+            if (shouldPatchBoardId) {
+                bool bid = searchAndPatch(PatchBlueToolBid, "board-id", data, PAGE_SIZE, path, boardIdsWithUSBBluetooth[0], kBoardIdSize, BaseDeviceInfo::get().boardIdentifier, kBoardIdSize);
+                if (!bid)
+                    __atomic_fetch_add(&bidMissCount, 1, __ATOMIC_RELAXED);
+                any |= bid;
+            }
             // 页已被改写时 notePatch 已把页偏移记进 patchedPages[]（吞错判定用）；
             // any 保留只为表达“本页至少命中一处”，不参与门控。
             (void)any;
@@ -870,8 +878,12 @@ static void patched_cs_validate_page(vnode_t vp, memory_object_t pager, memory_o
                 any |= searchAndPatch(PatchChipset15, "chipset range check (15.4)", data, PAGE_SIZE, path, kBadChipsetCheckOriginal15_4, kBadChipsetCheckPatched15_4);
             if (shouldPatchNvramCheck)
                 any |= searchAndPatchWithMask(PatchNvram, "internal controller NVRAM check", data, PAGE_SIZE, path, kSkipInternalControllerNVRAMCheck13_3, sizeof(kSkipInternalControllerNVRAMCheck13_3), kSkipInternalControllerNVRAMCheckMask13_3, sizeof(kSkipInternalControllerNVRAMCheckMask13_3), kSkipInternalControllerNVRAMCheckPatched13_3, sizeof(kSkipInternalControllerNVRAMCheckPatched13_3));
-            if (shouldPatchBoardId)
-                any |= searchAndPatch(PatchBtdBid, "board-id", data, PAGE_SIZE, path, boardIdsWithUSBBluetooth[0], kBoardIdSize, BaseDeviceInfo::get().boardIdentifier, kBoardIdSize);
+            if (shouldPatchBoardId) {
+                bool bid = searchAndPatch(PatchBtdBid, "board-id", data, PAGE_SIZE, path, boardIdsWithUSBBluetooth[0], kBoardIdSize, BaseDeviceInfo::get().boardIdentifier, kBoardIdSize);
+                if (!bid)
+                    __atomic_fetch_add(&bidMissCount, 1, __ATOMIC_RELAXED);
+                any |= bid;
+            }
             if (shouldPatchAddress)
                 any |= searchAndPatchWithMask(PatchAddress, "same-address check", data, PAGE_SIZE, path, kSkipAddressCheckOriginal, sizeof(kSkipAddressCheckOriginal), kSkipAddressCheckMask, sizeof(kSkipAddressCheckMask), kSkipAddressCheckPatched, sizeof(kSkipAddressCheckPatched));
             // 页已被改写时 notePatch 已把页偏移记进 patchedPages[]（吞错判定用）；
@@ -1115,24 +1127,24 @@ static int patched_apfs_verify_rl(vnode_t vp, off_t offset, void *a3, void *a4, 
     return FunctionCast(patched_apfs_verify_rl, orig_apfs_verify_rl)(vp, offset, a3, a4, a5, a6, a7, a8, a9);
 }
 
-static void processPatcher(KernelPatcher &patcher) {    const bool argOta    = checkKernelArgument("-ibtota");
-    legacyCsPatching     = checkKernelArgument("-ibtplegacy");
+static void processPatcher(KernelPatcher &patcher) {    const bool argOta    = checkKernelArgument("-ibtota");    legacyCsPatching     = checkKernelArgument("-ibtplegacy");
     // Por defecto SI se parchea (sin los parches el controlador no se enciende);
     // -ibtota desactiva todo, -ibtplegacy usa el modo antiguo incondicional.
     disableCsPatching    = argOta;
     SYSLOG(MODULE_BTLFX, "cs_validate patching: %s", disableCsPatching ? "OFF (-ibtota)" : (legacyCsPatching ? "legacy (unconditional)" : "process-scoped"));
-    if (getKernelVersion() >= KernelVersion::Sonoma) {
-        shouldPatchBoardId = checkKernelArgument("-btlfxboardid");
-    } else {
+    // 1.9.15: 这里原本是 `if (getKernelVersion() >= Sonoma) { 只认 -btlfxboardid }`，
+    // 也就是 macOS 14 起自动判定整段被跳过。后果在本机实测到了：
+    //   IBTBidArmed=No / IBTPatchMask=45（有 vendor、chipset，没有 bit1/bit7）
+    //   而故障 B 的根因恰是 board-id 命中 UART 列表 → 等 /dev/cu.BLTH 超时自尽。
+    // 本包自称替代 BlueToolFixup，就不该再要求用户额外加 BlueToolFixup 的
+    // boot-arg，改为默认启用；需要关闭时用 -ibtnobid。
+    shouldPatchBoardId = !checkKernelArgument("-ibtnobid");
+    // 长度必须严格等于 needle 长度：replaceSize 传的是 kBoardIdSize，
+    // 若本机 board-id 更短，findAndReplace 会按 21 字节读 patch 缓冲，越界。
+    if (shouldPatchBoardId) {
         auto boardId = BaseDeviceInfo::get().boardIdentifier;
-        auto boardIdSize = strlen(boardId) + 1;
-        shouldPatchBoardId = boardIdSize == kBoardIdSize || boardIdSize == kBoardIdSizeLegacy;
-        if (shouldPatchBoardId)
-            for (size_t i = 0; i < arrsize(boardIdsWithUSBBluetooth); i++)
-                if (strcmp(boardIdsWithUSBBluetooth[i], boardId) == 0) {
-                    shouldPatchBoardId = false;
-                    break;
-                }
+        if (boardId == nullptr || strlen(boardId) + 1 != kBoardIdSize)
+            shouldPatchBoardId = false;
     }
     // 12.4 Beta 3+, XNU 21.5
     if ((getKernelVersion() == KernelVersion::Monterey && getKernelMinorVersion() >= 5) || getKernelVersion() > KernelVersion::Monterey)
@@ -1289,6 +1301,7 @@ void ibtDiagFill(IbtDiagSnapshot *out) {
     // 1.9.14：board-id 补丁到底有没有尝试、有没有命中。
     out->patchMask    = __atomic_load_n(&appliedPatches, __ATOMIC_RELAXED);
     out->bidArmed     = shouldPatchBoardId ? 1u : 0u;
+    out->bidMiss      = __atomic_load_n(&bidMissCount, __ATOMIC_RELAXED);
     {
         const char *bid = BaseDeviceInfo::get().boardIdentifier;
         size_t n = 0;
