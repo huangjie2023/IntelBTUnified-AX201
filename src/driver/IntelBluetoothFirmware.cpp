@@ -112,6 +112,7 @@ void ibtDiagPublishLive()
     svc->setProperty("IBTBidArmed", (bool)(s.bidArmed != 0));
     svc->setProperty("IBTBidMiss", (unsigned long long)s.bidMiss, 32);
     svc->setProperty("IBTBoardId", (const char *)s.boardId);
+    svc->setProperty("IBTWireSolve", (unsigned long long)s.wireSolve, 32);
     // 1.9.11：cs_validate_page 入口漏斗。判读见 IbtDiag.h。
     svc->setProperty("IBTCsAll", (unsigned long long)s.csAll, 32);
     svc->setProperty("IBTCsPathFail", (unsigned long long)s.csPathFail, 32);

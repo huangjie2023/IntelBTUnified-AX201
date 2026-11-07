@@ -732,6 +732,9 @@ static bool apfsVerifyArmed = false;
 // （这样才能区分“kext 没找到”“符号没找到”“符号找到但路由失败”三种失败）。
 static uint32_t apfsSolveMask = 0;
 
+// 1.9.16: wire 路线可行性探测（见 IbtDiag.h 的 wireSolve 注释）。
+static uint32_t wireSolveMask = 0;
+
 // 1.9.11：cs_validate_page 入口漏斗（语义见 IbtDiag.h）。四个数严格递进：
 //   csAllCalls ≥ csPathFailures + csSbinMisses + csBtMatches
 // 任何一级归零都能直接把嫌疑锁死，不必再靠推断。
@@ -1220,6 +1223,17 @@ static void processPatcher(KernelPatcher &patcher) {    const bool argOta    = c
         if (patcher.solveSymbol(apfsSymId, apfsSyms[i]))
             __atomic_fetch_or(&apfsSolveMask, 1u << i, __ATOMIC_RELAXED);
 
+    // 1.9.16: 探测 wire 路线需要的符号是否真的在内核符号表里。只解析不路由，
+    // 不改任何行为——A 类崩溃的修复方案（wire 住被补丁的 16KB 组）依赖
+    // _ubc_range_wire，它不在公开 SDK 头文件里，存不存在只能实跑确认。
+    // _ubc_msync 是公开 KPI，作对照组：它若解析不到，说明探测方式本身有问题。
+    static const char *wireSyms[5] {
+        "_ubc_range_wire", "_ubc_range_unwire", "_vm_page_wire", "_vm_page_unwire", "_ubc_msync",
+    };
+    for (size_t i = 0; i < arrsize(wireSyms); i++)
+        if (patcher.solveSymbol(KernelPatcher::KernelID, wireSyms[i]))
+            __atomic_fetch_or(&wireSolveMask, 1u << i, __ATOMIC_RELAXED);
+
     // 路由统一走一个小包装：先按 APFS kinfo 的 id 试，失败再退回 KernelID（1.9.8 的路径）。
     // 两条都失败才算真失败，这样 bit4~7 的含义保持"这条钩子到底装上没有"。
     auto routeApfs = [&](KernelPatcher::RouteRequest &req) -> bool {
@@ -1302,6 +1316,7 @@ void ibtDiagFill(IbtDiagSnapshot *out) {
     out->patchMask    = __atomic_load_n(&appliedPatches, __ATOMIC_RELAXED);
     out->bidArmed     = shouldPatchBoardId ? 1u : 0u;
     out->bidMiss      = __atomic_load_n(&bidMissCount, __ATOMIC_RELAXED);
+    out->wireSolve    = __atomic_load_n(&wireSolveMask, __ATOMIC_RELAXED);
     {
         const char *bid = BaseDeviceInfo::get().boardIdentifier;
         size_t n = 0;

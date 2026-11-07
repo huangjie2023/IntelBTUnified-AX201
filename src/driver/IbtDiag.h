@@ -100,6 +100,22 @@ struct IbtDiagSnapshot {
     unsigned int bidArmed;   // 1 = shouldPatchBoardId，board-id 补丁本次是否启用
     unsigned int bidMiss;    // board-id 补丁执行了但没找到 needle 的次数（>0 且 patchMask 无 bit1/7 = needle 过期）
     char boardId[24];        // 实际 boardIdentifier（null 结尾），用来核对长度判定是否成立
+
+    // 1.9.16：wire 路线可行性探测。
+    //
+    // A 类崩溃（APFS compressed data hash mismatch → SIGBUS）的机制已实测闭环：
+    // 补丁页驻留 + 同 16KB 组相邻页被逐出后重读 → 组校验把「内存里改过的页」和
+    // 「盘上原始页」混在一起算哈希 → 必然不匹配。唯一正解是把被补丁的 16KB 组
+    // 整组 wire 住（acidanthera/bugtracker#2228 复现者给出的实验方向）。
+    // ubc_range_wire 不在公开 SDK 头文件里，但它在不在内核符号表里只能实测：
+    // _VNOP_VERIFY 同样不是公开 KPI，1.9.7 照样从 KernelID 解析到了。
+    // 这 5 位就是逐个试出来的结果：
+    //   bit0 _ubc_range_wire      有 → wire 路线可写
+    //   bit1 _ubc_range_unwire    有 → 才能配对释放
+    //   bit2 _vm_page_wire        备选：逐页 wire
+    //   bit3 _vm_page_unwire
+    //   bit4 _ubc_msync           对照组，公开 KPI，理应恒为 1；若它是 0 说明探测本身有问题
+    unsigned int wireSolve;
 };
 
 // ---------------------------------------------------------------------------
