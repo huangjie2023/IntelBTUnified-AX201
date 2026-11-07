@@ -52,6 +52,19 @@ struct IbtDiagSnapshot {
     unsigned long long lastOffset;  // 最后一次被吞的校验起点
     unsigned long long lastSize;    // 最后一次被吞的校验长度
     unsigned long long lastPage;    // 该区间内命中的补丁页（0 = 没记录）
+
+    // 1.9.11：cs_validate_page 入口分级计数。
+    //
+    // 1.9.10 的读数是 Armed=Yes / BtVnodes=0 / PatchedPages=0，但这一组数字
+    // 分不清三种截然不同的情况，进一步的分析全部无从下手：
+    //   a) 钩子根本没被调用（csAll=0）      → 这条路在 macOS 26 上就是死的
+    //   b) 被调用了但 vn_getpath 拿不到路径 → pagein 上下文不能解析路径
+    //   c) 路径拿到了但不是 /usr/sbin 下的 → 校验入口换了（例如走 SSV/cryptex）
+    // 下面四个数是严格递进的漏斗，一次开机就能定位断点在哪一级。
+    unsigned int csAll;      // 进入钩子的总次数（任何判断之前）
+    unsigned int csPathFail; // vn_getpath 返回非 0
+    unsigned int csSbin;     // 路径解析成功但不在 /usr/sbin/ 下（未计入 /usr/sbin 内的）
+    unsigned int csMatch;    // 命中 bluetoothd 或 BlueTool 的次数（≥ btVnodes，后者去重）
 };
 
 // ---------------------------------------------------------------------------

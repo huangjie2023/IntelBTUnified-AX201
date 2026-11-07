@@ -721,6 +721,14 @@ static bool apfsVerifyArmed = false;
 // （这样才能区分“kext 没找到”“符号没找到”“符号找到但路由失败”三种失败）。
 static uint32_t apfsSolveMask = 0;
 
+// 1.9.11：cs_validate_page 入口漏斗（语义见 IbtDiag.h）。四个数严格递进：
+//   csAllCalls ≥ csPathFailures + csSbinMisses + csBtMatches
+// 任何一级归零都能直接把嫌疑锁死，不必再靠推断。
+static uint32_t csAllCalls = 0;
+static uint32_t csPathFailures = 0;
+static uint32_t csSbinMisses = 0;
+static uint32_t csBtMatches = 0;
+
 static inline bool isBtVnode(vnode_t vp) {
     uint32_t n = __atomic_load_n(&btVnodeCount, __ATOMIC_ACQUIRE);
     for (uint32_t i = 0; i < n && i < kMaxBtVnodes; i++)
@@ -810,14 +818,26 @@ static bool currentProcIs(const char *name) {
 }
 
 static void patched_cs_validate_page(vnode_t vp, memory_object_t pager, memory_object_offset_t page_offset, const void *data, int *validated_p, int *tainted_p, int *nx_p) {
+    __atomic_fetch_add(&csAllCalls, 1, __ATOMIC_RELAXED);
     char path[PATH_MAX];
     int pathlen = PATH_MAX;
     FunctionCast(patched_cs_validate_page, orig_cs_validate)(vp, pager, page_offset, data, validated_p, tainted_p, nx_p);
     if (disableCsPatching)
         return;
     currentPageOffset = page_offset;
-    if (vn_getpath(vp, path, &pathlen) == 0 && UNLIKELY(strncmp(path, "/usr/sbin/", kSbinDirLength) == 0)) {
+    // 1.9.11：原来是一行复合条件（vn_getpath 成功 && 在 /usr/sbin 下），拆成三级、
+    // 每级单独计数。命中行为与 1.9.10 完全一致，区别只是失败时能看出卡在哪一级。
+    if (vn_getpath(vp, path, &pathlen) != 0) {
+        __atomic_fetch_add(&csPathFailures, 1, __ATOMIC_RELAXED);
+        return;
+    }
+    if (UNLIKELY(strncmp(path, "/usr/sbin/", kSbinDirLength) != 0)) {
+        __atomic_fetch_add(&csSbinMisses, 1, __ATOMIC_RELAXED);
+        return;
+    }
+    {
         if (strcmp(path + kSbinDirLength, "BlueTool") == 0) {
+            __atomic_fetch_add(&csBtMatches, 1, __ATOMIC_RELAXED);
             rememberBtVnode(vp);
             if (!legacyCsPatching && !currentProcIs("BlueTool"))
                 return;
@@ -830,6 +850,7 @@ static void patched_cs_validate_page(vnode_t vp, memory_object_t pager, memory_o
             (void)any;
         }
         else if (strcmp(path + kSbinDirLength, "bluetoothd") == 0) {
+            __atomic_fetch_add(&csBtMatches, 1, __ATOMIC_RELAXED);
             rememberBtVnode(vp);
             if (!legacyCsPatching && !currentProcIs("bluetoothd"))
                 return;
@@ -1091,7 +1112,9 @@ static void processPatcher(KernelPatcher &patcher) {    const bool argOta    = c
     if (getKernelVersion() <= KernelVersion::Sonoma)
         shouldPatchNvramCheck = checkKernelArgument("-btlfxnvramcheck");
     if (disableCsPatching) {
-        SYSLOG(MODULE_BTLFX, "bluetoothd/BlueTool pages left untouched (add -ibtpatch to enable)");
+        // 旧文案写的是 "add -ibtpatch to enable"，而 -ibtpatch 这个 boot-arg 从未存在过
+        // （全仓无解析点）。照日志加参数的人只会浪费时间，这里写清唯一出口。
+        SYSLOG(MODULE_BTLFX, "bluetoothd/BlueTool pages left untouched (-ibtota in effect; remove it and reboot)");
         return;
     }
     // 1.9.1: -ibtnovb 关闭 VNOP_VERIFY 吞错（诊断开关；默认开启）。
@@ -1224,6 +1247,10 @@ void ibtDiagFill(IbtDiagSnapshot *out) {
     out->lastOffset   = __atomic_load_n(&lastVerifyOffset, __ATOMIC_RELAXED);
     out->lastSize     = __atomic_load_n(&lastVerifySize, __ATOMIC_RELAXED);
     out->lastPage     = __atomic_load_n(&lastVerifyPage, __ATOMIC_RELAXED);
+    out->csAll        = __atomic_load_n(&csAllCalls, __ATOMIC_RELAXED);
+    out->csPathFail   = __atomic_load_n(&csPathFailures, __ATOMIC_RELAXED);
+    out->csSbin       = __atomic_load_n(&csSbinMisses, __ATOMIC_RELAXED);
+    out->csMatch      = __atomic_load_n(&csBtMatches, __ATOMIC_RELAXED);
 }
 
 static void pluginStart() {

@@ -100,6 +100,11 @@ void ibtDiagPublishLive()
     svc->setProperty("IBTLastOffset", s.lastOffset, 64);
     svc->setProperty("IBTLastSize", s.lastSize, 32);
     svc->setProperty("IBTLastPage", s.lastPage, 64);
+    // 1.9.11：cs_validate_page 入口漏斗。判读见 IbtDiag.h。
+    svc->setProperty("IBTCsAll", (unsigned long long)s.csAll, 32);
+    svc->setProperty("IBTCsPathFail", (unsigned long long)s.csPathFail, 32);
+    svc->setProperty("IBTCsSbin", (unsigned long long)s.csSbin, 32);
+    svc->setProperty("IBTCsMatch", (unsigned long long)s.csMatch, 32);
     // 1.9.10：唤醒竞态计时。判读方式：
     //   IBTSetupMs ≈ 27000 且 IBTFwMs ≈ 26000 → 27 秒全在固件下载
     //   IBTFwRetry = 1                        → 走的是失败重试路径，重点查第一次为什么失败
