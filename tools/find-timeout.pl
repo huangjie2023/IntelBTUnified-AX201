@@ -67,8 +67,41 @@ for (1 .. $ncmds) {
     }
     $p += $cmdsize;
 }
-die "no __TEXT segment\n" unless $filesize;
+unless ($filesize) {
+    print "!! __TEXT 未找到，dump load commands：\n";
+    dump_commands();
+    die "no __TEXT segment\n";
+}
 printf "TEXT vmaddr=0x%x fileoff=%d(abs %d) size=%d\n", $vmaddr, $fileoff, $base + $fileoff, $filesize;
+
+# 诊断：__TEXT 没找到时，把文件类型和 load command 流 dump 出来。
+sub dump_commands {
+    my $ft        = u32($base + 12);
+    my $sizeofcmds = u32($base + 20);
+    printf "mach filetype=%d (2=EXECUTE 6=DYLIB 13=FILESET) ncmds=%d sizeofcmds=%d\n",
+        $ft, $ncmds, $sizeofcmds;
+    my $q = $base + 28;
+    my $end = $base + 28 + $sizeofcmds;
+    $end = $base + $size if $end > $base + $size;
+    my $shown = 0;
+    while ($q < $end && $shown < 40) {
+        my ($c, $sz) = (u32($q), u32($q + 4));
+        my $extra = '';
+        if ($c == 0x19) {
+            my $nm = substr($buf, $q + 8, 16);
+            $nm =~ s/\0.*//s;
+            $extra = " seg=$nm";
+        } elsif ($c == 0x80000034) {
+            my $nm = substr($buf, $q + 8, 16);
+            $nm =~ s/\0.*//s;
+            $extra = " fileset_entry=$nm";
+        }
+        printf "  cmd=0x%08x size=%u%s\n", $c, $sz, $extra;
+        last if $sz < 8;
+        $q += $sz;
+        $shown++;
+    }
+}
 
 # ---- 找字符串 ----
 # 实测（17:11）：USB 路径 "Failed to initialize transport" ×4；UART 时代的
