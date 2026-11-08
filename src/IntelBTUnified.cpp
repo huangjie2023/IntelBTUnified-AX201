@@ -222,6 +222,7 @@ static unsigned int leHookBundled {};// IOSource Bundled 重载包装入口次�
 static unsigned int leParsed {};     // 成功读到事件头（getLength>0 且 readBytes 完成）
 static unsigned int leEvt3E {};      // evt==0x3E（LE 元事件）计数
 static unsigned int leCcSeen {};     // 元子事件 0x01（Connection Complete）计数（含失败）
+static unsigned int leAsyncMatch {}; // 1.9.28: 异步入口 that==hookPipeInstance 命中数
 
 static inline uint16_t leHandleOfEvent(const HciEventHdr *hdr) {
     // Read Remote Features Complete: [0]=subevent 0x04, [1]=status, [2..3]=handle
@@ -510,10 +511,9 @@ static IOReturn newAsyncIO(void *that, IOMemoryDescriptor* dataBuffer, uint32_t 
     __atomic_add_fetch(&leHookPipe, 1, __ATOMIC_RELAXED);
     // 1.9.24: Tahoe 上 Completion 重载已挂钩时必须让路（IOSource 层已覆盖 Pipe 层），
     // 否则同一完成回调会被包两层。
-    // 1.9.27: 拆掉 leActiveSlots>0 门槛——1.9.26 实测证明事件端点（中断 IN，异步
-    // Completion）被这个门槛挡在外面，Connection Complete 永远看不到，死锁复活。
-    // 忠实移植 if-lensman 的无条件方案；性能由 leProcessBuffer 的快速排除兜底。
-    if (!leRewriteDisabled && !iosourceCompletionRouted && completion) {
+    // 1.9.28: 加防双重包装保险（completion->action 已是包装函数则跳过）。
+    if (!leRewriteDisabled && !iosourceCompletionRouted && completion &&
+        that == hookPipeInstance && completion->action != asyncIOCompletion) {
         if (that == hookPipeInstance) {
             AsyncOwnerData *ownerData = new AsyncOwnerData;
             ownerData->action = completion->action;
@@ -542,16 +542,23 @@ static IOReturn newAsyncIO(void *that, IOMemoryDescriptor* dataBuffer, uint32_t 
 //   Bundled:    __ZN17IOUSBHostIOSource2ioEP18IOMemoryDescriptorjP26IOUSBHostBundledCompletionj
 // 1.9.27: 无门控（忠实移植 if-lensman 的无条件方案）——1.9.26 实测证明 slot 门槛
 // 会把事件端点（异步 Completion）挡在外面，Connection Complete 永远看不到。
-// 不按 that 过滤——Tahoe 上事件可能由非 Pipe 的 IOSource 实例投递（#514 实测
-// 作者为了行为二分也去掉了该过滤）。Rjj 是同步路径：栈对象、先调原函数再改写。
+// 1.9.28: 无条件方案在本机 panic（开机跑完 verbose 直接重启）。回退为按
+// that == hookPipeInstance 过滤（只包装 Intel 蓝牙事件管道，1.9.18~1.9.23 多年
+// 验证稳定的口径）；Rjj 保持无条件（1.9.26 实测 5894 次无 panic）。疑点是包装
+// 了全系统 USB 设备的完成回调（U 盘/HID/存储全在内），本机环境与 if-lensman
+// 不同。另加防双重包装保险：completion->action 已是我们的包装函数时跳过
+// （防调用方复用 completion 结构导致链式包装 → use-after-free）。
+// 匹配情况用 IBTLeAsyncMatch 计数验证——若永远为 0，说明事件走的 IOSource
+// 实例不是捕获的 pipe 对象，下一步换匹配维度。
 // ---------------------------------------------------------------------------
 static IOReturn newIOSourceIOCompletion(void *that, IOMemoryDescriptor* dataBuffer, uint32_t dataBufferLength, IOUSBHostCompletion* completion, uint32_t completionTimeoutMs)
 {
-    // 1.9.27: 拆掉 leActiveSlots>0 门槛（1.9.26 恢复它是错判——1.9.25 死循环的
-    // 根因是 Rjj 的 prepare 方向不匹配，已由纯 readBytes 根治；事件端点走的就是
-    // 本异步路径，门槛让它永远看不到 Connection Complete，slot 死锁复活）。
     __atomic_add_fetch(&leHookAsync, 1, __ATOMIC_RELAXED);
-    if (!leRewriteDisabled && completion) {
+    if (that == hookPipeInstance)
+        __atomic_add_fetch(&leAsyncMatch, 1, __ATOMIC_RELAXED);
+    // 1.9.28: 窄口径 = 捕获的 Intel 事件管道 + 防双重包装。
+    if (!leRewriteDisabled && completion && that == hookPipeInstance &&
+        completion->action != asyncIOCompletion) {
         AsyncOwnerData *ownerData = new AsyncOwnerData;
         ownerData->action = completion->action;
         ownerData->bundledAction = nullptr;
@@ -592,9 +599,10 @@ static void asyncBundledCompletion(void* owner, uint32_t ioCompletionCount, IOMe
 
 static IOReturn newIOSourceIOBundled(void *that, IOMemoryDescriptor* dataBuffer, uint32_t dataBufferLength, IOUSBHostBundledCompletion* completion, uint32_t completionTimeoutMs)
 {
-    // 1.9.27: 同 Completion，拆掉 slot 门槛。
+    // 1.9.28: 同 Completion——窄口径（只包 Intel 事件管道）+ 防双重包装。
     __atomic_add_fetch(&leHookBundled, 1, __ATOMIC_RELAXED);
-    if (!leRewriteDisabled && completion) {
+    if (!leRewriteDisabled && completion && that == hookPipeInstance &&
+        completion->action != asyncBundledCompletion) {
         AsyncOwnerData *ownerData = new AsyncOwnerData;
         ownerData->action = nullptr;
         ownerData->bundledAction = completion->action;
@@ -1818,6 +1826,7 @@ void ibtDiagFill(IbtDiagSnapshot *out) {
     out->leParsed     = __atomic_load_n(&leParsed, __ATOMIC_RELAXED);
     out->leEvt3E      = __atomic_load_n(&leEvt3E, __ATOMIC_RELAXED);
     out->leCcSeen     = __atomic_load_n(&leCcSeen, __ATOMIC_RELAXED);
+    out->leAsyncMatch = __atomic_load_n(&leAsyncMatch, __ATOMIC_RELAXED);
     {
         const char *bid = BaseDeviceInfo::get().boardIdentifier;
         size_t n = 0;
