@@ -141,6 +141,14 @@ void ibtDiagPublishLive()
     svc->setProperty("IBTLeSlotsReg", (unsigned long long)s.leSlotsReg, 32);
     svc->setProperty("IBTLeConnReg", (unsigned long long)s.leConnReg, 32);
     svc->setProperty("IBTIosrcMask", (unsigned long long)s.iosrcMask, 32);
+    // 1.9.27: 深漏斗（判读见 IbtDiag.h）
+    svc->setProperty("IBTLeHookPipe", (unsigned long long)s.leHookPipe, 32);
+    svc->setProperty("IBTLeHookAsync", (unsigned long long)s.leHookAsync, 32);
+    svc->setProperty("IBTLeHookRjj", (unsigned long long)s.leHookRjj, 32);
+    svc->setProperty("IBTLeHookBundled", (unsigned long long)s.leHookBundled, 32);
+    svc->setProperty("IBTLeParsed", (unsigned long long)s.leParsed, 32);
+    svc->setProperty("IBTLeEvt3E", (unsigned long long)s.leEvt3E, 32);
+    svc->setProperty("IBTLeCcSeen", (unsigned long long)s.leCcSeen, 32);
     // 1.9.11：cs_validate_page 入口漏斗。判读见 IbtDiag.h。
     svc->setProperty("IBTCsAll", (unsigned long long)s.csAll, 32);
     svc->setProperty("IBTCsPathFail", (unsigned long long)s.csPathFail, 32);

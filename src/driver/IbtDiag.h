@@ -164,6 +164,18 @@ struct IbtDiagSnapshot {
     unsigned int leSlotsReg;   // 命令路径注册 slot 数
     unsigned int leConnReg;    // 事件路径（Connection Complete）兜底注册数
     unsigned int iosrcMask;    // 三条 IOSource::io 重载路由成功位图
+    // 1.9.27: 深漏斗——每路径入口计数 + 解析计数。判读：
+    //   HookAsync=0 且 HookRjj 巨大 → 异步路径没进（门槛/路由问题）
+    //   Parsed=0 → readBytes 都没成功（描述符问题）
+    //   Evt3E>0 而 CcSeen=0 → 看到 LE 元事件但没有 Connection Complete（事件被截断/分帧不同）
+    //   CcSeen>0 而 ConnReg=0 → 有 CC 但 status!=0（连接失败事件）
+    unsigned int leHookPipe;   // IOUSBHostPipe::io 包装入口
+    unsigned int leHookAsync;  // IOSource Completion 重载包装入口
+    unsigned int leHookRjj;    // IOSource Rjj 同步重载入口
+    unsigned int leHookBundled;// IOSource Bundled 重载包装入口
+    unsigned int leParsed;     // 成功读到 2 字节事件头
+    unsigned int leEvt3E;      // LE 元事件（evt==0x3E）计数
+    unsigned int leCcSeen;     // 元子事件 0x01 计数（含 status!=0）
 };
 
 // ---------------------------------------------------------------------------
