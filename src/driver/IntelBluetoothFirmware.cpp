@@ -155,6 +155,8 @@ void ibtDiagPublishLive()
     svc->setProperty("IBTCmdAll", (unsigned long long)s.leCmdAll, 32);
     svc->setProperty("IBTLeCmd2016Async", (unsigned long long)s.leCmd2016Async, 32);
     svc->setProperty("IBTLeCmd2016Rjj", (unsigned long long)s.leCmd2016Rjj, 32);
+    svc->setProperty("IBTRjjReadOk", (unsigned long long)s.leRjjReadOk, 32);
+    svc->setProperty("IBTRjjReadFail", (unsigned long long)s.leRjjReadFail, 32);
     svc->setProperty("IBTCmdHci", (unsigned long long)s.leCmdHci, 32);
     svc->setProperty("IBTCmdDev", (unsigned long long)s.leCmdDev, 32);
     svc->setProperty("IBTPipeCap", (unsigned long long)s.lePipeCap, 32);

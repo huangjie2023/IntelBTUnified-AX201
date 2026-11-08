@@ -231,6 +231,8 @@ static unsigned int leCmdDev {};     // 1.9.30: 通过 isIntelBluetooth 的请�
 static unsigned int lePipeCap {};    // 1.9.30: Intel 中断管道捕获成功次数（init 钩子是否触发）
 static unsigned int leCmd2016Async {};// 1.9.31: 异步 Completion 入口识别到的 0x2016（判命令走哪条路）
 static unsigned int leCmd2016Rjj {};  // 1.9.31: 同步 Rjj 入口识别到的 0x2016（已含开窗+补发）
+static unsigned int leRjjReadOk {};   // 1.9.32: Rjj 入口 3 字节探测读成功数（缓冲区可读性）
+static unsigned int leRjjReadFail {}; // 1.9.32: Rjj 入口探测读失败数（readBytes 不可用则整层改写路线存疑）
 
 static inline uint16_t leHandleOfEvent(const HciEventHdr *hdr) {
     // Read Remote Features Complete: [0]=subevent 0x04, [1]=status, [2..3]=handle
@@ -609,8 +611,15 @@ static IOReturn newIOSourceIORjj(void *that, IOMemoryDescriptor* dataBuffer, uin
     // 四重匹配；readBytes 失败直接放行；补发走 old 指针不回钩子，无递归。
     uint8_t cmdHead[3] = {};
     bool isRemoteFeatures = false;
-    if (!leRewriteDisabled && dataBuffer && dataBuffer->getLength() >= 5 &&
-        dataBuffer->readBytes(0, cmdHead, 3) == 3 &&
+    // 1.9.32: 探测读结果计数——1.9.26 时代 Rjj 无条件下 leProcessBuffer 时 Parsed=0，
+    // 意味着 readBytes 可能全失败。若本计数 Fail 占多数，IOSource 层改写路线需重估。
+    const bool probeOk = dataBuffer && dataBuffer->getLength() >= 3 &&
+                         dataBuffer->readBytes(0, cmdHead, 3) == 3;
+    if (probeOk)
+        __atomic_add_fetch(&leRjjReadOk, 1, __ATOMIC_RELAXED);
+    else
+        __atomic_add_fetch(&leRjjReadFail, 1, __ATOMIC_RELAXED);
+    if (!leRewriteDisabled && probeOk && dataBuffer->getLength() >= 5 &&
         cmdHead[0] == (HCI_OP_LE_READ_REMOTE_FEATURES & 0xFF) &&
         cmdHead[1] == ((HCI_OP_LE_READ_REMOTE_FEATURES >> 8) & 0xFF) &&
         cmdHead[2] == 0x02) {
@@ -1920,6 +1929,8 @@ void ibtDiagFill(IbtDiagSnapshot *out) {
     out->leCmdAll     = __atomic_load_n(&leCmdAll, __ATOMIC_RELAXED);
     out->leCmd2016Async = __atomic_load_n(&leCmd2016Async, __ATOMIC_RELAXED);
     out->leCmd2016Rjj = __atomic_load_n(&leCmd2016Rjj, __ATOMIC_RELAXED);
+    out->leRjjReadOk = __atomic_load_n(&leRjjReadOk, __ATOMIC_RELAXED);
+    out->leRjjReadFail = __atomic_load_n(&leRjjReadFail, __ATOMIC_RELAXED);
     out->leCmdHci     = __atomic_load_n(&leCmdHci, __ATOMIC_RELAXED);
     out->leCmdDev     = __atomic_load_n(&leCmdDev, __ATOMIC_RELAXED);
     out->lePipeCap    = __atomic_load_n(&lePipeCap, __ATOMIC_RELAXED);
