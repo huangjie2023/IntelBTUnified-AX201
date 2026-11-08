@@ -391,6 +391,22 @@ IOReturn IntelBluetoothFirmware::setPowerState(unsigned long powerStateOrdinal, 
     return IOPMAckImplied;
 }
 
+// 1.9.22：关机/重启时立即解除救砖武装。背景：关机 teardown 流程里 Apple 的
+// 传输驱动会主动 close 设备，救砖巡检会把"无人持有"误判为栈拆台，两拍后
+// 在关机路径里 reset() 重枚举——把干净关机拖成分钟级死等（最坏 watchdog
+// panic）。本回调由电源管理层在 shutdown/restart 时投递（本驱动注册过
+// registerPowerDriver，必然收到），睡眠走的是 setPowerState，不受影响。
+void IntelBluetoothFirmware::systemWillShutdown(IOOptionBits specifier)
+{
+    if (m_rescueEnabled) {
+        m_rescueEnabled = false;
+        m_rescueCandidate = 0;
+        XYLog("rescue: disarmed for shutdown/restart (specifier=0x%lx)\n",
+              (unsigned long)specifier);
+    }
+    super::systemWillShutdown(specifier);
+}
+
 void IntelBluetoothFirmware::stop(IOService *provider)
 {
     XYLog("Driver Stop()\n");

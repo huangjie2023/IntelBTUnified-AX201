@@ -48,7 +48,10 @@ public:
     IOService * probe(IOService *provider, SInt32 *score) override;
     
     IOReturn setPowerState(unsigned long powerStateOrdinal, IOService *whatDevice) override;
-    
+
+    // 1.9.22：关机/重启时解除救砖武装（见 .cpp 实现）。
+    void systemWillShutdown(IOOptionBits specifier) override;
+
     void cleanUp();
     
     void publishReg(bool isSucceed, const char *fwName);
