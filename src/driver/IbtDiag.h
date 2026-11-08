@@ -148,6 +148,22 @@ struct IbtDiagSnapshot {
     unsigned int wireTeardown;        // teardown 执行次数（正常 boot 应恒为 0）
     unsigned int wireTeardownAborted; // teardown 累计回收的 UPL 数
     unsigned int stopCount;           // 服务 stop() 次数（睡眠会 +1，正常）
+
+    // 1.9.25: LE 改写状态机可观测性（本机日志通道死，全部走 ioreg）。
+    // 判读漏斗（BLE 鼠标/键盘"连上但配对挂起到超时 708"专用）：
+    //   IbtLeHookCalls=0   → 事件没流经我们的钩子（IOSource 三条路由失败，看 iosrcMask）
+    //   IbtIosrcMask       → bit0 Completion / bit1 Rjj / bit2 Bundled 各自路由成功
+    //   IbtLeConnReg>0     → Connection Complete 兜底注册生效（Tahoe 命令路径哑掉的备胎）
+    //   IbtLeSlotsReg>0    → 命令路径（0x2016 双发）注册正常
+    //   IbtLeRealPass>0 且 LeFakePhy=0 → stage1 没触发：第二个 features 事件没来
+    //   IbtLeFakeDlc>0 但仍配不上     → 改写已发出，问题在 bluetoothd 消费侧/鼠标侧
+    unsigned int leHookCalls;  // leProcessBuffer 进入次数（全部路径合计）
+    unsigned int leRealPass;   // stage0：真实 features complete 放行
+    unsigned int leFakePhy;    // stage1：fake PHY Update Complete 发出
+    unsigned int leFakeDlc;    // stage2：fake LE Data Length Change 发出
+    unsigned int leSlotsReg;   // 命令路径注册 slot 数
+    unsigned int leConnReg;    // 事件路径（Connection Complete）兜底注册数
+    unsigned int iosrcMask;    // 三条 IOSource::io 重载路由成功位图
 };
 
 // ---------------------------------------------------------------------------

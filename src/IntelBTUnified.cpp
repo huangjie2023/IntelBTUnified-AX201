@@ -198,6 +198,21 @@ static uint8_t fakePhyValue = 0x01;
 // Presupuesto de lineas de log para no inundar el arranque.
 static int  leLogBudget = 16;
 
+// 1.9.25: 本机日志通道是死的（见 IbtDiag.h 头注），LE 改写状态机的每个关键动作
+// 全部落成 ioreg 可读计数。判读漏斗：
+//   leHookCalls=0            → 三条 IOSource 钩子一个都没生效（事件没流经我们）
+//   leConnReg=0 且 leSlotsReg>0 → slot 注册走了命令路径（正常）
+//   leConnReg>0              → 事件路径兜底注册生效（Tahoe 上命令路径哑掉的备胎）
+//   leRealPass>0, leFakePhy>0, leFakeDlc>0 → 状态机 stage0→1→2 全走通
+//   leFakeDlc>0 但鼠标仍配不上 → 改写已发，问题在 bluetoothd 消费侧或鼠标侧
+static unsigned int leHookCalls {};  // leProcessBuffer 进入次数（所有路径合计）
+static unsigned int leRealPass {};   // stage0：真实 features 放行
+static unsigned int leFakePhy {};    // stage1：fake PHY Update 发出
+static unsigned int leFakeDlc {};    // stage2：fake Data Length Change 发出
+static unsigned int leSlotsReg {};   // 命令路径（0x2016 双发）注册 slot 数
+static unsigned int leConnReg {};    // 1.9.25 兜底：LE Connection Complete 注册 slot 数
+static unsigned int iosrcMask {};    // bit0 Completion / bit1 Rjj / bit2 Bundled 路由成功
+
 static inline uint16_t leHandleOfEvent(const HciEventHdr *hdr) {
     // Read Remote Features Complete: [0]=subevent 0x04, [1]=status, [2..3]=handle
     return (uint16_t)((hdr->data[2] | (hdr->data[3] << 8)) & 0x0FFF);
@@ -236,6 +251,7 @@ static void leRegisterSlot(uint16_t handle) {
             leSlots[i].stage = 0;
             leSlots[i].idle = 0;
             __atomic_add_fetch(&leActiveSlots, 1, __ATOMIC_SEQ_CST);
+            __atomic_add_fetch(&leSlotsReg, 1, __ATOMIC_RELAXED);
             DIAGLOG(MODULE_IBTP, "le slot +h=0x%03x (active %d)", handle, leActiveSlots);
             return;
         }
@@ -322,6 +338,9 @@ static void sendRandomAddress(void *that, IOService *provider, unsigned int time
 // se desalineaba y las conexiones se quedaban colgadas sin ningun crash.
 #define HCI_EVT_LE_META                               0x3E
 #define HCI_EVT_LE_META_READ_REMOTE_FEATURES_COMPLETE 0x04
+// 1.9.25: 兜底注册用。LE Connection Complete: [0]=subevent 0x01, [1]=status,
+// [2..3]=connection handle（无 status 字节坑，布局与 DLC 不同,见 #514）。
+#define HCI_EVT_LE_META_CONNECTION_COMPLETE 0x01
 
 // Plantillas; cada reescritura usa una copia local para no compartir bytes mutables
 // entre conexiones que se completan a la vez.
@@ -345,11 +364,23 @@ static void leProcessBuffer(IOMemoryDescriptor* dataBuffer, uint32_t &bytesTrans
     uint32_t allocLen = bytesTransferred;
 
     if (dataBuffer && bytesTransferred) {
+        __atomic_add_fetch(&leHookCalls, 1, __ATOMIC_RELAXED);
         void *buffer = IOMalloc(allocLen);
         if (buffer) {
             if (dataBuffer->getLength() > 0 && (getKernelVersion() < KernelVersion::Sequoia || !dataBuffer->prepare(kIODirectionInOut))) {
                 dataBuffer->readBytes(0, buffer, allocLen);
                 HciEventHdr *hdr = (HciEventHdr *)buffer;
+                // 1.9.25: Connection Complete 兜底注册。原实现只在 0x2016 命令路径
+                // （newHostDeviceRequest，要求 data == nullptr）注册 slot；Tahoe 上
+                // 若命令带着内联 data 到达，slot 永远不注册、改写状态机整体哑火
+                // （症状：连接成功但 "Security request before link is ready" 挂起
+                // 到 LSTO 超时 708）。看到连接成功就在事件路径注册，不再依赖命令路径。
+                if (hdr->evt == HCI_EVT_LE_META && hdr->data[0] == HCI_EVT_LE_META_CONNECTION_COMPLETE &&
+                    hdr->len >= 4 && hdr->data[1] == 0) {
+                    const uint16_t connHandle = (uint16_t)((hdr->data[2] | (hdr->data[3] << 8)) & 0x0FFF);
+                    leRegisterSlot(connHandle);
+                    __atomic_add_fetch(&leConnReg, 1, __ATOMIC_RELAXED);
+                }
                 const bool isLeFeatures = hdr->evt == HCI_EVT_LE_META &&
                                           hdr->data[0] == HCI_EVT_LE_META_READ_REMOTE_FEATURES_COMPLETE &&
                                           hdr->len >= 12;
@@ -364,6 +395,7 @@ static void leProcessBuffer(IOMemoryDescriptor* dataBuffer, uint32_t &bytesTrans
                         if (slot->stage == 0) {
                             slot->stage = 1;
                             slot->idle = 0;
+                            __atomic_add_fetch(&leRealPass, 1, __ATOMIC_RELAXED);
                             if (leLogBudget-- > 0)
                                 DIAGLOG(MODULE_IBTP, "le h=0x%03x features complete (real, pass)", handle);
                         } else if (slot->stage == 1) {
@@ -377,6 +409,7 @@ static void leProcessBuffer(IOMemoryDescriptor* dataBuffer, uint32_t &bytesTrans
                             bytesTransferred = 8;
                             slot->stage = 2;
                             slot->idle = 0;
+                            __atomic_add_fetch(&leFakePhy, 1, __ATOMIC_RELAXED);
                             if (leLogBudget-- > 0)
                                 DIAGLOG(MODULE_IBTP, "le h=0x%03x -> fake PHY Update", handle);
                         } else {
@@ -386,6 +419,7 @@ static void leProcessBuffer(IOMemoryDescriptor* dataBuffer, uint32_t &bytesTrans
                             dlc[4] = hdr->data[3];
                             dataBuffer->writeBytes(0, dlc, sizeof(dlc));
                             bytesTransferred = 13;
+                            __atomic_add_fetch(&leFakeDlc, 1, __ATOMIC_RELAXED);
                             if (leLogBudget-- > 0)
                                 DIAGLOG(MODULE_IBTP, "le h=0x%03x -> fake Data Length Change (done)", handle);
                             slot->used = false;
@@ -472,7 +506,10 @@ static IOReturn newAsyncIO(void *that, IOMemoryDescriptor* dataBuffer, uint32_t 
 // ---------------------------------------------------------------------------
 static IOReturn newIOSourceIOCompletion(void *that, IOMemoryDescriptor* dataBuffer, uint32_t dataBufferLength, IOUSBHostCompletion* completion, uint32_t completionTimeoutMs)
 {
-    if (!leRewriteDisabled && leActiveSlots > 0 && completion) {
+    // 1.9.25: 去掉 leActiveSlots>0 门槛——slot 注册可能发生在事件路径
+    // （Connection Complete 兜底），门槛在包装时就把第一条事件挡在外面，
+    // slot 永远注册不上，死锁。改写逻辑内部对无 slot 事件原样放行。
+    if (!leRewriteDisabled && completion) {
         AsyncOwnerData *ownerData = new AsyncOwnerData;
         ownerData->action = completion->action;
         ownerData->bundledAction = nullptr;
@@ -488,7 +525,8 @@ static IOReturn newIOSourceIORjj(void *that, IOMemoryDescriptor* dataBuffer, uin
 {
     IOReturn ret = FunctionCast(newIOSourceIORjj, oldIOSourceIORjj)(that, dataBuffer, dataBufferLength, bytesTransferred, completionTimeoutMs);
     // 同步路径：数据已经拿到，改写缓冲区即可（bytesTransferred 是出/入参）。
-    if (ret == kIOReturnSuccess && !leRewriteDisabled && leActiveSlots > 0)
+    // 1.9.25: 同上去掉 leActiveSlots>0 门槛。
+    if (ret == kIOReturnSuccess && !leRewriteDisabled)
         leProcessBuffer(dataBuffer, bytesTransferred);
     return ret;
 }
@@ -509,7 +547,8 @@ static void asyncBundledCompletion(void* owner, uint32_t ioCompletionCount, IOMe
 
 static IOReturn newIOSourceIOBundled(void *that, IOMemoryDescriptor* dataBuffer, uint32_t dataBufferLength, IOUSBHostBundledCompletion* completion, uint32_t completionTimeoutMs)
 {
-    if (!leRewriteDisabled && leActiveSlots > 0 && completion) {
+    // 1.9.25: 同 Completion 路径，去掉 leActiveSlots>0 门槛。
+    if (!leRewriteDisabled && completion) {
         AsyncOwnerData *ownerData = new AsyncOwnerData;
         ownerData->action = nullptr;
         ownerData->bundledAction = completion->action;
@@ -649,9 +688,10 @@ static void processUSBHost(KernelPatcher &patcher, size_t index, mach_vm_address
         };
         for (size_t i = 0; i < arrsize(iosourceRequests); i++) {
             patcher.routeMultiple(index, &iosourceRequests[i], 1, address, size);
-            if (patcher.getError() == KernelPatcher::Error::NoError)
+            if (patcher.getError() == KernelPatcher::Error::NoError) {
                 routed++;
-            else
+                __atomic_fetch_or(&iosrcMask, 1u << i, __ATOMIC_RELAXED);
+            } else
                 patcher.clearError();
         }
         if (routed == 3) {
@@ -1716,6 +1756,14 @@ void ibtDiagFill(IbtDiagSnapshot *out) {
     out->wireLastErr  = __atomic_load_n(&wireLastError, __ATOMIC_RELAXED);
     out->wireTeardown = __atomic_load_n(&wireTeardownCount, __ATOMIC_RELAXED);
     out->wireTeardownAborted = __atomic_load_n(&wireTeardownAborted, __ATOMIC_RELAXED);
+    // 1.9.25: LE 改写状态机可观测性（日志通道死，全部走 ioreg）
+    out->leHookCalls  = __atomic_load_n(&leHookCalls, __ATOMIC_RELAXED);
+    out->leRealPass   = __atomic_load_n(&leRealPass, __ATOMIC_RELAXED);
+    out->leFakePhy    = __atomic_load_n(&leFakePhy, __ATOMIC_RELAXED);
+    out->leFakeDlc    = __atomic_load_n(&leFakeDlc, __ATOMIC_RELAXED);
+    out->leSlotsReg   = __atomic_load_n(&leSlotsReg, __ATOMIC_RELAXED);
+    out->leConnReg    = __atomic_load_n(&leConnReg, __ATOMIC_RELAXED);
+    out->iosrcMask    = __atomic_load_n(&iosrcMask, __ATOMIC_RELAXED);
     {
         const char *bid = BaseDeviceInfo::get().boardIdentifier;
         size_t n = 0;

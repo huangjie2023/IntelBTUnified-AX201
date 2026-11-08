@@ -133,6 +133,14 @@ void ibtDiagPublishLive()
     svc->setProperty("IBTStopCount", (unsigned long long)s.stopCount, 32);
     svc->setProperty("IBTWireTeardown", (unsigned long long)s.wireTeardown, 32);
     svc->setProperty("IBTWireTeardownAborted", (unsigned long long)s.wireTeardownAborted, 32);
+    // 1.9.25: LE 改写状态机可观测性（修 BLE 鼠标配对）
+    svc->setProperty("IBTLeHookCalls", (unsigned long long)s.leHookCalls, 32);
+    svc->setProperty("IBTLeRealPass", (unsigned long long)s.leRealPass, 32);
+    svc->setProperty("IBTLeFakePhy", (unsigned long long)s.leFakePhy, 32);
+    svc->setProperty("IBTLeFakeDlc", (unsigned long long)s.leFakeDlc, 32);
+    svc->setProperty("IBTLeSlotsReg", (unsigned long long)s.leSlotsReg, 32);
+    svc->setProperty("IBTLeConnReg", (unsigned long long)s.leConnReg, 32);
+    svc->setProperty("IBTIosrcMask", (unsigned long long)s.iosrcMask, 32);
     // 1.9.11：cs_validate_page 入口漏斗。判读见 IbtDiag.h。
     svc->setProperty("IBTCsAll", (unsigned long long)s.csAll, 32);
     svc->setProperty("IBTCsPathFail", (unsigned long long)s.csPathFail, 32);
