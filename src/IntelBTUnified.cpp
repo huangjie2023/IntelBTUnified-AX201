@@ -570,15 +570,9 @@ static IOReturn newAsyncIO(void *that, IOMemoryDescriptor* dataBuffer, uint32_t 
 static IOReturn newIOSourceIOCompletion(void *that, IOMemoryDescriptor* dataBuffer, uint32_t dataBufferLength, IOUSBHostCompletion* completion, uint32_t completionTimeoutMs)
 {
     __atomic_add_fetch(&leHookAsync, 1, __ATOMIC_RELAXED);
-    // 1.9.31: 被动识别 0x2016——若命令也走异步层（Rjj 层 Cmd2016 仍为 0 时用它判路）。
-    // 仅计数，不在此开窗/补发。
-    uint8_t cmdHead[3] = {};
-    if (dataBuffer && dataBuffer->getLength() >= 5 &&
-        dataBuffer->readBytes(0, cmdHead, 3) == 3 &&
-        cmdHead[0] == (HCI_OP_LE_READ_REMOTE_FEATURES & 0xFF) &&
-        cmdHead[1] == ((HCI_OP_LE_READ_REMOTE_FEATURES >> 8) & 0xFF) &&
-        cmdHead[2] == 0x02)
-        __atomic_add_fetch(&leCmd2016Async, 1, __ATOMIC_RELAXED);
+    // 1.9.33: 入口探测读已删除——异步 io 提交时描述符未映射，全系统无条件读它
+    // 是 1.9.31/32 两次开机 panic 的头号嫌疑（1.9.27 死因族）。窗口包装逻辑
+    // 保持 1.9.29 口径：窗口开时才包装（复制 completion 传参）。
     if (!leRewriteDisabled && __atomic_load_n(&leRemoteReads, __ATOMIC_ACQUIRE) > 0 &&
         completion && completion->action != asyncIOCompletion) {
         AsyncOwnerData *ownerData = new AsyncOwnerData;
@@ -604,44 +598,38 @@ static IOReturn newIOSourceIORjj(void *that, IOMemoryDescriptor* dataBuffer, uin
     // 1.9.31: 26.7.3 实测（IBTCmdAll=0 / PipeCap=0 / HookRjj=5894）——deviceRequest
     // 与 Pipe 层符号已重构掉，命令侧钩子全哑；但 IOSource 三条 io 重载有效，且
     // 5894 的量级意味着控制传输（host→controller 的 HCI 命令）同样流经此处。
-    // 于是在 Rjj 入口被动读 3 字节识别 LE Read Remote Features（opcode 0x2016，
-    // 长度恒 2）：命中 → 注册 slot + 开窗 +2 → 真实命令照发 → 再同步补发两次
-    // 同样的命令（#514 的"跑三遍"：事件路径把第 2/3 个 features complete 改写成
-    // fake PHY / fake DLC）。误判防护：opcode 两字节 + len 字节 + getLength>=5
-    // 四重匹配；readBytes 失败直接放行；补发走 old 指针不回钩子，无递归。
-    uint8_t cmdHead[3] = {};
-    bool isRemoteFeatures = false;
-    // 1.9.32: 探测读结果计数——1.9.26 时代 Rjj 无条件下 leProcessBuffer 时 Parsed=0，
-    // 意味着 readBytes 可能全失败。若本计数 Fail 占多数，IOSource 层改写路线需重估。
-    const bool probeOk = dataBuffer && dataBuffer->getLength() >= 3 &&
-                         dataBuffer->readBytes(0, cmdHead, 3) == 3;
-    if (probeOk)
-        __atomic_add_fetch(&leRjjReadOk, 1, __ATOMIC_RELAXED);
-    else
-        __atomic_add_fetch(&leRjjReadFail, 1, __ATOMIC_RELAXED);
-    if (!leRewriteDisabled && probeOk && dataBuffer->getLength() >= 5 &&
-        cmdHead[0] == (HCI_OP_LE_READ_REMOTE_FEATURES & 0xFF) &&
-        cmdHead[1] == ((HCI_OP_LE_READ_REMOTE_FEATURES >> 8) & 0xFF) &&
-        cmdHead[2] == 0x02) {
-        isRemoteFeatures = true;
-        uint8_t hbuf[2] = {};
-        uint16_t handle = 0;
-        if (dataBuffer->readBytes(3, hbuf, 2) == 2)
-            handle = (uint16_t)((hbuf[0] | (hbuf[1] << 8)) & 0x0FFF);
-        leRegisterSlot(handle);
-        unsigned int prev = __atomic_add_fetch(&leRemoteReads, 2, __ATOMIC_SEQ_CST);
-        if (prev > 16)
-            __atomic_store_n(&leRemoteReads, 2, __ATOMIC_SEQ_CST);
-        __atomic_add_fetch(&leCmd2016, 1, __ATOMIC_RELAXED);
-        __atomic_add_fetch(&leCmd2016Rjj, 1, __ATOMIC_RELAXED);
-    }
+    // 1.9.33（panic 修复）：1.9.31/32 在"原函数调用前"读缓冲 + Async 提交入口读
+    // 缓冲，两次开机 panic（同 1.9.27 死因族：异步/未映射描述符上 readBytes）。
+    // 全部探测挪回"调用后"——1.9.26 实证该位置整 boot 5894 次读无 panic。同步 io
+    // 返回后、调用方释放前，OUT 命令缓冲内容仍在，读它做 0x2016 识别完全等价。
     __atomic_add_fetch(&leHookRjj, 1, __ATOMIC_RELAXED);
     IOReturn ret = FunctionCast(newIOSourceIORjj, oldIOSourceIORjj)(that, dataBuffer, dataBufferLength, bytesTransferred, completionTimeoutMs);
-    if (isRemoteFeatures) {
-        // 补发两次同样的读取（第三次是上面那条真实命令）。同步串行，共用调用方的
-        // 描述符（数据 stage 已在线，与 lsh v2.5.1 的同步重执行同一做法）。
-        FunctionCast(newIOSourceIORjj, oldIOSourceIORjj)(that, dataBuffer, dataBufferLength, bytesTransferred, completionTimeoutMs);
-        FunctionCast(newIOSourceIORjj, oldIOSourceIORjj)(that, dataBuffer, dataBufferLength, bytesTransferred, completionTimeoutMs);
+    if (ret == kIOReturnSuccess && !leRewriteDisabled && dataBuffer && dataBuffer->getLength() >= 3) {
+        uint8_t cmdHead[3] = {};
+        const bool probeOk = dataBuffer->readBytes(0, cmdHead, 3) == 3;
+        if (probeOk)
+            __atomic_add_fetch(&leRjjReadOk, 1, __ATOMIC_RELAXED);
+        else
+            __atomic_add_fetch(&leRjjReadFail, 1, __ATOMIC_RELAXED);
+        if (probeOk && dataBuffer->getLength() >= 5 &&
+            cmdHead[0] == (HCI_OP_LE_READ_REMOTE_FEATURES & 0xFF) &&
+            cmdHead[1] == ((HCI_OP_LE_READ_REMOTE_FEATURES >> 8) & 0xFF) &&
+            cmdHead[2] == 0x02) {
+            uint8_t hbuf[2] = {};
+            uint16_t handle = 0;
+            if (dataBuffer->readBytes(3, hbuf, 2) == 2)
+                handle = (uint16_t)((hbuf[0] | (hbuf[1] << 8)) & 0x0FFF);
+            leRegisterSlot(handle);
+            unsigned int prev = __atomic_add_fetch(&leRemoteReads, 2, __ATOMIC_SEQ_CST);
+            if (prev > 16)
+                __atomic_store_n(&leRemoteReads, 2, __ATOMIC_SEQ_CST);
+            __atomic_add_fetch(&leCmd2016, 1, __ATOMIC_RELAXED);
+            __atomic_add_fetch(&leCmd2016Rjj, 1, __ATOMIC_RELAXED);
+            // 补发两次同样的读取（第三次是刚发过的真实命令）。同步串行，共用调用
+            // 方的描述符；补发走 old 指针不回钩子，无递归。
+            FunctionCast(newIOSourceIORjj, oldIOSourceIORjj)(that, dataBuffer, dataBufferLength, bytesTransferred, completionTimeoutMs);
+            FunctionCast(newIOSourceIORjj, oldIOSourceIORjj)(that, dataBuffer, dataBufferLength, bytesTransferred, completionTimeoutMs);
+        }
     }
     // 同步路径：数据已经拿到，改写缓冲区即可（bytesTransferred 是出/入参）。
     // 1.9.29: 窗口门控（与异步路径一致；无条件版本仅 1.9.26 短暂存活）。
