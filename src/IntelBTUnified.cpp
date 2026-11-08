@@ -616,6 +616,10 @@ static const uint8_t kBtdWaitSite2Patched[] = {
 };
 static bool shouldPatchWaits = false;
 
+// 1.9.21: 传输死亡自动救砖开关（默认开，-ibt-norescue 关）。非 static：
+// IntelBluetoothFirmware.cpp 的 start() 读取它决定是否武装巡检。
+bool gIbtRescueDisabled = false;
+
 static bool shouldPatchBoardId = false;
 static bool shouldPatchAddress = false;
 static bool shouldPatchNvramCheck = false;
@@ -1312,6 +1316,10 @@ static int patched_apfs_verify_rl(vnode_t vp, off_t offset, void *a3, void *a4, 
 }
 
 static void processPatcher(KernelPatcher &patcher) {    const bool argOta    = checkKernelArgument("-ibtota");    legacyCsPatching     = checkKernelArgument("-ibtplegacy");
+    // 1.9.21: 传输死亡自动救砖（wedge 自愈），默认启用；-ibt-norescue 关闭。
+    // 判据与流程见 IbtDiag.h；本变量在驱动 start() 里读取。
+    gIbtRescueDisabled = checkKernelArgument("-ibt-norescue");
+    SYSLOG(MODULE_BTLFX, "rescue-on-wedge: %s", gIbtRescueDisabled ? "OFF (-ibt-norescue)" : "ON");
     // Por defecto SI se parchea (sin los parches el controlador no se enciende);
     // -ibtota desactiva todo, -ibtplegacy usa el modo antiguo incondicional.
     disableCsPatching    = argOta;

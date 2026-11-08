@@ -64,6 +64,13 @@ private:
     // 的那一份全 0 快照——连续几轮实验都被这一点误导。
     IOTimerEventSource *m_pDiagTimer {nullptr};
     void diagTimerFired();
+    // 1.9.21：传输死亡自动救砖。判据与流程见 IbtDiag.h 顶部注释。
+    bool m_rescueEnabled {false};       // start() 成功后置位（-ibt-norescue 可关）
+    bool m_appleHeld {false};           // 已观测到 Apple 栈持有设备（正常态闩锁）
+    unsigned int m_rescueCandidate {0}; // 连续“Apple 已释放”探测拍数
+    unsigned int m_rescueCount {0};     // 实际触发 reset 的次数
+    bool probeAppleGone();              // true = 设备未被任何客户端持有
+    void diagRescueTick();              // 每拍（15s）巡检一次
 };
 
 #endif

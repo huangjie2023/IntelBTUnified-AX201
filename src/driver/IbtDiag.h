@@ -192,3 +192,23 @@ void ibtDiagPublishLive();
 // teardown 在 stop() 里调用，abort 全部 UPL 并释放 vnode 引用。
 void ibtWireProcess();
 void ibtWireTeardown();
+
+// ---------------------------------------------------------------------------
+// 1.9.21：传输死亡自动救砖（wedge 自愈）。
+//
+// 故障形态（2026-11-07 21:03 实测闭环）：AX201 蓝牙固件在控制器内部跑死
+// （HCI 永久无响应，bluetoothd 看门狗 "Stack Mutex try lock failed" 自杀），
+// Apple 栈拆台（DetachUserClients / terminating pseudo nub）并释放设备，
+// 但设备没有被 terminate（StopCount=0）→ 蓝牙从系统里消失，只能重启。
+// 且关机时系统对死控制器 teardown 干等约 2 分钟 → watchdogd 137s 无签到
+// → 内核 panic（非正常关机）。
+//
+// 检测信号：正常态 Apple 的传输驱动独占持有 USB 设备（open 必失败）；
+// 栈拆台后设备被释放，open 会成功。连续两拍（~30s）探测到"Apple 已释放"
+// 即判定传输死亡，调用 IOUSBHostDevice::reset()（官方语义 = terminate 并
+// 重枚举，等效拔插）→ 设备重枚举 → 本驱动重新 start → 固件重载 → 自愈。
+//
+// 关闭开关：boot-arg -ibt-norescue。
+// 读数：IBTRescueArmed / IBTRescueHeld / IBTRescueCandidate / IBTRescueCount。
+// ---------------------------------------------------------------------------
+extern bool gIbtRescueDisabled; // true = -ibt-norescue，救砖关闭

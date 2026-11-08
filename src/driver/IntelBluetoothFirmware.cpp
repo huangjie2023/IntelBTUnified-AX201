@@ -273,6 +273,15 @@ bool IntelBluetoothFirmware::start(IOService *provider)
     if (!m_pDiagTimer)
         XYLog("diag timer unavailable, snapshot stays at start-time values\n");
     cleanUp();
+    // 1.9.21：救砖巡检需要长期持有 provider 指针。cleanUp 只是清掉 open 状态；
+    // provider 在我们 stop() 之前必然有效（IOService 客户端关系保证），定时器
+    // 在 stop() 里被摘除，指针不会在设备销毁后被回访。
+    m_pDevice = OSDynamicCast(IOUSBHostDevice, provider);
+    m_rescueEnabled = !gIbtRescueDisabled;
+    // USB stop/start 循环（睡眠）后状态重置：唤醒后 Apple 重新 open 之前
+    // 存在无人持有的空窗，闩锁必须重新学习。
+    m_appleHeld = false;
+    m_rescueCandidate = 0;
     return true;
 }
 
@@ -284,9 +293,69 @@ void IntelBluetoothFirmware::diagTimerFired()
     // 持有 pager/对象锁，在钩子里建 UPL/fault 页会死锁）。处理完再刷新 ioreg
     // 快照，这样 WireOk/WireActive 与属性表始终同步。
     ibtWireProcess();
+    // 1.9.21：救砖巡检与诊断同节奏（15s 一拍）。探测本身只是 open/close 的
+    // 独占性试探，不发起任何 USB 传输，对死控制器也安全。
+    if (m_rescueEnabled)
+        diagRescueTick();
     ibtDiagPublishLive();
+    setProperty("IBTRescueArmed", (bool)m_rescueEnabled);
+    setProperty("IBTRescueHeld", (bool)m_appleHeld);
+    setProperty("IBTRescueCandidate", (unsigned long long)m_rescueCandidate, 32);
+    setProperty("IBTRescueCount", (unsigned long long)m_rescueCount, 32);
     if (m_pDiagTimer)
         m_pDiagTimer->setTimeoutMS(kDiagRefreshMs);
+}
+
+// 1.9.21：探测设备当前是否无人持有。正常态 Apple 的传输驱动独占持有设备，
+// open() 返回 false；栈拆台后设备被释放，open() 成功——探测后立刻 close 归还，
+// 全程零 USB 传输。
+bool IntelBluetoothFirmware::probeAppleGone()
+{
+    if (!m_pDevice)
+        return false;
+    if (!m_pDevice->open(this))
+        return false;   // 有人持有（正常态 = Apple 传输驱动）
+    m_pDevice->close(this);
+    return true;        // 无人持有 = Apple 已释放
+}
+
+// 1.9.21：救砖状态机，两拍确认后触发 IOUSBHostDevice::reset()（官方语义 =
+// terminate 并重枚举，等效拔插；不可在 USB 端口 workloop 调用——本函数跑在
+// 我们自己的 workloop 上，满足要求）。reset 后设备重枚举、本驱动重新 start
+// 并重载固件，bluetoothd 重新拿到传输层，全程无需重启。
+void IntelBluetoothFirmware::diagRescueTick()
+{
+    const bool appleGone = probeAppleGone();
+    if (!appleGone) {
+        if (m_rescueCandidate)
+            XYLog("rescue: Apple stack back, cancel candidate (%u)\n", m_rescueCandidate);
+        m_appleHeld = true;
+        m_rescueCandidate = 0;
+        return;
+    }
+    if (!m_appleHeld) {
+        // start() 后 Apple 尚未接入的空窗（或上一轮救砖后的重枚举窗口），
+        // 闩锁未建立，不计入候选。
+        return;
+    }
+    ++m_rescueCandidate;
+    XYLog("rescue: Apple stack released device, candidate %u/2\n", m_rescueCandidate);
+    if (m_rescueCandidate < 2)
+        return; // 两拍（约 30s）确认，滤掉 Apple 自身短时的 close/reopen 竞态
+    m_rescueCandidate = 0;
+    m_appleHeld = false;
+    XYLog("rescue: transport dead, resetting USB device (attempt #%u)\n", ++m_rescueCount);
+    if (!m_pDevice->open(this)) {
+        // 竞态：确认期间 Apple 又把设备抢回去了，放弃本轮、重新闩锁。
+        XYLog("rescue: device re-held by Apple, abort reset\n");
+        m_appleHeld = true;
+        return;
+    }
+    IOReturn rc = m_pDevice->reset();
+    XYLog("rescue: reset()=0x%x, device reenumerating, firmware will reload\n", rc);
+    m_pDevice->close(this);
+    // reset 触发 terminate → 我们的 stop()（定时器摘除）→ 设备重枚举 →
+    // start() 重新武装。若 port reset 救不回来，下一轮枚举失败，维持原状。
 }
 
 void IntelBluetoothFirmware::publishReg(bool isSucceed, const char *fwName)
