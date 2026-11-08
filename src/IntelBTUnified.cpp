@@ -225,6 +225,10 @@ static unsigned int leCcSeen {};     // 元子事件 0x01（Connection Complete�
 static unsigned int leAsyncMatch {}; // 1.9.28: 异步入口 that==hookPipeInstance 命中数（1.9.29 起仅作历史对照，恒 0 属预期）
 static int  leRemoteReads {};        // 1.9.29: 0x2016 开窗计数（if-lensman remoteReadSCount 方案，>0 时 IOSource 钩子才包装）
 static unsigned int leCmd2016 {};    // 1.9.29: 命令钩子捕获到的 0x2016 命令数
+static unsigned int leCmdAll {};     // 1.9.30: deviceRequest 钩子入口总数（路由是否安装）
+static unsigned int leCmdHci {};     // 1.9.30: 成功读到 opcode 的请求数（读路径是否工作）
+static unsigned int leCmdDev {};     // 1.9.30: 通过 isIntelBluetooth 的请求数（过滤器是否失配）
+static unsigned int lePipeCap {};    // 1.9.30: Intel 中断管道捕获成功次数（init 钩子是否触发）
 
 static inline uint16_t leHandleOfEvent(const HciEventHdr *hdr) {
     // Read Remote Features Complete: [0]=subevent 0x04, [1]=status, [2..3]=handle
@@ -644,6 +648,7 @@ static void captureIntelInterruptPipe(void *that, IOUSBHostDevice *device, Stand
             // registra: una captura fallida explica los fallos de conexion en frio.
             SYSLOG(MODULE_IBTP, "[PATCH] event pipe captured %p (was %p)", that, hookPipeInstance);
             hookPipeInstance = that;
+            __atomic_add_fetch(&lePipeCap, 1, __ATOMIC_RELAXED);
         }
     }
 }
@@ -664,14 +669,19 @@ static int newInitPipeConfig(void *that, StandardUSB::EndpointDescriptor const *
 }
 
 static IOReturn newHostDeviceRequest(void *that, IOService *provider, StandardUSB::DeviceRequest &request, void *data, IOMemoryDescriptor *descriptor, unsigned int &length, IOUSBHostCompletion *completion, unsigned int timeout) {
-    // Solo comandos HCI (clase, host->dispositivo, bRequest 0) de un controlador
-    // Bluetooth Intel conocido (antes se inspeccionaba cualquier dispositivo USB).
+    // 1.9.30: lsh v2.5.1 口径——对所有 deviceRequest 无预过滤地读 opcode（data 内联
+    // 或 descriptor 都试）。被动匹配零风险（他全量发行的行为）；主动写（random
+    // address 注入、补发重执行）仍限 Intel 设备。旧的四层预过滤只要一层在
+    // 26.7.3 失配，0x2016 就永远看不到（1.9.29 实测 IBTLeCmd2016=0）。
+    __atomic_add_fetch(&leCmdAll, 1, __ATOMIC_RELAXED);
     auto dev = OSDynamicCast(IOUSBHostDevice, reinterpret_cast<OSObject *>(that));
-    if (dev && isIntelBluetooth(dev) && request.wLength >= HCI_CMD_HDR_SIZE && request.bRequest == 0 &&
-        (request.bmRequestType & kDeviceRequestDirectionMask) == (kRequestDirectionOut << kDeviceRequestDirectionPhase) &&
-        (request.bmRequestType & kDeviceRequestTypeMask) == (kRequestTypeClass << kDeviceRequestTypePhase)) {
-        uint8_t hciBuf[MAX_HCI_BUF_LEN] = {};
-        const HciCommandHdr *hdr = nullptr;
+    const bool intelDev = dev && isIntelBluetooth(dev);
+    if (intelDev)
+        __atomic_add_fetch(&leCmdDev, 1, __ATOMIC_RELAXED);
+
+    uint8_t hciBuf[MAX_HCI_BUF_LEN] = {};
+    const HciCommandHdr *hdr = nullptr;
+    if (request.wLength >= HCI_CMD_HDR_SIZE) {
         if (data != nullptr) {
             hdr = static_cast<const HciCommandHdr *>(data);
         } else if (descriptor != nullptr && descriptor->getLength() >= HCI_CMD_HDR_SIZE) {
@@ -684,7 +694,10 @@ static IOReturn newHostDeviceRequest(void *that, IOService *provider, StandardUS
                 hdr = reinterpret_cast<const HciCommandHdr *>(hciBuf);
             }
         }
-        if (hdr) {
+    }
+    if (hdr)
+        __atomic_add_fetch(&leCmdHci, 1, __ATOMIC_RELAXED);
+    if (hdr) {
             if (hdr->opcode == HCI_OP_RESET) {
                 // Tras un reset hay que volver a enviar la direccion y olvidar el estado
                 // de las conexiones anteriores (el controlador las ha perdido).
@@ -692,7 +705,7 @@ static IOReturn newHostDeviceRequest(void *that, IOService *provider, StandardUS
                 leClearAllSlots("hci reset");
                 __atomic_store_n(&leRemoteReads, 0, __ATOMIC_SEQ_CST);  // 1.9.29: 关窗
             } else if (hdr->opcode == HCI_OP_LE_SET_SCAN_PARAM) {
-                if (__atomic_exchange_n(&randomAddrSent, 1, __ATOMIC_SEQ_CST) == 0)
+                if (intelDev && __atomic_exchange_n(&randomAddrSent, 1, __ATOMIC_SEQ_CST) == 0)
                     sendRandomAddress(that, provider, timeout);
             } else if (hdr->opcode == HCI_OP_LE_READ_REMOTE_FEATURES) {
                 // #514: enviar DOS lecturas extra -> dos eventos 0x04 duplicados que se
@@ -712,17 +725,16 @@ static IOReturn newHostDeviceRequest(void *that, IOService *provider, StandardUS
                         __atomic_store_n(&leRemoteReads, 2, __ATOMIC_SEQ_CST);  // 防窗口卡死
                     __atomic_add_fetch(&leCmd2016, 1, __ATOMIC_RELAXED);
                 }
-                if (data == nullptr) {
+                if (intelDev && data == nullptr) {
                     FunctionCast(newHostDeviceRequest, oldHostDeviceRequest)(that, provider, request, nullptr, descriptor, length, nullptr, timeout);
                     FunctionCast(newHostDeviceRequest, oldHostDeviceRequest)(that, provider, request, nullptr, descriptor, length, nullptr, timeout);
-                } else {
+                } else if (intelDev) {
                     // Tahoe 内联 payload：同样补发两次额外读取（第三次是函数尾部的主请求）。
                     FunctionCast(newHostDeviceRequest, oldHostDeviceRequest)(that, provider, request, data, descriptor, length, nullptr, timeout);
                     FunctionCast(newHostDeviceRequest, oldHostDeviceRequest)(that, provider, request, data, descriptor, length, nullptr, timeout);
                 }
             }
             DIAGLOG(MODULE_IBTP, "opcode: 0x%04x len: %u wLength: %u async: %d", hdr->opcode, hdr->len, request.wLength, completion != nullptr);
-        }
     }
     return FunctionCast(newHostDeviceRequest, oldHostDeviceRequest)(that, provider, request, data, descriptor, length, completion, timeout);
 }
@@ -1861,6 +1873,10 @@ void ibtDiagFill(IbtDiagSnapshot *out) {
     out->leAsyncMatch = __atomic_load_n(&leAsyncMatch, __ATOMIC_RELAXED);
     out->leRemoteReads= (unsigned int)__atomic_load_n(&leRemoteReads, __ATOMIC_RELAXED);
     out->leCmd2016    = __atomic_load_n(&leCmd2016, __ATOMIC_RELAXED);
+    out->leCmdAll     = __atomic_load_n(&leCmdAll, __ATOMIC_RELAXED);
+    out->leCmdHci     = __atomic_load_n(&leCmdHci, __ATOMIC_RELAXED);
+    out->leCmdDev     = __atomic_load_n(&leCmdDev, __ATOMIC_RELAXED);
+    out->lePipeCap    = __atomic_load_n(&lePipeCap, __ATOMIC_RELAXED);
     {
         const char *bid = BaseDeviceInfo::get().boardIdentifier;
         size_t n = 0;

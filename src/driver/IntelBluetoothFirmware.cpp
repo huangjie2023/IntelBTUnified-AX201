@@ -152,6 +152,10 @@ void ibtDiagPublishLive()
     svc->setProperty("IBTLeAsyncMatch", (unsigned long long)s.leAsyncMatch, 32);
     svc->setProperty("IBTLeRemoteReads", (unsigned long long)(int)s.leRemoteReads, 32);
     svc->setProperty("IBTLeCmd2016", (unsigned long long)s.leCmd2016, 32);
+    svc->setProperty("IBTCmdAll", (unsigned long long)s.leCmdAll, 32);
+    svc->setProperty("IBTCmdHci", (unsigned long long)s.leCmdHci, 32);
+    svc->setProperty("IBTCmdDev", (unsigned long long)s.leCmdDev, 32);
+    svc->setProperty("IBTPipeCap", (unsigned long long)s.lePipeCap, 32);
     // 1.9.11：cs_validate_page 入口漏斗。判读见 IbtDiag.h。
     svc->setProperty("IBTCsAll", (unsigned long long)s.csAll, 32);
     svc->setProperty("IBTCsPathFail", (unsigned long long)s.csPathFail, 32);
