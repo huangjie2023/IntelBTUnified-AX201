@@ -183,6 +183,9 @@ struct IbtDiagSnapshot {
     unsigned int leCmd2016Rjj;   // 1.9.31: 同步 Rjj 调用后识别到的 0x2016（已含开窗+补发）
     unsigned int leRjjReadOk;    // 1.9.33: Rjj 调用后探测读成功数（1.9.26 实证安全位置）
     unsigned int leRjjReadFail;  // 1.9.33: Rjj 调用后探测读失败数（Fail 占多数 = 缓冲区不可读）
+    unsigned int leRjjRetFail;   // 1.9.34: Rjj 原函数返回非 Success 次数
+    unsigned int leRjjBufNull;   // 1.9.34: dataBuffer 为空次数
+    unsigned int leRjjBufShort;  // 1.9.34: 缓冲长度 < 3 次数
     unsigned int leCmdAll;     // deviceRequest 钩子入口总数（路由是否安装）
     unsigned int leCmdHci;     // 成功读到 opcode 的请求数（读路径是否工作）
     unsigned int leCmdDev;     // 通过 isIntelBluetooth 的请求数（过滤器是否失配）

@@ -231,8 +231,11 @@ static unsigned int leCmdDev {};     // 1.9.30: 通过 isIntelBluetooth 的请�
 static unsigned int lePipeCap {};    // 1.9.30: Intel 中断管道捕获成功次数（init 钩子是否触发）
 static unsigned int leCmd2016Async {};// 1.9.31: 异步 Completion 入口识别到的 0x2016（判命令走哪条路）
 static unsigned int leCmd2016Rjj {};  // 1.9.31: 同步 Rjj 入口识别到的 0x2016（已含开窗+补发）
-static unsigned int leRjjReadOk {};   // 1.9.32: Rjj 入口 3 字节探测读成功数（缓冲区可读性）
-static unsigned int leRjjReadFail {}; // 1.9.32: Rjj 入口探测读失败数（readBytes 不可用则整层改写路线存疑）
+static unsigned int leRjjReadOk {};   // 1.9.32: Rjj 探测读成功数（缓冲区可读性）
+static unsigned int leRjjReadFail {}; // 1.9.32: Rjj 探测读失败数（readBytes 不可用则整层改写路线存疑）
+static unsigned int leRjjRetFail {};  // 1.9.34: Rjj 原函数返回非 Success 的次数
+static unsigned int leRjjBufNull {};  // 1.9.34: Rjj 的 dataBuffer 为空的次数
+static unsigned int leRjjBufShort {}; // 1.9.34: Rjj 的缓冲长度 < 3 的次数
 
 static inline uint16_t leHandleOfEvent(const HciEventHdr *hdr) {
     // Read Remote Features Complete: [0]=subevent 0x04, [1]=status, [2..3]=handle
@@ -604,31 +607,42 @@ static IOReturn newIOSourceIORjj(void *that, IOMemoryDescriptor* dataBuffer, uin
     // 返回后、调用方释放前，OUT 命令缓冲内容仍在，读它做 0x2016 识别完全等价。
     __atomic_add_fetch(&leHookRjj, 1, __ATOMIC_RELAXED);
     IOReturn ret = FunctionCast(newIOSourceIORjj, oldIOSourceIORjj)(that, dataBuffer, dataBufferLength, bytesTransferred, completionTimeoutMs);
-    if (ret == kIOReturnSuccess && !leRewriteDisabled && dataBuffer && dataBuffer->getLength() >= 3) {
-        uint8_t cmdHead[3] = {};
-        const bool probeOk = dataBuffer->readBytes(0, cmdHead, 3) == 3;
-        if (probeOk)
-            __atomic_add_fetch(&leRjjReadOk, 1, __ATOMIC_RELAXED);
-        else
-            __atomic_add_fetch(&leRjjReadFail, 1, __ATOMIC_RELAXED);
-        if (probeOk && dataBuffer->getLength() >= 5 &&
-            cmdHead[0] == (HCI_OP_LE_READ_REMOTE_FEATURES & 0xFF) &&
-            cmdHead[1] == ((HCI_OP_LE_READ_REMOTE_FEATURES >> 8) & 0xFF) &&
-            cmdHead[2] == 0x02) {
-            uint8_t hbuf[2] = {};
-            uint16_t handle = 0;
-            if (dataBuffer->readBytes(3, hbuf, 2) == 2)
-                handle = (uint16_t)((hbuf[0] | (hbuf[1] << 8)) & 0x0FFF);
-            leRegisterSlot(handle);
-            unsigned int prev = __atomic_add_fetch(&leRemoteReads, 2, __ATOMIC_SEQ_CST);
-            if (prev > 16)
-                __atomic_store_n(&leRemoteReads, 2, __ATOMIC_SEQ_CST);
-            __atomic_add_fetch(&leCmd2016, 1, __ATOMIC_RELAXED);
-            __atomic_add_fetch(&leCmd2016Rjj, 1, __ATOMIC_RELAXED);
-            // 补发两次同样的读取（第三次是刚发过的真实命令）。同步串行，共用调用
-            // 方的描述符；补发走 old 指针不回钩子，无递归。
-            FunctionCast(newIOSourceIORjj, oldIOSourceIORjj)(that, dataBuffer, dataBufferLength, bytesTransferred, completionTimeoutMs);
-            FunctionCast(newIOSourceIORjj, oldIOSourceIORjj)(that, dataBuffer, dataBufferLength, bytesTransferred, completionTimeoutMs);
+    // 1.9.34: 分流计数——1.9.33 读数 ReadOk/ReadFail 同时为 0，探测块从未进入，
+    // 但无法区分是 ret 非 Success、开关被关、还是缓冲不合法。每条岔路单独计数，
+    // 下一轮读数自解释，不再猜。
+    if (!leRewriteDisabled) {
+        if (ret != kIOReturnSuccess) {
+            __atomic_add_fetch(&leRjjRetFail, 1, __ATOMIC_RELAXED);
+        } else if (!dataBuffer) {
+            __atomic_add_fetch(&leRjjBufNull, 1, __ATOMIC_RELAXED);
+        } else if (dataBuffer->getLength() < 3) {
+            __atomic_add_fetch(&leRjjBufShort, 1, __ATOMIC_RELAXED);
+        } else {
+            uint8_t cmdHead[3] = {};
+            const bool probeOk = dataBuffer->readBytes(0, cmdHead, 3) == 3;
+            if (probeOk)
+                __atomic_add_fetch(&leRjjReadOk, 1, __ATOMIC_RELAXED);
+            else
+                __atomic_add_fetch(&leRjjReadFail, 1, __ATOMIC_RELAXED);
+            if (probeOk && dataBuffer->getLength() >= 5 &&
+                cmdHead[0] == (HCI_OP_LE_READ_REMOTE_FEATURES & 0xFF) &&
+                cmdHead[1] == ((HCI_OP_LE_READ_REMOTE_FEATURES >> 8) & 0xFF) &&
+                cmdHead[2] == 0x02) {
+                uint8_t hbuf[2] = {};
+                uint16_t handle = 0;
+                if (dataBuffer->readBytes(3, hbuf, 2) == 2)
+                    handle = (uint16_t)((hbuf[0] | (hbuf[1] << 8)) & 0x0FFF);
+                leRegisterSlot(handle);
+                unsigned int prev = __atomic_add_fetch(&leRemoteReads, 2, __ATOMIC_SEQ_CST);
+                if (prev > 16)
+                    __atomic_store_n(&leRemoteReads, 2, __ATOMIC_SEQ_CST);
+                __atomic_add_fetch(&leCmd2016, 1, __ATOMIC_RELAXED);
+                __atomic_add_fetch(&leCmd2016Rjj, 1, __ATOMIC_RELAXED);
+                // 补发两次同样的读取（第三次是刚发过的真实命令）。同步串行，共用调用
+                // 方的描述符；补发走 old 指针不回钩子，无递归。
+                FunctionCast(newIOSourceIORjj, oldIOSourceIORjj)(that, dataBuffer, dataBufferLength, bytesTransferred, completionTimeoutMs);
+                FunctionCast(newIOSourceIORjj, oldIOSourceIORjj)(that, dataBuffer, dataBufferLength, bytesTransferred, completionTimeoutMs);
+            }
         }
     }
     // 同步路径：数据已经拿到，改写缓冲区即可（bytesTransferred 是出/入参）。
@@ -1919,6 +1933,9 @@ void ibtDiagFill(IbtDiagSnapshot *out) {
     out->leCmd2016Rjj = __atomic_load_n(&leCmd2016Rjj, __ATOMIC_RELAXED);
     out->leRjjReadOk = __atomic_load_n(&leRjjReadOk, __ATOMIC_RELAXED);
     out->leRjjReadFail = __atomic_load_n(&leRjjReadFail, __ATOMIC_RELAXED);
+    out->leRjjRetFail = __atomic_load_n(&leRjjRetFail, __ATOMIC_RELAXED);
+    out->leRjjBufNull = __atomic_load_n(&leRjjBufNull, __ATOMIC_RELAXED);
+    out->leRjjBufShort = __atomic_load_n(&leRjjBufShort, __ATOMIC_RELAXED);
     out->leCmdHci     = __atomic_load_n(&leCmdHci, __ATOMIC_RELAXED);
     out->leCmdDev     = __atomic_load_n(&leCmdDev, __ATOMIC_RELAXED);
     out->lePipeCap    = __atomic_load_n(&lePipeCap, __ATOMIC_RELAXED);
