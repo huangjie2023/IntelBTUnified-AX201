@@ -192,6 +192,10 @@ void ibtDiagPublishLive();
 // teardown 在 stop() 里调用，abort 全部 UPL 并释放 vnode 引用。
 void ibtWireProcess();
 void ibtWireTeardown();
+// 1.9.24: 唤醒重钉请求。驱动层在 setPowerState(唤醒) 里调用，下一次
+// ibtWireProcess()（diag timer，同时被收紧到 1s）会 abort 旧 UPL 并重建，
+// 兜底"睡眠路径让 IO_WIRE 失效但引用还在"的场景。
+void ibtWireRewireRequest();
 
 // ---------------------------------------------------------------------------
 // 1.9.21：传输死亡自动救砖（wedge 自愈）。

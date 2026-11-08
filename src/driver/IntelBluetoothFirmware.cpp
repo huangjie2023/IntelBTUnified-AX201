@@ -387,6 +387,16 @@ IOReturn IntelBluetoothFirmware::setPowerState(unsigned long powerStateOrdinal, 
     // 1.9.5: 每次睡眠/唤醒都刷新一次快照，休眠前的那一份正好覆盖上一轮唤醒
     // 期间累计的 swallowed 计数（唤醒瞬间的快照早于 bluetoothd 缺页）。
     ++gPmEvents;
+    // 1.9.24: 唤醒时请求重钉补丁页组（powerStateOrdinal 0 = 睡眠，1 = 唤醒）。
+    // 实测 2026-11-08：唤醒后 2s BlueTool SIGBUS（APFS 组校验混合失败），睡眠路径
+    // 上 UPL 的 IO_WIRE 可能失效。这里只置请求标志（PM 上下文不能建 UPL/fault 页），
+    // 真正的重建在下一次 diag timer 的 workloop 上下文里做。同时把定时器收紧到
+    // 1s，把"唤醒 → 重钉完成"的无保护窗口从最长 15s 压到 ~1s。
+    if (powerStateOrdinal != 0) {
+        ibtWireRewireRequest();
+        if (m_pDiagTimer)
+            m_pDiagTimer->setTimeoutMS(1000);
+    }
     ibtDiagPublishLive();
     return IOPMAckImplied;
 }

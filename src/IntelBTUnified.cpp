@@ -45,6 +45,23 @@
 //  注意：本机与两份独立案例的对照组均已排除介质/盘上数据——不命中只能说明“我们的
 //  采样没覆盖到”，不能反推盘坏。
 //
+//  1.9.24: 两条线。
+//  (a) BLE 鼠标配对（IntelBluetoothFirmware #514 的 Tahoe 分支）：
+//      本机实测（bt-pair3.log）连接/GATT 全通，之后 30 秒完全静默（零 SMP/零 GATT
+//      发现），设置界面转圈超时。classicPaired=0/lePaired=0 排除陈旧 Bond。机理 =
+//      Tahoe 上 IOUSBHostPipe::io 尾跳进 IOUSBHostIOSource::io 的三条重载之一，
+//      只挂 Pipe 一条时部分事件/数据路径到不了主机。修复：Tahoe 起挂全三条
+//      （Completion / Rjj / Bundled，符号取自 if-lensman 实测成功实现）；Completion
+//      挂上后停掉 Pipe 层包装防双重改写；重写逻辑抽成 leProcessBuffer 四路共用。
+//      Rjj（同步栈对象）先调原函数再改写；Bundled 逐项改写 actualByteCountArray。
+//  (b) A 类崩溃加固（2026-11-08 16:05 唤醒后 2s BlueTool SIGBUS，APFS compressed
+//      hash mismatch，与 bluetoothd 历史崩溃同签名）：
+//      ① _apfs_pagein_with_verification 从纯计数探针升级为吞错（bt vnode + EBADMSG
+//        门控不变）——带吞错的 _apfs_vnop_verify/_decmpfs_validate 这次没接住，
+//        "带校验的 pagein"本身就是失败路径最直接的宿主；
+//      ② 唤醒重钉：setPowerState(唤醒) 置请求，diag timer（同时收紧到 1s）在
+//        workloop 里 abort 旧 UPL、重建新 UPL，兜底"睡眠让 IO_WIRE 失效但引用还在"。
+//
 //  Solo macOS 12 (Monterey) o posterior: los parches de macOS 11 y anteriores se han eliminado.
 //
 //  1.9.2: 修掉 1.9.1 吞错的实际失效原因（顺序依赖 bug）。
@@ -75,6 +92,8 @@
 
 #include <IOKit/IOBufferMemoryDescriptor.h>
 #include <IOKit/usb/IOUSBHostDevice.h>
+// 1.9.24: IOUSBHostBundledCompletion / IOUSBHostBundledCompletionAction 定义在这里。
+#include <IOKit/usb/IOUSBHostIOSource.h>
 #include <sys/proc.h>
 #include <sys/random.h>
 #include <sys/errno.h>
@@ -120,12 +139,24 @@ typedef struct {
     void *owner;
     IOMemoryDescriptor *dataBuffer;
     IOUSBHostCompletionAction action;
+    // 1.9.24: Bundled 路径（IOUSBHostIOSource::io 第三条重载）的回调。
+    // 同一 owner 结构按路径二选一：Completion 用 action，Bundled 用 bundledAction。
+    IOUSBHostBundledCompletionAction bundledAction;
 } AsyncOwnerData;
 
 static mach_vm_address_t oldHostDeviceRequest {};
 static mach_vm_address_t oldAsyncIO {};
 static mach_vm_address_t oldInitPipe {};
 static mach_vm_address_t oldInitPipeConfig {};
+// 1.9.24 (#514): Tahoe 上 IOUSBHostPipe::io 尾跳进 IOUSBHostIOSource::io 的三条
+// 重载之一（Completion / Rjj / Bundled）。只挂 Pipe 一条时部分事件路径到不了主机，
+// 症状 = BLE HID 连接建立后完全静默（SMP/GATT 包丢失），30 秒后设置界面超时断开。
+static mach_vm_address_t oldIOSourceIOCompletion {};
+static mach_vm_address_t oldIOSourceIORjj {};
+static mach_vm_address_t oldIOSourceIOBundled {};
+// Completion 重载路由成功后，Pipe 层的包装必须停掉：两边都包装会把同一完成回调
+// 套两层 owner（重写跑两次 + 双重 delete 链），这是 #514 实测作者的同样做法。
+static bool iosourceCompletionRouted = false;
 
 // El original usaba una direccion constante igual para todo el mundo. Ahora se genera
 // una por arranque. Una direccion estatica aleatoria BLE exige los dos bits altos a 1.
@@ -304,10 +335,13 @@ static const uint8_t fakePhyUpdateCompleteEvent[8] = {0x3E, 0x06, 0x0C, 0x00, 0x
 // 27 octets / 328us tx+rx.
 static const uint8_t fakeDataLengthChangeEvent[13] = {0x3E, 0x0B, 0x07, 0x00, 0x00, 0x1B, 0x00, 0x48, 0x01, 0x1B, 0x00, 0x48, 0x01};
 
-static void asyncIOCompletion(void* owner, void* parameter, IOReturn status, uint32_t bytesTransferred)
+// 1.9.24: 把完成回调里的读缓冲/改写/槽位过期逻辑抽出来，供四条路径共用：
+//   1. IOUSBHostPipe::io 的 completion（旧路径，Tahoe 之前的版本）
+//   2. IOUSBHostIOSource::io(IOUSBHostCompletion*)（Tahoe Completion 重载）
+//   3. IOUSBHostIOSource::io(uint32_t&)（Tahoe Rjj 同步重载——先调原函数再改写）
+//   4. IOUSBHostIOSource::io(IOUSBHostBundledCompletion*)（Tahoe Bundled 重载，逐项改写）
+static void leProcessBuffer(IOMemoryDescriptor* dataBuffer, uint32_t &bytesTransferred)
 {
-    AsyncOwnerData *asyncOwner = (AsyncOwnerData *)owner;
-    IOMemoryDescriptor* dataBuffer = asyncOwner->dataBuffer;
     uint32_t allocLen = bytesTransferred;
 
     if (dataBuffer && bytesTransferred) {
@@ -388,6 +422,14 @@ static void asyncIOCompletion(void* owner, void* parameter, IOReturn status, uin
             IOFree(buffer, allocLen);
         }
     }
+}
+
+static void asyncIOCompletion(void* owner, void* parameter, IOReturn status, uint32_t bytesTransferred)
+{
+    AsyncOwnerData *asyncOwner = (AsyncOwnerData *)owner;
+    IOMemoryDescriptor* dataBuffer = asyncOwner->dataBuffer;
+    if (dataBuffer && bytesTransferred)
+        leProcessBuffer(dataBuffer, bytesTransferred);
     if (asyncOwner->action)
         asyncOwner->action(asyncOwner->owner, parameter, status, bytesTransferred);
     delete asyncOwner;
@@ -395,10 +437,13 @@ static void asyncIOCompletion(void* owner, void* parameter, IOReturn status, uin
 
 static IOReturn newAsyncIO(void *that, IOMemoryDescriptor* dataBuffer, uint32_t bytesTransferred, IOUSBHostCompletion* completion, uint32_t completionTimeoutMs)
 {
-    if (!leRewriteDisabled && leActiveSlots > 0 && completion) {
+    // 1.9.24: Tahoe 上 Completion 重载已挂钩时必须让路（IOSource 层已覆盖 Pipe 层），
+    // 否则同一完成回调会被包两层。
+    if (!leRewriteDisabled && !iosourceCompletionRouted && leActiveSlots > 0 && completion) {
         if (that == hookPipeInstance) {
             AsyncOwnerData *ownerData = new AsyncOwnerData;
             ownerData->action = completion->action;
+            ownerData->bundledAction = nullptr;
             ownerData->owner = completion->owner;
             ownerData->dataBuffer = dataBuffer;
             completion->action = asyncIOCompletion;
@@ -411,6 +456,69 @@ static IOReturn newAsyncIO(void *that, IOMemoryDescriptor* dataBuffer, uint32_t 
         }
     }
     return FunctionCast(newAsyncIO, oldAsyncIO)(that, dataBuffer, bytesTransferred, completion, completionTimeoutMs);
+}
+
+// ---------------------------------------------------------------------------
+// 1.9.24 (#514): Tahoe 的三条 IOUSBHostIOSource::io 重载。
+//
+// 符号来自 if-lensman/Hackintosh-MacPro7-1-EFI（IntelBluetoothFirmware #514 的实测
+// 成功实现，HHKB BLE 键盘配对验证通过）：
+//   Completion: __ZN17IOUSBHostIOSource2ioEP18IOMemoryDescriptorjP19IOUSBHostCompletionj
+//   Rjj:        __ZN17IOUSBHostIOSource2ioEP18IOMemoryDescriptorjRjj
+//   Bundled:    __ZN17IOUSBHostIOSource2ioEP18IOMemoryDescriptorjP26IOUSBHostBundledCompletionj
+// 门控只看 leActiveSlots>0（重写窗口极短：只在 0x2016 双发与第三个事件之间），
+// 不按 that 过滤——Tahoe 上事件可能由非 Pipe 的 IOSource 实例投递（#514 实测
+// 作者为了行为二分也去掉了该过滤）。Rjj 是同步路径：栈对象、先调原函数再改写。
+// ---------------------------------------------------------------------------
+static IOReturn newIOSourceIOCompletion(void *that, IOMemoryDescriptor* dataBuffer, uint32_t dataBufferLength, IOUSBHostCompletion* completion, uint32_t completionTimeoutMs)
+{
+    if (!leRewriteDisabled && leActiveSlots > 0 && completion) {
+        AsyncOwnerData *ownerData = new AsyncOwnerData;
+        ownerData->action = completion->action;
+        ownerData->bundledAction = nullptr;
+        ownerData->owner = completion->owner;
+        ownerData->dataBuffer = dataBuffer;
+        completion->action = asyncIOCompletion;
+        completion->owner = ownerData;
+    }
+    return FunctionCast(newIOSourceIOCompletion, oldIOSourceIOCompletion)(that, dataBuffer, dataBufferLength, completion, completionTimeoutMs);
+}
+
+static IOReturn newIOSourceIORjj(void *that, IOMemoryDescriptor* dataBuffer, uint32_t dataBufferLength, uint32_t &bytesTransferred, uint32_t completionTimeoutMs)
+{
+    IOReturn ret = FunctionCast(newIOSourceIORjj, oldIOSourceIORjj)(that, dataBuffer, dataBufferLength, bytesTransferred, completionTimeoutMs);
+    // 同步路径：数据已经拿到，改写缓冲区即可（bytesTransferred 是出/入参）。
+    if (ret == kIOReturnSuccess && !leRewriteDisabled && leActiveSlots > 0)
+        leProcessBuffer(dataBuffer, bytesTransferred);
+    return ret;
+}
+
+static void asyncBundledCompletion(void* owner, uint32_t ioCompletionCount, IOMemoryDescriptor** dataBufferArray, void** parameter, IOReturn* statusArray, uint32_t* actualByteCountArray)
+{
+    AsyncOwnerData *asyncOwner = (AsyncOwnerData *)owner;
+    if (asyncOwner->bundledAction && dataBufferArray && actualByteCountArray) {
+        for (uint32_t i = 0; i < ioCompletionCount; i++) {
+            uint32_t bytes = actualByteCountArray[i];
+            leProcessBuffer(dataBufferArray[i], bytes);
+            actualByteCountArray[i] = bytes;
+        }
+        asyncOwner->bundledAction(asyncOwner->owner, ioCompletionCount, dataBufferArray, parameter, statusArray, actualByteCountArray);
+    }
+    delete asyncOwner;
+}
+
+static IOReturn newIOSourceIOBundled(void *that, IOMemoryDescriptor* dataBuffer, uint32_t dataBufferLength, IOUSBHostBundledCompletion* completion, uint32_t completionTimeoutMs)
+{
+    if (!leRewriteDisabled && leActiveSlots > 0 && completion) {
+        AsyncOwnerData *ownerData = new AsyncOwnerData;
+        ownerData->action = nullptr;
+        ownerData->bundledAction = completion->action;
+        ownerData->owner = completion->owner;
+        ownerData->dataBuffer = nullptr;   // Bundled 的数据在数组里，回调中逐项处理
+        completion->action = asyncBundledCompletion;
+        completion->owner = ownerData;
+    }
+    return FunctionCast(newIOSourceIOBundled, oldIOSourceIOBundled)(that, dataBuffer, dataBufferLength, completion, completionTimeoutMs);
 }
 
 static void captureIntelInterruptPipe(void *that, IOUSBHostDevice *device, StandardUSB::EndpointDescriptor const *descriptor) {
@@ -526,6 +634,32 @@ static void processUSBHost(KernelPatcher &patcher, size_t index, mach_vm_address
     } else {
         SYSLOG(MODULE_IBTP, "failed to resolve symbols, error = %d", patcher.getError());
         patcher.clearError();
+    }
+    // 1.9.24 (#514): Tahoe 的三条 IOUSBHostIOSource::io 重载。逐条单独提交，
+    // 任何一条失败不影响其它（Completion 挂上就停掉 Pipe 层包装）。
+    if (getKernelVersion() >= KernelVersion::Tahoe) {
+        int routed = 0;
+        KernelPatcher::RouteRequest iosourceRequests[3] {
+            {"__ZN17IOUSBHostIOSource2ioEP18IOMemoryDescriptorjP19IOUSBHostCompletionj",
+                newIOSourceIOCompletion, oldIOSourceIOCompletion},
+            {"__ZN17IOUSBHostIOSource2ioEP18IOMemoryDescriptorjRjj",
+                newIOSourceIORjj, oldIOSourceIORjj},
+            {"__ZN17IOUSBHostIOSource2ioEP18IOMemoryDescriptorjP26IOUSBHostBundledCompletionj",
+                newIOSourceIOBundled, oldIOSourceIOBundled},
+        };
+        for (size_t i = 0; i < arrsize(iosourceRequests); i++) {
+            patcher.routeMultiple(index, &iosourceRequests[i], 1, address, size);
+            if (patcher.getError() == KernelPatcher::Error::NoError)
+                routed++;
+            else
+                patcher.clearError();
+        }
+        if (routed == 3) {
+            iosourceCompletionRouted = true;
+            SYSLOG(MODULE_IBTP, "IOSource::io 3/3 overloads routed (Tahoe LE event paths covered)");
+        } else {
+            SYSLOG(MODULE_IBTP, "IOSource::io overloads routed %d/3 (Pipe completion stays active)", routed);
+        }
     }
 }
 
@@ -757,6 +891,12 @@ static uint32_t apfsUncOnBt = 0;
 static uint32_t apfsRlAll = 0;
 static uint32_t apfsRlOnBt = 0;
 static bool apfsVerifyArmed = false;
+// 1.9.24: _apfs_pagein_with_verification 的吞错武装。2026-11-08 16:05 的 BlueTool
+// SIGBUS（唤醒后 2s、APFS compressed hash mismatch、pagein error 94）证明带吞错的
+// _apfs_vnop_verify 与 _decmpfs_validate_compressed_file 都没接住这次失败——
+// 而这个函数的名字直说"带校验的 pagein"，正是压缩组校验失败最直接的宿主。
+// 门控与其它吞错钩子完全一致：bt vnode 定域 + EBADMSG（handleBtVerifyError）。
+static bool apfsPiBypassArmed = false;
 // 1.9.9: 1.9.8 实机 SymMask=13（只有 bit0/2/3），四条 APFS 路由全部失败、计数器全 0。
 // 原因不是符号不存在（字符串枚举确认过），而是**查错了符号表**：
 // APFS 是 kext，它的内部函数是局部符号（只被同文件的 vnode 操作表引用，不进内核导出表），
@@ -849,9 +989,50 @@ static inline void wireEnqueue(vnode_t vp, uint64_t pageOffset) {
     __atomic_fetch_add(&wireQueuedCount, 1, __ATOMIC_RELAXED);
 }
 
+// 1.9.24: 唤醒重钉。1.9.20 已把 teardown 挪出 stop()（UPL 跨 stop/start 持有），
+// 但 2026-11-08 16:05 的 BlueTool SIGBUS 仍发生在唤醒后 2 秒——睡眠路径上某处
+// （休眠镜像往返 / VM 处理）可能让 UPL 的 IO_WIRE 失效而引引用还在。兜底：
+// 每次唤醒由 setPowerState 置位请求，下一次 diag timer（被同时收紧到 1s）在
+// workloop 上下文里 abort 旧 UPL、重建新 UPL（page list 会把仍驻留的补丁页
+// 重新钉住）。重建本身无害：abort+create 不改变页内容，只重申 wire 计数。
+static bool wireRewirePending = false;
+static uint32_t wireRewireCount = 0;
+
+void ibtWireRewireRequest() {
+    __atomic_store_n(&wireRewirePending, true, __ATOMIC_RELEASE);
+}
+
+static inline void wireRewireIfRequested() {
+    if (!__atomic_exchange_n(&wireRewirePending, false, __ATOMIC_ACQ_REL))
+        return;
+    uint32_t n = __atomic_load_n(&wireEntryCount, __ATOMIC_ACQUIRE);
+    uint32_t unwound = 0;
+    for (uint32_t i = 0; i < n && i < kMaxWireEntries; i++) {
+        WireEntry &e = wireEntries[i];
+        if (e.vp == nullptr)
+            continue;
+        if (__atomic_load_n(&e.wired, __ATOMIC_ACQUIRE)) {
+            int kr = ubc_upl_abort(static_cast<upl_t>(e.upl), kUplAbortFlags);
+            __atomic_store_n(&e.wired, false, __ATOMIC_RELEASE);
+            if (kr == 0) {
+                __atomic_fetch_sub(&wireActiveCount, 1, __ATOMIC_RELAXED);
+                unwound++;
+            } else {
+                __atomic_fetch_add(&wireAbortFail, 1, __ATOMIC_RELAXED);
+                __atomic_store_n(&wireLastError, (uint32_t)kr, __ATOMIC_RELAXED);
+            }
+        }
+        // 无论原来是否 wired：标记未处理，让下面的常规流程重建。
+        __atomic_store_n(&e.done, false, __ATOMIC_RELEASE);
+    }
+    __atomic_fetch_add(&wireRewireCount, 1, __ATOMIC_RELAXED);
+    SYSLOG(MODULE_IBTP, "wire rewire #%u after wake: %u UPLs unwound for re-pinning", wireRewireCount, unwound);
+}
+
 void ibtWireProcess() {
     if (!__atomic_load_n(&wireArmed, __ATOMIC_ACQUIRE))
         return;
+    wireRewireIfRequested();
     uint32_t n = __atomic_load_n(&wireEntryCount, __ATOMIC_ACQUIRE);
     for (uint32_t i = 0; i < n && i < kMaxWireEntries; i++) {
         WireEntry &e = wireEntries[i];
@@ -1276,15 +1457,24 @@ static int patched_apfs_vnop_verify(vnode_t vp, off_t offset, void *a3, void *a4
     return handleBtVerifyError(vp, offset, 0, err, onBt);
 }
 
-// 下面三个只计数，不改变行为——它们是"如果不是 vop_verify，那到底是哪个"的定位探针。
+// 下面两个只计数，不改变行为——它们是"如果不是 vop_verify，那到底是哪个"的定位探针。
 // 每个都必须有自己独立的 orig 指针，共用会被后一次路由覆盖，先装的钩子转发进错函数。
 static mach_vm_address_t orig_apfs_pagein_verif {};
 
+// 1.9.24: 从"只计数"升级为"计数 + 吞错"（理由见 apfsPiBypassArmed 处注释）。
+// 前几版只计数的形态保留在计数器里：apfsPiAll / apfsPiOnBt 语义不变，
+// 吞掉与否由 handleBtVerifyError 的统一判据决定（bt vnode + EBADMSG）。
 static int patched_apfs_pagein_verif(vnode_t vp, off_t offset, void *a3, void *a4, void *a5, void *a6, void *a7, void *a8, void *a9) {
+    int err = FunctionCast(patched_apfs_pagein_verif, orig_apfs_pagein_verif)(vp, offset, a3, a4, a5, a6, a7, a8, a9);
     __atomic_fetch_add(&apfsPiAll, 1, __ATOMIC_RELAXED);
-    if (vp != nullptr && isBtVnode(vp))
-        __atomic_fetch_add(&apfsPiOnBt, 1, __ATOMIC_RELAXED);
-    return FunctionCast(patched_apfs_pagein_verif, orig_apfs_pagein_verif)(vp, offset, a3, a4, a5, a6, a7, a8, a9);
+    bool onBt = (vp != nullptr && isBtVnode(vp));
+    if (!onBt)
+        return err;
+    __atomic_fetch_add(&apfsPiOnBt, 1, __ATOMIC_RELAXED);
+    if (err == 0 || disableVerifyBypass || !apfsPiBypassArmed)
+        return err;
+    // bufsize 未知传 0：页偏移比对只是日志附注，不影响吞不吞。
+    return handleBtVerifyError(vp, offset, 0, err, onBt);
 }
 
 static mach_vm_address_t orig_apfs_verify_unc {};
@@ -1448,8 +1638,12 @@ static void processPatcher(KernelPatcher &patcher) {    const bool argOta    = c
     }
 
     KernelPatcher::RouteRequest apfsPageinRoute("_apfs_pagein_with_verification", patched_apfs_pagein_verif, orig_apfs_pagein_verif);
-    if (routeApfs(apfsPageinRoute))
+    if (routeApfs(apfsPageinRoute)) {
+        // 1.9.24: 吞错武装（原为纯计数探针）。
+        apfsPiBypassArmed = true;
         __atomic_fetch_or(&symMask, 0x20u, __ATOMIC_RELAXED);
+        SYSLOG(MODULE_BTLFX, "apfs_pagein_with_verification EBADMSG bypass armed (bluetoothd/BlueTool only)");
+    }
 
     KernelPatcher::RouteRequest apfsUncRoute("_apfs_verify_uncompressed_data", patched_apfs_verify_unc, orig_apfs_verify_unc);
     if (routeApfs(apfsUncRoute))
