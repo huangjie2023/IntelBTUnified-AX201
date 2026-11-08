@@ -222,7 +222,9 @@ static unsigned int leHookBundled {};// IOSource Bundled 重载包装入口次�
 static unsigned int leParsed {};     // 成功读到事件头（getLength>0 且 readBytes 完成）
 static unsigned int leEvt3E {};      // evt==0x3E（LE 元事件）计数
 static unsigned int leCcSeen {};     // 元子事件 0x01（Connection Complete）计数（含失败）
-static unsigned int leAsyncMatch {}; // 1.9.28: 异步入口 that==hookPipeInstance 命中数
+static unsigned int leAsyncMatch {}; // 1.9.28: 异步入口 that==hookPipeInstance 命中数（1.9.29 起仅作历史对照，恒 0 属预期）
+static int  leRemoteReads {};        // 1.9.29: 0x2016 开窗计数（if-lensman remoteReadSCount 方案，>0 时 IOSource 钩子才包装）
+static unsigned int leCmd2016 {};    // 1.9.29: 命令钩子捕获到的 0x2016 命令数
 
 static inline uint16_t leHandleOfEvent(const HciEventHdr *hdr) {
     // Read Remote Features Complete: [0]=subevent 0x04, [1]=status, [2..3]=handle
@@ -447,6 +449,9 @@ static void leProcessBuffer(IOMemoryDescriptor* dataBuffer, uint32_t &bytesTrans
                             slot->stage = 2;
                             slot->idle = 0;
                             __atomic_add_fetch(&leFakePhy, 1, __ATOMIC_RELAXED);
+                            // 1.9.29: 每个 fake 事件消耗一次窗口配额（+2/命令，两 fake 归零）。
+                            if (__atomic_sub_fetch(&leRemoteReads, 1, __ATOMIC_SEQ_CST) < 0)
+                                __atomic_store_n(&leRemoteReads, 0, __ATOMIC_SEQ_CST);
                             if (leLogBudget-- > 0)
                                 DIAGLOG(MODULE_IBTP, "le h=0x%03x -> fake PHY Update", handle);
                         } else {
@@ -457,6 +462,8 @@ static void leProcessBuffer(IOMemoryDescriptor* dataBuffer, uint32_t &bytesTrans
                             dataBuffer->writeBytes(0, dlc, sizeof(dlc));
                             bytesTransferred = 13;
                             __atomic_add_fetch(&leFakeDlc, 1, __ATOMIC_RELAXED);
+                            if (__atomic_sub_fetch(&leRemoteReads, 1, __ATOMIC_SEQ_CST) < 0)
+                                __atomic_store_n(&leRemoteReads, 0, __ATOMIC_SEQ_CST);
                             if (leLogBudget-- > 0)
                                 DIAGLOG(MODULE_IBTP, "le h=0x%03x -> fake Data Length Change (done)", handle);
                             slot->used = false;
@@ -540,32 +547,37 @@ static IOReturn newAsyncIO(void *that, IOMemoryDescriptor* dataBuffer, uint32_t 
 //   Completion: __ZN17IOUSBHostIOSource2ioEP18IOMemoryDescriptorjP19IOUSBHostCompletionj
 //   Rjj:        __ZN17IOUSBHostIOSource2ioEP18IOMemoryDescriptorjRjj
 //   Bundled:    __ZN17IOUSBHostIOSource2ioEP18IOMemoryDescriptorjP26IOUSBHostBundledCompletionj
-// 1.9.27: 无门控（忠实移植 if-lensman 的无条件方案）——1.9.26 实测证明 slot 门槛
-// 会把事件端点（异步 Completion）挡在外面，Connection Complete 永远看不到。
-// 1.9.28: 无条件方案在本机 panic（开机跑完 verbose 直接重启）。回退为按
-// that == hookPipeInstance 过滤（只包装 Intel 蓝牙事件管道，1.9.18~1.9.23 多年
-// 验证稳定的口径）；Rjj 保持无条件（1.9.26 实测 5894 次无 panic）。疑点是包装
-// 了全系统 USB 设备的完成回调（U 盘/HID/存储全在内），本机环境与 if-lensman
-// 不同。另加防双重包装保险：completion->action 已是我们的包装函数时跳过
-// （防调用方复用 completion 结构导致链式包装 → use-after-free）。
-// 匹配情况用 IBTLeAsyncMatch 计数验证——若永远为 0，说明事件走的 IOSource
-// 实例不是捕获的 pipe 对象，下一步换匹配维度。
+// 1.9.27: 无门控 → 本机 panic（全系统 USB 完成回调都被包装，completion 结构复用
+// 导致链式包装 UAF）。
+// 1.9.28: that == hookPipeInstance 过滤 → 维度错误（IOSource 层的 that 是
+// IOUSBHostIOSource 实例，不是捕获的 pipe 指针，IBTLeAsyncMatch 恒 0），事件永远
+// 被放行，状态机全哑。
+// 1.9.29: 忠实移植 if-lensman 在 Tahoe 26.6.1 实测的开窗方案：
+//   ① 门控 = leRemoteReads > 0（0x2016 命令 +2 开窗，fake 事件 -1 关窗）——
+//     窗口只在一次连接的 features 交换前后打开，避免全系统长期包装；
+//   ② 复制 completion 结构传给原函数、不动调用方结构体（他的写法）——根除
+//     调用方复用 completion 结构导致的链式包装；io() 返回失败时回收 ownerData；
+//   ③ 不比对任何对象指针。
 // ---------------------------------------------------------------------------
 static IOReturn newIOSourceIOCompletion(void *that, IOMemoryDescriptor* dataBuffer, uint32_t dataBufferLength, IOUSBHostCompletion* completion, uint32_t completionTimeoutMs)
 {
     __atomic_add_fetch(&leHookAsync, 1, __ATOMIC_RELAXED);
-    if (that == hookPipeInstance)
-        __atomic_add_fetch(&leAsyncMatch, 1, __ATOMIC_RELAXED);
-    // 1.9.28: 窄口径 = 捕获的 Intel 事件管道 + 防双重包装。
-    if (!leRewriteDisabled && completion && that == hookPipeInstance &&
-        completion->action != asyncIOCompletion) {
+    if (!leRewriteDisabled && __atomic_load_n(&leRemoteReads, __ATOMIC_ACQUIRE) > 0 &&
+        completion && completion->action != asyncIOCompletion) {
         AsyncOwnerData *ownerData = new AsyncOwnerData;
-        ownerData->action = completion->action;
-        ownerData->bundledAction = nullptr;
-        ownerData->owner = completion->owner;
-        ownerData->dataBuffer = dataBuffer;
-        completion->action = asyncIOCompletion;
-        completion->owner = ownerData;
+        if (ownerData) {
+            ownerData->action = completion->action;
+            ownerData->bundledAction = nullptr;
+            ownerData->owner = completion->owner;
+            ownerData->dataBuffer = dataBuffer;
+            IOUSBHostCompletion wrapped = *completion;
+            wrapped.owner = ownerData;
+            wrapped.action = asyncIOCompletion;
+            IOReturn ret = FunctionCast(newIOSourceIOCompletion, oldIOSourceIOCompletion)(that, dataBuffer, dataBufferLength, &wrapped, completionTimeoutMs);
+            if (ret != kIOReturnSuccess)
+                delete ownerData;
+            return ret;
+        }
     }
     return FunctionCast(newIOSourceIOCompletion, oldIOSourceIOCompletion)(that, dataBuffer, dataBufferLength, completion, completionTimeoutMs);
 }
@@ -575,10 +587,9 @@ static IOReturn newIOSourceIORjj(void *that, IOMemoryDescriptor* dataBuffer, uin
     __atomic_add_fetch(&leHookRjj, 1, __ATOMIC_RELAXED);
     IOReturn ret = FunctionCast(newIOSourceIORjj, oldIOSourceIORjj)(that, dataBuffer, dataBufferLength, bytesTransferred, completionTimeoutMs);
     // 同步路径：数据已经拿到，改写缓冲区即可（bytesTransferred 是出/入参）。
-    // 1.9.26: prePrepared=true——描述符此刻已被 io() 以只读方向 prepare，
-    // 只准 readBytes，严禁 prepare/complete（1.9.25 启动死循环根因）。
-    // 1.9.27: leProcessBuffer 全线纯 readBytes，无需再区分。
-    if (ret == kIOReturnSuccess && !leRewriteDisabled)
+    // 1.9.29: 窗口门控（与异步路径一致；无条件版本仅 1.9.26 短暂存活）。
+    if (ret == kIOReturnSuccess && !leRewriteDisabled &&
+        __atomic_load_n(&leRemoteReads, __ATOMIC_ACQUIRE) > 0)
         leProcessBuffer(dataBuffer, bytesTransferred);
     return ret;
 }
@@ -599,17 +610,24 @@ static void asyncBundledCompletion(void* owner, uint32_t ioCompletionCount, IOMe
 
 static IOReturn newIOSourceIOBundled(void *that, IOMemoryDescriptor* dataBuffer, uint32_t dataBufferLength, IOUSBHostBundledCompletion* completion, uint32_t completionTimeoutMs)
 {
-    // 1.9.28: 同 Completion——窄口径（只包 Intel 事件管道）+ 防双重包装。
+    // 1.9.29: 同 Completion——窗口门控 + 复制 completion 传参。
     __atomic_add_fetch(&leHookBundled, 1, __ATOMIC_RELAXED);
-    if (!leRewriteDisabled && completion && that == hookPipeInstance &&
-        completion->action != asyncBundledCompletion) {
+    if (!leRewriteDisabled && __atomic_load_n(&leRemoteReads, __ATOMIC_ACQUIRE) > 0 &&
+        completion && completion->action != asyncBundledCompletion) {
         AsyncOwnerData *ownerData = new AsyncOwnerData;
-        ownerData->action = nullptr;
-        ownerData->bundledAction = completion->action;
-        ownerData->owner = completion->owner;
-        ownerData->dataBuffer = nullptr;   // Bundled 的数据在数组里，回调中逐项处理
-        completion->action = asyncBundledCompletion;
-        completion->owner = ownerData;
+        if (ownerData) {
+            ownerData->action = nullptr;
+            ownerData->bundledAction = completion->action;
+            ownerData->owner = completion->owner;
+            ownerData->dataBuffer = nullptr;   // Bundled 的数据在数组里，回调中逐项处理
+            IOUSBHostBundledCompletion wrapped = *completion;
+            wrapped.owner = ownerData;
+            wrapped.action = asyncBundledCompletion;
+            IOReturn ret = FunctionCast(newIOSourceIOBundled, oldIOSourceIOBundled)(that, dataBuffer, dataBufferLength, &wrapped, completionTimeoutMs);
+            if (ret != kIOReturnSuccess)
+                delete ownerData;
+            return ret;
+        }
     }
     return FunctionCast(newIOSourceIOBundled, oldIOSourceIOBundled)(that, dataBuffer, dataBufferLength, completion, completionTimeoutMs);
 }
@@ -672,22 +690,36 @@ static IOReturn newHostDeviceRequest(void *that, IOService *provider, StandardUS
                 // de las conexiones anteriores (el controlador las ha perdido).
                 __atomic_store_n(&randomAddrSent, 0, __ATOMIC_SEQ_CST);
                 leClearAllSlots("hci reset");
+                __atomic_store_n(&leRemoteReads, 0, __ATOMIC_SEQ_CST);  // 1.9.29: 关窗
             } else if (hdr->opcode == HCI_OP_LE_SET_SCAN_PARAM) {
                 if (__atomic_exchange_n(&randomAddrSent, 1, __ATOMIC_SEQ_CST) == 0)
                     sendRandomAddress(that, provider, timeout);
-            } else if (hdr->opcode == HCI_OP_LE_READ_REMOTE_FEATURES && data == nullptr) {
+            } else if (hdr->opcode == HCI_OP_LE_READ_REMOTE_FEATURES) {
                 // #514: enviar DOS lecturas extra -> dos eventos 0x04 duplicados que se
                 // reescriben (1er dup -> fake PHY Update Complete, 2o dup -> fake LE Data
                 // Length Change). La peticion real (con completion) se ejecuta abajo.
                 // El estado se lleva por connection handle: los tres eventos de esta
                 // lectura lo comparten, y asi dos dispositivos reconectando a la vez no
                 // se pisan (causa de "conecta a veces" en arranque en frio).
+                // 1.9.29: 不再要求 data == nullptr——Tahoe 上命令 payload 可能内联在
+                // data 指针里，旧条件导致 slot 注册与开窗全部哑火（IBTLeSlotsReg=0）。
                 if (!leRewriteDisabled && hdr->len >= 2) {
                     uint16_t handle = (uint16_t)((hdr->data[0] | (hdr->data[1] << 8)) & 0x0FFF);
                     leRegisterSlot(handle);
+                    // if-lensman 开窗机制：+2/命令，每个 fake 事件 -1，连接结束归零。
+                    unsigned int prev = __atomic_add_fetch(&leRemoteReads, 2, __ATOMIC_SEQ_CST);
+                    if (prev > 16)
+                        __atomic_store_n(&leRemoteReads, 2, __ATOMIC_SEQ_CST);  // 防窗口卡死
+                    __atomic_add_fetch(&leCmd2016, 1, __ATOMIC_RELAXED);
                 }
-                FunctionCast(newHostDeviceRequest, oldHostDeviceRequest)(that, provider, request, nullptr, descriptor, length, nullptr, timeout);
-                FunctionCast(newHostDeviceRequest, oldHostDeviceRequest)(that, provider, request, nullptr, descriptor, length, nullptr, timeout);
+                if (data == nullptr) {
+                    FunctionCast(newHostDeviceRequest, oldHostDeviceRequest)(that, provider, request, nullptr, descriptor, length, nullptr, timeout);
+                    FunctionCast(newHostDeviceRequest, oldHostDeviceRequest)(that, provider, request, nullptr, descriptor, length, nullptr, timeout);
+                } else {
+                    // Tahoe 内联 payload：同样补发两次额外读取（第三次是函数尾部的主请求）。
+                    FunctionCast(newHostDeviceRequest, oldHostDeviceRequest)(that, provider, request, data, descriptor, length, nullptr, timeout);
+                    FunctionCast(newHostDeviceRequest, oldHostDeviceRequest)(that, provider, request, data, descriptor, length, nullptr, timeout);
+                }
             }
             DIAGLOG(MODULE_IBTP, "opcode: 0x%04x len: %u wLength: %u async: %d", hdr->opcode, hdr->len, request.wLength, completion != nullptr);
         }
@@ -1827,6 +1859,8 @@ void ibtDiagFill(IbtDiagSnapshot *out) {
     out->leEvt3E      = __atomic_load_n(&leEvt3E, __ATOMIC_RELAXED);
     out->leCcSeen     = __atomic_load_n(&leCcSeen, __ATOMIC_RELAXED);
     out->leAsyncMatch = __atomic_load_n(&leAsyncMatch, __ATOMIC_RELAXED);
+    out->leRemoteReads= (unsigned int)__atomic_load_n(&leRemoteReads, __ATOMIC_RELAXED);
+    out->leCmd2016    = __atomic_load_n(&leCmd2016, __ATOMIC_RELAXED);
     {
         const char *bid = BaseDeviceInfo::get().boardIdentifier;
         size_t n = 0;

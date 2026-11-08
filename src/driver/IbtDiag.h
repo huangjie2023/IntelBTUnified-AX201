@@ -176,7 +176,9 @@ struct IbtDiagSnapshot {
     unsigned int leParsed;     // 成功读到 2 字节事件头
     unsigned int leEvt3E;      // LE 元事件（evt==0x3E）计数
     unsigned int leCcSeen;     // 元子事件 0x01 计数（含 status!=0）
-    unsigned int leAsyncMatch; // 异步入口命中捕获 pipe 的次数（0 = 事件不走捕获对象）
+    unsigned int leAsyncMatch; // 异步入口命中捕获 pipe 的次数（1.9.29 起恒 0 属预期，历史对照）
+    int          leRemoteReads;// 0x2016 开窗计数当前值（>0 = 窗口开着）
+    unsigned int leCmd2016;    // 命令钩子捕获到的 0x2016 命令数
 };
 
 // ---------------------------------------------------------------------------
