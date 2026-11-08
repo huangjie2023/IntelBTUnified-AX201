@@ -586,35 +586,27 @@ static const uint8_t kSkipInternalControllerNVRAMCheckPatched13_3[] = {
 };
 
 // ---------------------------------------------------------------------------
-// 1.9.19: B 类根治 —— bluetoothd 传输等待循环的睡眠间隔补丁（默认启用，-ibtnowaits 关）。
+// 1.9.23: 移除 1.9.19 的「bluetoothd 传输等待循环 100ms→500ms」补丁。
 //
-// 证据链（tools/find-callers.pl + find-waits.pl 对 26.7.3 x86_64 切片的实测输出）：
-//   usleep_ms thunk（imul edi,edi,1000 尾调 usleep）只有 1 个 @0x1000f2409；
-//   14 个 mov edi,imm; call 调用点里只有 2 个带循环边界，全在同一函数的两个分支：
-//     site1 @0x100159251: 41 83 ff 6d (cmp r15d,109) ... bf 64 00 00 00 (100ms)
-//     site2 @0x10015930c: 83 f8 6d    (cmp eax,109)  ... bf 64 00 00 00 (100ms)
-//   109 × 100ms ≈ 10.9s + 每轮 probe 开销 ≈ 观测的 15~16.4s 超时；耗尽后调
-//   "Failed to initialize transport %s" 报错函数 → os_crash（B 类崩溃本体）。
+// 实测判定（11-08，Round2 / Round3 对照）：
+//   - 补丁开启（无 -ibtnowaits）：睡眠唤醒 3/3 崩；
+//   - 补丁关闭（-ibtnowaits）  ：睡眠唤醒 2/3 崩，死亡签名逐字节相同
+//     （DeviceRequestAsync reason=1205 → USBDeviceReEnumerate → 新实例 ~16.4s
+//       预算耗尽 → Failed to initialize transport USB → 第三个实例存活）。
+//   即预算长短与唤醒崩溃无关，Round2 的「3/3 vs 0/2」只是小样本错觉。
 //
-// 补丁：mov edi,100 → mov edi,500（bf 64 00 00 00 → bf f4 01 00 00）。
-// 循环次数 0x6d 是 imm8（上限 127 次 = 12.7s，不够），改睡眠间隔把预算
-// 提到 109 × 500ms ≈ 54.5s；控制器就绪时循环照常立即退出，只是轮询粒度变粗。
-// needle 为 15 字节实测序列（含两条 call rel32，与该 bluetoothd 构建逐字节绑定）；
-// macOS 更新后 needle 失配 = 补丁静默不生效（PatchMask 无 bit9/bit10），无副作用。
+// 真正的病灶在睡眠握手：睡前 bluetoothd 下发 VS event mask / ignoreUSBReset
+// 一律 result 2，控制器带错误状态入睡；这发生在 Apple 栈与 Intel 固件之间，
+// 不在 bluetoothd 的等待循环里，改等待间隔够不着。
+//
+// 移除的额外收益：少改写两处 bluetoothd __TEXT 代码页。每多一个被改写的驻留页，
+// 就多一份 APFS 16KiB 压缩组哈希失配 → 缺页重读 SIGBUS 的暴露面（1.9.3 的
+// VNOP_VERIFY 旁路就是为这类页准备的）。补丁无收益、有成本，故整段删除，
+// 用户不再需要加任何 boot-arg 就能得到验证过的原版时序。
+//
+// PatchMask 的 bit9/bit10 保留为历史位，自 1.9.23 起恒为 0（见 PatchId）。
+// tools/find-waits.pl 留作取证工具，不再参与构建。
 // ---------------------------------------------------------------------------
-static const uint8_t kBtdWaitSite1Original[] = {
-    0xE8, 0x95, 0xEF, 0xF8, 0xFF, 0xBF, 0x64, 0x00, 0x00, 0x00, 0xE8, 0xAE, 0x91, 0xF9, 0xFF,
-};
-static const uint8_t kBtdWaitSite1Patched[] = {
-    0xE8, 0x95, 0xEF, 0xF8, 0xFF, 0xBF, 0xF4, 0x01, 0x00, 0x00, 0xE8, 0xAE, 0x91, 0xF9, 0xFF,
-};
-static const uint8_t kBtdWaitSite2Original[] = {
-    0xE8, 0xDA, 0xEE, 0xF8, 0xFF, 0xBF, 0x64, 0x00, 0x00, 0x00, 0xE8, 0xF3, 0x90, 0xF9, 0xFF,
-};
-static const uint8_t kBtdWaitSite2Patched[] = {
-    0xE8, 0xDA, 0xEE, 0xF8, 0xFF, 0xBF, 0xF4, 0x01, 0x00, 0x00, 0xE8, 0xF3, 0x90, 0xF9, 0xFF,
-};
-static bool shouldPatchWaits = false;
 
 // 1.9.21: 传输死亡自动救砖开关（默认开，-ibt-norescue 关）。非 static：
 // IntelBluetoothFirmware.cpp 的 start() 读取它决定是否武装巡检。
@@ -656,6 +648,8 @@ enum PatchId : uint32_t {
     PatchNvram       = 1u << 6,
     PatchBtdBid      = 1u << 7,
     PatchAddress     = 1u << 8,
+    // 1.9.23: waits 补丁已移除；这两位保留为历史位，恒为 0，
+    // 避免旧版 ioreg/dmesg 读数在升级后语义漂移。
     PatchBtdWait1    = 1u << 9,
     PatchBtdWait2    = 1u << 10,
 };
@@ -1067,11 +1061,7 @@ static void patched_cs_validate_page(vnode_t vp, memory_object_t pager, memory_o
             }
             if (shouldPatchAddress)
                 any |= searchAndPatchWithMask(PatchAddress, "same-address check", data, PAGE_SIZE, path, kSkipAddressCheckOriginal, sizeof(kSkipAddressCheckOriginal), kSkipAddressCheckMask, sizeof(kSkipAddressCheckMask), kSkipAddressCheckPatched, sizeof(kSkipAddressCheckPatched));
-            // 1.9.19: 传输等待循环 100ms→500ms（B 类根治，见 kBtdWaitSite1* 注释）。
-            if (shouldPatchWaits) {
-                any |= searchAndPatch(PatchBtdWait1, "transport wait 100->500ms (site1)", data, PAGE_SIZE, path, kBtdWaitSite1Original, kBtdWaitSite1Patched);
-                any |= searchAndPatch(PatchBtdWait2, "transport wait 100->500ms (site2)", data, PAGE_SIZE, path, kBtdWaitSite2Original, kBtdWaitSite2Patched);
-            }
+            // 1.9.23: waits 补丁已移除（见文件头说明），此处不再改写等待循环。
             // 1.9.17: 本页命中补丁 → 把它所在的 16KB 压缩组入队，由驱动定时器在
             // workloop 上下文里整组 wire（为什么不能在这里直接 wire：钩子持有
             // pager/对象锁，vm_map_wire 会去 fault 同一个 pager → 死锁）。
@@ -1331,8 +1321,9 @@ static void processPatcher(KernelPatcher &patcher) {    const bool argOta    = c
     // 本包自称替代 BlueToolFixup，就不该再要求用户额外加 BlueToolFixup 的
     // boot-arg，改为默认启用；需要关闭时用 -ibtnobid。
     shouldPatchBoardId = !checkKernelArgument("-ibtnobid");
-    // 1.9.19: 传输等待循环间隔补丁，默认启用；-ibtnowaits 关闭（诊断用）。
-    shouldPatchWaits = !checkKernelArgument("-ibtnowaits");
+    // 1.9.23: 不再解析 -ibtnowaits —— waits 补丁整段移除，默认就是原版时序。
+    // 保留一行日志，便于确认跑的是新版；参数存在与否都不会影响行为。
+    SYSLOG(MODULE_BTLFX, "transport wait patch retired (1.9.23): bluetoothd timing left stock, -ibtnowaits no longer needed");
     // 长度必须严格等于 needle 长度：replaceSize 传的是 kBoardIdSize，
     // 若本机 board-id 更短，findAndReplace 会按 21 字节读 patch 缓冲，越界。
     if (shouldPatchBoardId) {
