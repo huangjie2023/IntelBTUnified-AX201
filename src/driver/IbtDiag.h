@@ -180,6 +180,7 @@ struct IbtDiagSnapshot {
     int          leRemoteReads;// 0x2016 开窗计数当前值（>0 = 窗口开着）
     unsigned int leCmd2016;    // 命令钩子捕获到的 0x2016 命令数
     unsigned int leCmd2016Async; // 1.9.31: 异步 Completion 入口识别到的 0x2016（判定命令走同步还是异步）
+    unsigned int leCmd2016Rjj;   // 1.9.31: 同步 Rjj 入口识别到的 0x2016（已含开窗+补发）
     unsigned int leCmdAll;     // deviceRequest 钩子入口总数（路由是否安装）
     unsigned int leCmdHci;     // 成功读到 opcode 的请求数（读路径是否工作）
     unsigned int leCmdDev;     // 通过 isIntelBluetooth 的请求数（过滤器是否失配）
