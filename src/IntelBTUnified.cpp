@@ -359,7 +359,15 @@ static const uint8_t fakeDataLengthChangeEvent[13] = {0x3E, 0x0B, 0x07, 0x00, 0x
 //   2. IOUSBHostIOSource::io(IOUSBHostCompletion*)（Tahoe Completion 重载）
 //   3. IOUSBHostIOSource::io(uint32_t&)（Tahoe Rjj 同步重载——先调原函数再改写）
 //   4. IOUSBHostIOSource::io(IOUSBHostBundledCompletion*)（Tahoe Bundled 重载，逐项改写）
-static void leProcessBuffer(IOMemoryDescriptor* dataBuffer, uint32_t &bytesTransferred)
+//
+// 1.9.26: 新增 prePrepared 参数。1.9.25 的启动死循环（屏幕刷 "IOMemoryDescriptor
+// prepared read only" + backtrace 到本 kext）根因：Rjj 是同步路径，原函数 io()
+// 执行期间描述符已被 USB 栈按只读方向 prepare；此时再 prepare(kIODirectionInOut)
+// 方向不匹配告警、complete() 不平衡，启动期每个 HCI 事件刷一轮，系统卡死。
+// Rjj 路径必须传 prePrepared=true：描述符已在 wire 状态，直接 readBytes，
+// 严禁 prepare/complete。异步完成回调路径（1/2/4）描述符回调时未 prepare，
+// 维持 Sequoia+ 的 prepare/readBytes/complete（1.9.18 起实测稳定）。
+static void leProcessBuffer(IOMemoryDescriptor* dataBuffer, uint32_t &bytesTransferred, bool prePrepared)
 {
     uint32_t allocLen = bytesTransferred;
 
@@ -367,7 +375,10 @@ static void leProcessBuffer(IOMemoryDescriptor* dataBuffer, uint32_t &bytesTrans
         __atomic_add_fetch(&leHookCalls, 1, __ATOMIC_RELAXED);
         void *buffer = IOMalloc(allocLen);
         if (buffer) {
-            if (dataBuffer->getLength() > 0 && (getKernelVersion() < KernelVersion::Sequoia || !dataBuffer->prepare(kIODirectionInOut))) {
+            const bool canRead = dataBuffer->getLength() > 0 &&
+                                 (prePrepared || getKernelVersion() < KernelVersion::Sequoia ||
+                                  !dataBuffer->prepare(kIODirectionInOut));
+            if (canRead) {
                 dataBuffer->readBytes(0, buffer, allocLen);
                 HciEventHdr *hdr = (HciEventHdr *)buffer;
                 // 1.9.25: Connection Complete 兜底注册。原实现只在 0x2016 命令路径
@@ -451,7 +462,9 @@ static void leProcessBuffer(IOMemoryDescriptor* dataBuffer, uint32_t &bytesTrans
                         }
                     }
                 }
-                if (getKernelVersion() >= KernelVersion::Sequoia) dataBuffer->complete(kIODirectionInOut);
+                // 只有我们自己 prepare 过的才配对 complete；Rjj（prePrepared）的
+                // 描述符生命周期归 io() 调用方，碰了就不平衡（1.9.25 启动死循环根因）。
+                if (!prePrepared && getKernelVersion() >= KernelVersion::Sequoia) dataBuffer->complete(kIODirectionInOut);
             }
             IOFree(buffer, allocLen);
         }
@@ -463,7 +476,7 @@ static void asyncIOCompletion(void* owner, void* parameter, IOReturn status, uin
     AsyncOwnerData *asyncOwner = (AsyncOwnerData *)owner;
     IOMemoryDescriptor* dataBuffer = asyncOwner->dataBuffer;
     if (dataBuffer && bytesTransferred)
-        leProcessBuffer(dataBuffer, bytesTransferred);
+        leProcessBuffer(dataBuffer, bytesTransferred, false);
     if (asyncOwner->action)
         asyncOwner->action(asyncOwner->owner, parameter, status, bytesTransferred);
     delete asyncOwner;
@@ -506,10 +519,10 @@ static IOReturn newAsyncIO(void *that, IOMemoryDescriptor* dataBuffer, uint32_t 
 // ---------------------------------------------------------------------------
 static IOReturn newIOSourceIOCompletion(void *that, IOMemoryDescriptor* dataBuffer, uint32_t dataBufferLength, IOUSBHostCompletion* completion, uint32_t completionTimeoutMs)
 {
-    // 1.9.25: 去掉 leActiveSlots>0 门槛——slot 注册可能发生在事件路径
-    // （Connection Complete 兜底），门槛在包装时就把第一条事件挡在外面，
-    // slot 永远注册不上，死锁。改写逻辑内部对无 slot 事件原样放行。
-    if (!leRewriteDisabled && completion) {
+    // 1.9.26: 恢复 leActiveSlots>0 门槛（1.9.25 拆掉后重逻辑在启动期对每个事件
+    // 跑 prepare/complete，死循环）。死锁由 Rjj 路径解：它无门槛 + 只 readBytes，
+    // Connection Complete 兜底注册 slot 后，本异步路径自然开始包装。
+    if (!leRewriteDisabled && leActiveSlots > 0 && completion) {
         AsyncOwnerData *ownerData = new AsyncOwnerData;
         ownerData->action = completion->action;
         ownerData->bundledAction = nullptr;
@@ -525,9 +538,11 @@ static IOReturn newIOSourceIORjj(void *that, IOMemoryDescriptor* dataBuffer, uin
 {
     IOReturn ret = FunctionCast(newIOSourceIORjj, oldIOSourceIORjj)(that, dataBuffer, dataBufferLength, bytesTransferred, completionTimeoutMs);
     // 同步路径：数据已经拿到，改写缓冲区即可（bytesTransferred 是出/入参）。
-    // 1.9.25: 同上去掉 leActiveSlots>0 门槛。
+    // 1.9.25: 去掉 leActiveSlots>0 门槛（slot 兜底注册靠这条路径，鸡生蛋死锁的解）。
+    // 1.9.26: prePrepared=true——描述符此刻已被 io() 以只读方向 prepare，
+    // 只准 readBytes，严禁 prepare/complete（1.9.25 启动死循环根因）。
     if (ret == kIOReturnSuccess && !leRewriteDisabled)
-        leProcessBuffer(dataBuffer, bytesTransferred);
+        leProcessBuffer(dataBuffer, bytesTransferred, true);
     return ret;
 }
 
@@ -537,7 +552,7 @@ static void asyncBundledCompletion(void* owner, uint32_t ioCompletionCount, IOMe
     if (asyncOwner->bundledAction && dataBufferArray && actualByteCountArray) {
         for (uint32_t i = 0; i < ioCompletionCount; i++) {
             uint32_t bytes = actualByteCountArray[i];
-            leProcessBuffer(dataBufferArray[i], bytes);
+            leProcessBuffer(dataBufferArray[i], bytes, false);
             actualByteCountArray[i] = bytes;
         }
         asyncOwner->bundledAction(asyncOwner->owner, ioCompletionCount, dataBufferArray, parameter, statusArray, actualByteCountArray);
@@ -547,8 +562,8 @@ static void asyncBundledCompletion(void* owner, uint32_t ioCompletionCount, IOMe
 
 static IOReturn newIOSourceIOBundled(void *that, IOMemoryDescriptor* dataBuffer, uint32_t dataBufferLength, IOUSBHostBundledCompletion* completion, uint32_t completionTimeoutMs)
 {
-    // 1.9.25: 同 Completion 路径，去掉 leActiveSlots>0 门槛。
-    if (!leRewriteDisabled && completion) {
+    // 1.9.26: 同 Completion，恢复 leActiveSlots>0 门槛（重逻辑只在 slot 活跃时跑）。
+    if (!leRewriteDisabled && leActiveSlots > 0 && completion) {
         AsyncOwnerData *ownerData = new AsyncOwnerData;
         ownerData->action = nullptr;
         ownerData->bundledAction = completion->action;
