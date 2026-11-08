@@ -236,6 +236,11 @@ static unsigned int leRjjReadFail {}; // 1.9.32: Rjj 探测读失败数（readBy
 static unsigned int leRjjRetFail {};  // 1.9.34: Rjj 原函数返回非 Success 的次数
 static unsigned int leRjjBufNull {};  // 1.9.34: Rjj 的 dataBuffer 为空的次数
 static unsigned int leRjjBufShort {}; // 1.9.34: Rjj 的缓冲长度 < 3 的次数
+static unsigned int leRjjValid {};    // 1.9.35: Rjj 调用后 bytesTransferred>=2 的次数（数据真的在缓冲里）
+static unsigned int leRjjB03E {};     // 1.9.35: Rjj 缓冲首字节 = 0x3E（LE 元事件）次数
+static unsigned int leRjjB004 {};     // 1.9.35: Rjj 缓冲首字节 = 0x04（HCI 包指示头）次数
+static unsigned int usbRouteMask {};  // 1.9.35: USB 层符号逐符号路由结果 bit0=deviceRequest bit1=Pipe::io bit2/3=initPipe
+static unsigned int cmdSymIdx {};     // 1.9.35: deviceRequest 命中的候选符号序号（1=IOUSBHostDevice 2=IOUSBHostObject）
 
 static inline uint16_t leHandleOfEvent(const HciEventHdr *hdr) {
     // Read Remote Features Complete: [0]=subevent 0x04, [1]=status, [2..3]=handle
@@ -624,25 +629,20 @@ static IOReturn newIOSourceIORjj(void *that, IOMemoryDescriptor* dataBuffer, uin
                 __atomic_add_fetch(&leRjjReadOk, 1, __ATOMIC_RELAXED);
             else
                 __atomic_add_fetch(&leRjjReadFail, 1, __ATOMIC_RELAXED);
-            if (probeOk && dataBuffer->getLength() >= 5 &&
-                cmdHead[0] == (HCI_OP_LE_READ_REMOTE_FEATURES & 0xFF) &&
-                cmdHead[1] == ((HCI_OP_LE_READ_REMOTE_FEATURES >> 8) & 0xFF) &&
-                cmdHead[2] == 0x02) {
-                uint8_t hbuf[2] = {};
-                uint16_t handle = 0;
-                if (dataBuffer->readBytes(3, hbuf, 2) == 2)
-                    handle = (uint16_t)((hbuf[0] | (hbuf[1] << 8)) & 0x0FFF);
-                leRegisterSlot(handle);
-                unsigned int prev = __atomic_add_fetch(&leRemoteReads, 2, __ATOMIC_SEQ_CST);
-                if (prev > 16)
-                    __atomic_store_n(&leRemoteReads, 2, __ATOMIC_SEQ_CST);
-                __atomic_add_fetch(&leCmd2016, 1, __ATOMIC_RELAXED);
-                __atomic_add_fetch(&leCmd2016Rjj, 1, __ATOMIC_RELAXED);
-                // 补发两次同样的读取（第三次是刚发过的真实命令）。同步串行，共用调用
-                // 方的描述符；补发走 old 指针不回钩子，无递归。
-                FunctionCast(newIOSourceIORjj, oldIOSourceIORjj)(that, dataBuffer, dataBufferLength, bytesTransferred, completionTimeoutMs);
-                FunctionCast(newIOSourceIORjj, oldIOSourceIORjj)(that, dataBuffer, dataBufferLength, bytesTransferred, completionTimeoutMs);
+            // 1.9.35: Rjj 数据内容直方图——回答"Rjj 到底是什么流"：
+            //   Valid=0（bytesTransferred 恒 0）→ Rjj 是提交式，数据在完成回调，
+            //     1.9.26 的 Parsed=0 与 1.9.33 的探测哑火同源；
+            //   Valid>0 且 B03E>0 → Rjj 就是事件流（改写可在本层做）；
+            //   Valid>0 且 B004>0 → 带 HCI 包指示头（0x04）的原始流。
+            if (probeOk && bytesTransferred >= 2) {
+                __atomic_add_fetch(&leRjjValid, 1, __ATOMIC_RELAXED);
+                if (cmdHead[0] == 0x3E)
+                    __atomic_add_fetch(&leRjjB03E, 1, __ATOMIC_RELAXED);
+                else if (cmdHead[0] == 0x04)
+                    __atomic_add_fetch(&leRjjB004, 1, __ATOMIC_RELAXED);
             }
+            // 1.9.35: 0x2016 识别与补发从本层移除——命令层（deviceRequest）接管。
+            // 本层历史读数从未见过命令（Cmd2016Rjj 恒 0），保留只会增加风险面。
         }
     }
     // 同步路径：数据已经拿到，改写缓冲区即可（bytesTransferred 是出/入参）。
@@ -809,24 +809,52 @@ static void processUSBHost(KernelPatcher &patcher, size_t index, mach_vm_address
     if (kextIOUSBHost.loadIndex != index)
         return;
     makeRandomAddressCommand();
-    KernelPatcher::RouteRequest requests[] {
-        {"__ZN15IOUSBHostDevice13deviceRequestEP9IOServiceRN11StandardUSB13DeviceRequestEPvP18IOMemoryDescriptorRjP19IOUSBHostCompletionj",
-            newHostDeviceRequest, oldHostDeviceRequest},
-        {"__ZN13IOUSBHostPipe2ioEP18IOMemoryDescriptorjP19IOUSBHostCompletionj",
-            newAsyncIO, oldAsyncIO},
-        // macOS 26.5+: el tercer parametro paso a ser ConfigurationDescriptor
+    // 1.9.35: 逐符号独立路由 + 掩码计数。旧版把 deviceRequest/Pipe::io/initPipe
+    // 放进一个 routeMultiple 批量提交——任一符号解析失败，整批下线且我们只看到
+    // 一个笼统 error 就 clearError 了（CmdAll=0 + HookPipe=0 同时哑火的真因）。
+    // IOSource 三条当时是逐条提交的，所以全活（IosrcMask=7）——这个对比就是证据。
+    // 26.7.3 上 IOUSBHostDevice::deviceRequest 极可能被挪进基类 IOUSBHostObject
+    // （Apple 重构常见操作），故加候选符号逐个试，命中哪个由 IBTCmdSym 报告。
+    const char *cmdSyms[] {
+        "__ZN15IOUSBHostDevice13deviceRequestEP9IOServiceRN11StandardUSB13DeviceRequestEPvP18IOMemoryDescriptorRjP19IOUSBHostCompletionj",
+        "__ZN15IOUSBHostObject13deviceRequestEP9IOServiceRN11StandardUSB13DeviceRequestEPvP18IOMemoryDescriptorRjP19IOUSBHostCompletionj",
+    };
+    for (size_t i = 0; i < arrsize(cmdSyms); i++) {
+        KernelPatcher::RouteRequest req {cmdSyms[i], newHostDeviceRequest, oldHostDeviceRequest};
+        patcher.routeMultiple(index, &req, 1, address, size);
+        if (patcher.getError() == KernelPatcher::Error::NoError) {
+            cmdSymIdx = (unsigned int)(i + 1);
+            __atomic_fetch_or(&usbRouteMask, 1u, __ATOMIC_RELAXED);
+            break;
+        }
+        patcher.clearError();
+    }
+    KernelPatcher::RouteRequest pipeReq {
+        "__ZN13IOUSBHostPipe2ioEP18IOMemoryDescriptorjP19IOUSBHostCompletionj",
+        newAsyncIO, oldAsyncIO};
+    patcher.routeMultiple(index, &pipeReq, 1, address, size);
+    if (patcher.getError() == KernelPatcher::Error::NoError)
+        __atomic_fetch_or(&usbRouteMask, 2u, __ATOMIC_RELAXED);
+    else
+        patcher.clearError();
+    // macOS 26.5+: el tercer parametro paso a ser ConfigurationDescriptor
+    KernelPatcher::RouteRequest initPipeReqs[] {
         {"__ZN13IOUSBHostPipe28initWithDescriptorsAndOwnersEPKN11StandardUSB18EndpointDescriptorEPKNS0_23ConfigurationDescriptorEP22AppleUSBHostControllerP15IOUSBHostDeviceP18IOUSBHostInterfaceht",
             newInitPipeConfig, oldInitPipeConfig},
         {"__ZN13IOUSBHostPipe28initWithDescriptorsAndOwnersEPKN11StandardUSB18EndpointDescriptorEPKNS0_37SuperSpeedEndpointCompanionDescriptorEP22AppleUSBHostControllerP15IOUSBHostDeviceP18IOUSBHostInterfaceht",
             newInitPipe, oldInitPipe},
     };
-    patcher.routeMultiple(index, requests, arrsize(requests), address, size);
-    if (patcher.getError() == KernelPatcher::Error::NoError) {
-        SYSLOG(MODULE_IBTP, "routed %zu symbols", arrsize(requests));
-    } else {
-        SYSLOG(MODULE_IBTP, "failed to resolve symbols, error = %d", patcher.getError());
-        patcher.clearError();
+    for (size_t i = 0; i < arrsize(initPipeReqs); i++) {
+        patcher.routeMultiple(index, &initPipeReqs[i], 1, address, size);
+        if (patcher.getError() == KernelPatcher::Error::NoError)
+            __atomic_fetch_or(&usbRouteMask, 4u << i, __ATOMIC_RELAXED);
+        else
+            patcher.clearError();
     }
+    if (cmdSymIdx)
+        SYSLOG(MODULE_IBTP, "deviceRequest routed via candidate #%u", cmdSymIdx);
+    else
+        SYSLOG(MODULE_IBTP, "deviceRequest: no candidate symbol resolved (26.7.3 rename?)");
     // 1.9.24 (#514): Tahoe 的三条 IOUSBHostIOSource::io 重载。逐条单独提交，
     // 任何一条失败不影响其它（Completion 挂上就停掉 Pipe 层包装）。
     if (getKernelVersion() >= KernelVersion::Tahoe) {
@@ -1936,6 +1964,11 @@ void ibtDiagFill(IbtDiagSnapshot *out) {
     out->leRjjRetFail = __atomic_load_n(&leRjjRetFail, __ATOMIC_RELAXED);
     out->leRjjBufNull = __atomic_load_n(&leRjjBufNull, __ATOMIC_RELAXED);
     out->leRjjBufShort = __atomic_load_n(&leRjjBufShort, __ATOMIC_RELAXED);
+    out->leRjjValid = __atomic_load_n(&leRjjValid, __ATOMIC_RELAXED);
+    out->leRjjB03E = __atomic_load_n(&leRjjB03E, __ATOMIC_RELAXED);
+    out->leRjjB004 = __atomic_load_n(&leRjjB004, __ATOMIC_RELAXED);
+    out->leUsbRouteMask = __atomic_load_n(&usbRouteMask, __ATOMIC_RELAXED);
+    out->leCmdSym = cmdSymIdx;
     out->leCmdHci     = __atomic_load_n(&leCmdHci, __ATOMIC_RELAXED);
     out->leCmdDev     = __atomic_load_n(&leCmdDev, __ATOMIC_RELAXED);
     out->lePipeCap    = __atomic_load_n(&lePipeCap, __ATOMIC_RELAXED);

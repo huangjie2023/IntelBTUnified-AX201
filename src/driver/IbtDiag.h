@@ -186,6 +186,11 @@ struct IbtDiagSnapshot {
     unsigned int leRjjRetFail;   // 1.9.34: Rjj 原函数返回非 Success 次数
     unsigned int leRjjBufNull;   // 1.9.34: dataBuffer 为空次数
     unsigned int leRjjBufShort;  // 1.9.34: 缓冲长度 < 3 次数
+    unsigned int leRjjValid;     // 1.9.35: Rjj 调用后 bytesTransferred>=2 次数（数据真在缓冲）
+    unsigned int leRjjB03E;      // 1.9.35: Rjj 首字节 0x3E 次数（LE 元事件流证据）
+    unsigned int leRjjB004;      // 1.9.35: Rjj 首字节 0x04 次数（HCI 包指示头证据）
+    unsigned int leUsbRouteMask; // 1.9.35: USB 层逐符号路由结果 bit0=deviceRequest bit1=Pipe::io bit2/3=initPipe
+    unsigned int leCmdSym;       // 1.9.35: deviceRequest 命中的候选符号（1=Device 2=Object 0=全败）
     unsigned int leCmdAll;     // deviceRequest 钩子入口总数（路由是否安装）
     unsigned int leCmdHci;     // 成功读到 opcode 的请求数（读路径是否工作）
     unsigned int leCmdDev;     // 通过 isIntelBluetooth 的请求数（过滤器是否失配）

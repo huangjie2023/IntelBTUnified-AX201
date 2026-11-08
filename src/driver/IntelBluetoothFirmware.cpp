@@ -160,6 +160,11 @@ void ibtDiagPublishLive()
     svc->setProperty("IBTRjjRetFail", (unsigned long long)s.leRjjRetFail, 32);
     svc->setProperty("IBTRjjBufNull", (unsigned long long)s.leRjjBufNull, 32);
     svc->setProperty("IBTRjjBufShort", (unsigned long long)s.leRjjBufShort, 32);
+    svc->setProperty("IBTRjjValid", (unsigned long long)s.leRjjValid, 32);
+    svc->setProperty("IBTRjjB03E", (unsigned long long)s.leRjjB03E, 32);
+    svc->setProperty("IBTRjjB004", (unsigned long long)s.leRjjB004, 32);
+    svc->setProperty("IBTUsbMask", (unsigned long long)s.leUsbRouteMask, 32);
+    svc->setProperty("IBTCmdSym", (unsigned long long)s.leCmdSym, 32);
     svc->setProperty("IBTCmdHci", (unsigned long long)s.leCmdHci, 32);
     svc->setProperty("IBTCmdDev", (unsigned long long)s.leCmdDev, 32);
     svc->setProperty("IBTPipeCap", (unsigned long long)s.lePipeCap, 32);
