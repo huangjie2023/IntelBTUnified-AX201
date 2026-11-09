@@ -733,10 +733,12 @@ static IOReturn newHostDeviceRequest(void *that, IOService *provider, StandardUS
     const bool intelDev = dev && isIntelBluetooth(dev);
     if (intelDev)
         __atomic_add_fetch(&leCmdDev, 1, __ATOMIC_RELAXED);
-
+    // 1.9.36: 非 Intel 设备一律只计数不读——1.9.35 的 USB 断电极可能是对所有
+    // 设备的描述符 prepare/read/complete 干扰了 Hub 电源管理等类请求。钩子
+    // 入口本身是纯计数（无 I/O），其余动作全部限于 Intel 蓝牙设备。
     uint8_t hciBuf[MAX_HCI_BUF_LEN] = {};
     const HciCommandHdr *hdr = nullptr;
-    if (request.wLength >= HCI_CMD_HDR_SIZE) {
+    if (intelDev && request.wLength >= HCI_CMD_HDR_SIZE) {
         if (data != nullptr) {
             hdr = static_cast<const HciCommandHdr *>(data);
         } else if (descriptor != nullptr && descriptor->getLength() >= HCI_CMD_HDR_SIZE) {
@@ -809,52 +811,48 @@ static void processUSBHost(KernelPatcher &patcher, size_t index, mach_vm_address
     if (kextIOUSBHost.loadIndex != index)
         return;
     makeRandomAddressCommand();
-    // 1.9.35: 逐符号独立路由 + 掩码计数。旧版把 deviceRequest/Pipe::io/initPipe
-    // 放进一个 routeMultiple 批量提交——任一符号解析失败，整批下线且我们只看到
-    // 一个笼统 error 就 clearError 了（CmdAll=0 + HookPipe=0 同时哑火的真因）。
-    // IOSource 三条当时是逐条提交的，所以全活（IosrcMask=7）——这个对比就是证据。
-    // 26.7.3 上 IOUSBHostDevice::deviceRequest 极可能被挪进基类 IOUSBHostObject
-    // （Apple 重构常见操作），故加候选符号逐个试，命中哪个由 IBTCmdSym 报告。
+    // 1.9.36: USB 层钩子默认【零安装】。1.9.35 的教训：逐符号路由让一批从未在
+    // 本机运行过的钩子（deviceRequest/Object 变体、Pipe::io、initPipe×2）首次激
+    // 活，其中任何一个与 26.7.3 语义不兼容都会击穿全系统 USB 控制传输（实测：
+    // 所有 USB 口断电、蓝牙随之失效）。现在改为两段式：
+    //   默认：只做 solveSymbol 存在性探测（纯读，不装钩子），结果进 IBTUsbMask；
+    //   -ibtusb：才真正安装 deviceRequest 钩子（按探测结果选候选符号）。
+    // initPipe/Pipe::io 继续只探测不安装（IOSource 层已覆盖事件路径，不需要它们）。
     const char *cmdSyms[] {
         "__ZN15IOUSBHostDevice13deviceRequestEP9IOServiceRN11StandardUSB13DeviceRequestEPvP18IOMemoryDescriptorRjP19IOUSBHostCompletionj",
         "__ZN15IOUSBHostObject13deviceRequestEP9IOServiceRN11StandardUSB13DeviceRequestEPvP18IOMemoryDescriptorRjP19IOUSBHostCompletionj",
     };
+    const bool usbInstall = checkKernelArgument("-ibtusb");
     for (size_t i = 0; i < arrsize(cmdSyms); i++) {
-        KernelPatcher::RouteRequest req {cmdSyms[i], newHostDeviceRequest, oldHostDeviceRequest};
-        patcher.routeMultiple(index, &req, 1, address, size);
-        if (patcher.getError() == KernelPatcher::Error::NoError) {
-            cmdSymIdx = (unsigned int)(i + 1);
-            __atomic_fetch_or(&usbRouteMask, 1u, __ATOMIC_RELAXED);
-            break;
-        }
         patcher.clearError();
-    }
-    KernelPatcher::RouteRequest pipeReq {
-        "__ZN13IOUSBHostPipe2ioEP18IOMemoryDescriptorjP19IOUSBHostCompletionj",
-        newAsyncIO, oldAsyncIO};
-    patcher.routeMultiple(index, &pipeReq, 1, address, size);
-    if (patcher.getError() == KernelPatcher::Error::NoError)
-        __atomic_fetch_or(&usbRouteMask, 2u, __ATOMIC_RELAXED);
-    else
-        patcher.clearError();
-    // macOS 26.5+: el tercer parametro paso a ser ConfigurationDescriptor
-    KernelPatcher::RouteRequest initPipeReqs[] {
-        {"__ZN13IOUSBHostPipe28initWithDescriptorsAndOwnersEPKN11StandardUSB18EndpointDescriptorEPKNS0_23ConfigurationDescriptorEP22AppleUSBHostControllerP15IOUSBHostDeviceP18IOUSBHostInterfaceht",
-            newInitPipeConfig, oldInitPipeConfig},
-        {"__ZN13IOUSBHostPipe28initWithDescriptorsAndOwnersEPKN11StandardUSB18EndpointDescriptorEPKNS0_37SuperSpeedEndpointCompanionDescriptorEP22AppleUSBHostControllerP15IOUSBHostDeviceP18IOUSBHostInterfaceht",
-            newInitPipe, oldInitPipe},
-    };
-    for (size_t i = 0; i < arrsize(initPipeReqs); i++) {
-        patcher.routeMultiple(index, &initPipeReqs[i], 1, address, size);
-        if (patcher.getError() == KernelPatcher::Error::NoError)
-            __atomic_fetch_or(&usbRouteMask, 4u << i, __ATOMIC_RELAXED);
-        else
+        mach_vm_address_t sym = patcher.solveSymbol(index, cmdSyms[i]);
+        if (patcher.getError() != KernelPatcher::Error::NoError || !sym) {
             patcher.clearError();
+            continue;
+        }
+        __atomic_fetch_or(&usbRouteMask, 1u << i, __ATOMIC_RELAXED);
+        if (usbInstall && !cmdSymIdx) {
+            KernelPatcher::RouteRequest req {cmdSyms[i], newHostDeviceRequest, oldHostDeviceRequest};
+            patcher.routeMultiple(index, &req, 1, address, size);
+            if (patcher.getError() == KernelPatcher::Error::NoError) {
+                cmdSymIdx = (unsigned int)(i + 1);
+                SYSLOG(MODULE_IBTP, "deviceRequest routed via candidate #%u (-ibtusb)", cmdSymIdx);
+            } else
+                patcher.clearError();
+        }
     }
-    if (cmdSymIdx)
-        SYSLOG(MODULE_IBTP, "deviceRequest routed via candidate #%u", cmdSymIdx);
-    else
-        SYSLOG(MODULE_IBTP, "deviceRequest: no candidate symbol resolved (26.7.3 rename?)");
+    patcher.clearError();
+    if (patcher.solveSymbol(index, "__ZN13IOUSBHostPipe2ioEP18IOMemoryDescriptorjP19IOUSBHostCompletionj"))
+        __atomic_fetch_or(&usbRouteMask, 4u, __ATOMIC_RELAXED);
+    patcher.clearError();
+    if (patcher.solveSymbol(index, "__ZN13IOUSBHostPipe28initWithDescriptorsAndOwnersEPKN11StandardUSB18EndpointDescriptorEPKNS0_23ConfigurationDescriptorEP22AppleUSBHostControllerP15IOUSBHostDeviceP18IOUSBHostInterfaceht"))
+        __atomic_fetch_or(&usbRouteMask, 8u, __ATOMIC_RELAXED);
+    patcher.clearError();
+    if (patcher.solveSymbol(index, "__ZN13IOUSBHostPipe28initWithDescriptorsAndOwnersEPKN11StandardUSB18EndpointDescriptorEPKNS0_37SuperSpeedEndpointCompanionDescriptorEP22AppleUSBHostControllerP15IOUSBHostDeviceP18IOUSBHostInterfaceht"))
+        __atomic_fetch_or(&usbRouteMask, 16u, __ATOMIC_RELAXED);
+    patcher.clearError();
+    if (!usbInstall)
+        SYSLOG(MODULE_IBTP, "USB-layer hooks probe-only (IBTUsbMask=0x%x); add boot-arg -ibtusb to install deviceRequest", usbRouteMask);
     // 1.9.24 (#514): Tahoe 的三条 IOUSBHostIOSource::io 重载。逐条单独提交，
     // 任何一条失败不影响其它（Completion 挂上就停掉 Pipe 层包装）。
     if (getKernelVersion() >= KernelVersion::Tahoe) {
