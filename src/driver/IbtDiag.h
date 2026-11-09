@@ -49,6 +49,11 @@ struct IbtDiagSnapshot {
     unsigned int apfsRlOnBt;
     unsigned int apfsSolve;     // 1.9.9: 四个 APFS 符号各自是否解析成功（0..3 位），区分"kext 没找到/符号没找到"
     unsigned int apfsRetry;     // 1.9.37: APFS 吞错层延迟补装的尝试拍数（0=启动即武装完整）
+    // 1.9.38: KC 磁盘符号表直读路线（26.7.3 上 APFS 内嵌 KC，Lilu 两条路全败）
+    unsigned int kcSolve;       // KC 文件符号表里四个 APFS 符号各自找到（0..3 位）
+    unsigned int kcRoute;       // 经 KC 地址路由成功的钩子（0..3 位）
+    unsigned int kcStatus;      // KC 解析状态：1/4/5=可重试失败 2/3=永久失败 6=slide 验证失败 7=就绪
+    unsigned long long kcSlide; // 交叉验证后的 kernel slide（0 = 尚未得出）
     unsigned int patchedPages;  // 本 boot 记录到的补丁页数（诊断附注，不作判定）
     unsigned long long lastOffset;  // 最后一次被吞的校验起点
     unsigned long long lastSize;    // 最后一次被吞的校验长度

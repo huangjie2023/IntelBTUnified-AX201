@@ -100,6 +100,11 @@
 // 1.9.18: ubc_create_upl / ubc_upl_abort / vnode_ref 钉页路线
 #include <sys/ubc.h>
 #include <sys/vnode.h>
+// 1.9.38: 直接读 BootKernelExtensions.kc 的符号表（26.7.3 上 APFS 内嵌 KC，
+// Lilu 的两条符号解析路都拿不到 APFS 符号，见 kcParseSymtab 处注释）。
+#include <sys/uio.h>
+#include <mach-o/loader.h>
+#include <mach-o/nlist.h>
 
 #include "Devices.h"
 #include "driver/IbtDiag.h"
@@ -1719,6 +1724,212 @@ static int patched_apfs_verify_rl(vnode_t vp, off_t offset, void *a3, void *a4, 
 }
 
 // ---------------------------------------------------------------------------
+// ---------------------------------------------------------------------------
+// 1.9.38: 直接解析磁盘上 BootKernelExtensions.kc 的符号表，按地址挂钩。
+//
+// 证据链（1.9.36/1.9.37 两轮实测 + 本机读数）：
+//   - kmutil inspect 实证 26.7.3 的 AppleAPFS 是 fileset entry 内嵌在
+//     BootKernelExtensions.kc 里（LC_FILESET_ENTRY），不是独立 kext；
+//   - IBTApfsSolve=0 + IBTApfsRetry=12：Lilu 两条符号路（APFS kinfo /
+//     KernelID）在真机上全部失败——KernelID 只扫运行时 symtab，fileset
+//     kext 的符号不在里面；
+//   - grep 磁盘 KC 文件：_apfs_pagein_with_verification 等符号名字符串
+//     实实在在存在于文件里（磁盘 KC 保留全量符号表）；
+//   - SSV 保证启动加载的 KC 与磁盘文件逐字节一致 → 文件符号表的 n_value
+//     （未加 slide 的 vmaddr）加上 kernel slide 就是运行时真地址。
+//
+// 做法：
+//   1. vnode 读 KC 头（32KB），找 LC_SYMTAB（symoff/nsyms/stroff/strsize）；
+//   2. IOMalloc 读出符号表+字符串表（几 MB，一次性，常驻到钩子挂齐）；
+//   3. 用两个内核导出符号交叉计算 kernel slide：KernelID 可解析的运行时
+//      地址 - 文件表里的 n_value。两个参考符号结果必须一致、20 位对齐、
+//      量级合理，否则放弃（绝不带错地址写内核）；
+//   4. 对四个 APFS 符号逐个查表，构造 symbol=nullptr 的 RouteRequest
+//      （routeMultipleInternal 对 null symbol 跳过解析、直接用预填的
+//      from 地址），经 routeMultipleLong(KernelID) 挂钩——trampoline
+//      分配走内核 kinfo 的正常路径，与普通内核路由同一条代码。
+// 任何一步校验不过 → 该层放弃，零写入。所有失败都会记进 IBTKcStatus。
+//
+// 状态码：1=文件打不开（root 未挂载等，可重试） 2=魔数/架构不对（永久）
+//         3=没找到 LC_SYMTAB 或参数越界（永久） 4=读符号表失败（可重试）
+//         5=读字符串表失败（可重试） 6=参考符号算不出一致 slide  7=符号表就绪
+static uint8_t  *kcSymBuf  = nullptr;   // nlist_64 数组（从文件读出）
+static char     *kcStrBuf  = nullptr;   // 字符串表
+static uint32_t  kcNsyms   = 0;
+static uint32_t  kcStrSize = 0;
+static uint32_t  kcStatus  = 0;         // 对外暴露为 IBTKcStatus
+static bool      kcParseDead = false;   // 永久性失败，不再重试解析
+static bool      kcSlideOk   = false;
+static mach_vm_address_t kcSlide  = 0;  // 交叉验证后的 kernel slide
+
+static void kcFreeBuffers() {
+    if (kcSymBuf) { IOFree(kcSymBuf, static_cast<size_t>(kcNsyms) * sizeof(nlist_64)); kcSymBuf = nullptr; }
+    if (kcStrBuf) { IOFree(kcStrBuf, kcStrSize); kcStrBuf = nullptr; }
+    kcNsyms = 0;
+    kcStrSize = 0;
+}
+
+static bool kcReadFileAt(const char *path, uint64_t off, void *buf, size_t len) {
+    vnode_t vp = nullptr;
+    vfs_context_t ctxt = vfs_context_create(nullptr);
+    bool ok = false;
+    do {
+        if (vnode_lookup(path, 0, &vp, ctxt) != 0)
+            break;
+        uio_t uio = uio_create(1, off, UIO_SYSSPACE, UIO_READ);
+        if (!uio)
+            break;
+        if (uio_addiov(uio, CAST_USER_ADDR_T(buf), len) != 0) {
+            uio_free(uio);
+            break;
+        }
+        int err = VNOP_READ(vp, uio, 0, ctxt);
+        int resid = err ? 1 : (uio_resid(uio) != 0);
+        uio_free(uio);
+        if (err || resid)
+            break;
+        ok = true;
+    } while (false);
+    if (vp != nullptr)
+        vnode_put(vp);
+    vfs_context_rele(ctxt);
+    return ok;
+}
+
+static bool kcParseSymtab() {
+    if (kcSymBuf != nullptr && kcStrBuf != nullptr)
+        return true;   // 已就绪
+    kcFreeBuffers();
+    static const char *kKcPath = "/System/Library/KernelCollections/BootKernelExtensions.kc";
+    static constexpr uint32_t kHdrSize = 32 * 1024;
+    auto hdr = reinterpret_cast<uint8_t *>(IOMalloc(kHdrSize));   // 不能用栈：内核栈只有 16K
+    if (!hdr) { kcStatus = 4; return false; }
+    bool ok = kcReadFileAt(kKcPath, 0, hdr, kHdrSize);
+    if (!ok) {
+        IOFree(hdr, kHdrSize);
+        kcStatus = 1;
+        return false;
+    }
+    do {
+        auto mh = reinterpret_cast<mach_header_64 *>(hdr);
+        // MH_FILESET 常量在旧 SDK 里不存在（Lilu 同样用字面量 0xC）
+        if (mh->magic != MH_MAGIC_64 || mh->cputype != CPU_TYPE_X86_64 || mh->filetype != 0xC) {
+            kcStatus = 2;
+            break;
+        }
+        symtab_command *st = nullptr;
+        size_t off = sizeof(mach_header_64);
+        for (uint32_t i = 0; i < mh->ncmds; i++) {
+            if (off + sizeof(load_command) > kHdrSize)
+                break;
+            auto lc = reinterpret_cast<load_command *>(hdr + off);
+            if (lc->cmdsize < sizeof(load_command) || off + lc->cmdsize > kHdrSize)
+                break;
+            if (lc->cmd == LC_SYMTAB) {
+                st = reinterpret_cast<symtab_command *>(lc);
+                break;
+            }
+            off += lc->cmdsize;
+        }
+        if (!st || st->nsyms == 0 || st->nsyms > 1000000u ||
+            st->strsize == 0 || st->strsize > (48u << 20) ||
+            st->symoff > (64u << 20) || st->stroff > (64u << 20)) {
+            kcStatus = 3;
+            break;
+        }
+        kcNsyms   = st->nsyms;
+        kcStrSize = st->strsize;
+        kcSymBuf  = reinterpret_cast<uint8_t *>(IOMalloc(static_cast<size_t>(kcNsyms) * sizeof(nlist_64)));
+        kcStrBuf  = reinterpret_cast<char *>(IOMalloc(kcStrSize));
+        if (!kcSymBuf || !kcStrBuf) { kcStatus = 4; break; }
+        if (!kcReadFileAt(kKcPath, st->symoff, kcSymBuf, static_cast<size_t>(kcNsyms) * sizeof(nlist_64))) {
+            kcStatus = 4;
+            break;
+        }
+        if (!kcReadFileAt(kKcPath, st->stroff, kcStrBuf, kcStrSize)) {
+            kcStatus = 5;
+            break;
+        }
+        kcStatus = 7;
+    } while (false);
+    IOFree(hdr, kHdrSize);
+    if (kcStatus != 7)
+        kcFreeBuffers();
+    return kcStatus == 7;
+}
+
+// 精确匹配一个符号，返回文件里的未加 slide 的 n_value；0 = 没找到。
+// 只认 N_SECT 类型的定义项（APFS 四符号都是 fileset 内的 static/全局函数）。
+static mach_vm_address_t kcFindSym(const char *name) {
+    if (!kcSymBuf || !kcStrBuf)
+        return 0;
+    size_t len = strlen(name) + 1;
+    auto nl = reinterpret_cast<nlist_64 *>(kcSymBuf);
+    for (uint32_t i = 0; i < kcNsyms; i++, nl++) {
+        if ((nl->n_type & N_STAB) != 0)
+            continue;
+        if ((nl->n_type & N_TYPE) != N_SECT || nl->n_sect == 0)
+            continue;
+        if (nl->n_un.n_strx == 0 || nl->n_un.n_strx + len > kcStrSize)
+            continue;
+        if (memcmp(kcStrBuf + nl->n_un.n_strx, name, len) == 0)
+            return nl->n_value;
+    }
+    return 0;
+}
+
+// kernel slide 交叉验证：至少两个参考符号（KernelID 可解析 + 文件表里也有）
+// 独立算出的 slide 完全一致、非零、20 位对齐、< 4GB，才允许用。
+static bool kcComputeSlide(KernelPatcher &patcher) {
+    if (kcSlideOk)
+        return true;
+    static const char *kcRefSyms[3] { "_IOLog", "_vn_getpath", "_kmod" };
+    mach_vm_address_t slide = 0;
+    size_t agree = 0;
+    for (size_t i = 0; i < arrsize(kcRefSyms); i++) {
+        auto fileVal = kcFindSym(kcRefSyms[i]);
+        auto runVal  = patcher.solveSymbol(KernelPatcher::KernelID, kcRefSyms[i]);
+        if (!fileVal || !runVal || runVal <= fileVal)
+            continue;
+        auto s = runVal - fileVal;
+        if (s >= (1ull << 32) || (s & 0xFFFFFull) != 0)
+            continue;
+        if (agree == 0) {
+            slide = s;
+            agree = 1;
+        } else if (slide == s) {
+            agree = 2;
+        } else {
+            SYSLOG(MODULE_BTLFX, "kc slide mismatch between reference symbols, aborting kc route");
+            kcStatus = 6;
+            return false;
+        }
+    }
+    if (agree < 2) {
+        kcStatus = 6;
+        return false;
+    }
+    kcSlide = slide;
+    kcSlideOk = true;
+    SYSLOG(MODULE_BTLFX, "kc slide cross-verified: 0x%llx", kcSlide);
+    return true;
+}
+
+// 1.9.38: 按显式地址挂一个钩子（走 Lilu 的正常 trampoline 路径）。
+// RouteRequest 的 symbol 传 nullptr 时 routeMultipleInternal 会跳过符号解析、
+// 直接使用预填的 from——这是我们能把文件符号表地址喂给 Lilu 的唯一正门。
+static bool kcRouteOne(KernelPatcher &patcher, const char *sym, void *patchedFn, mach_vm_address_t &origFn) {
+    auto val = kcFindSym(sym);
+    if (!val || val < 0xffffff7000000000ull || val > 0xffffffA000000000ull)
+        return false;
+    KernelPatcher::RouteRequest req(nullptr, patchedFn, origFn);
+    req.from = val + kcSlide;
+    SYSLOG(MODULE_BTLFX, "kc route %s at 0x%llx (file 0x%llx + slide 0x%llx)",
+           sym, static_cast<unsigned long long>(req.from),
+           static_cast<unsigned long long>(val), static_cast<unsigned long long>(kcSlide));
+    return patcher.routeMultipleLong(KernelPatcher::KernelID, &req, 1);
+}
+
 // 1.9.37: APFS 四符号的解析+路由抽成幂等函数。
 //
 // 背景（1.9.25 实测）：IBTApfsSolve 曾整轮为 0 —— APFS kinfo 的加载/解析存在
@@ -1727,6 +1938,16 @@ static int patched_apfs_verify_rl(vnode_t vp, off_t offset, void *a3, void *a4, 
 // 这一层：吞错缺席 = error 94 直接穿透 = bluetoothd exec 失败。processPatcher
 // 只跑一次、无重试，这是 1.9.36 的真实缺口。本函数可重复执行：已解析的位
 // 跳过、已路由的钩子跳过，由 ibtApfsRetry() 在 diag timer 里延迟补装。
+// 1.9.38: KC 路由的跨拍状态。kcSolveMask/kcRouteMask 的 0..3 位对应
+// apfsSyms[] 的顺序（vnop_verify / pagein_with_verification / unc / rangelist）。
+static uint32_t kcSolveMask = 0;
+static uint32_t kcRouteMask = 0;
+// Lilu 在 onPatcherLoad 回调里传入的 patcher 是长生命周期对象（kinfos /
+// kernelWriteLock 都在里面），重试补装复用它。1.9.37 每拍新建 KernelPatcher
+// 是无效代码：构造函数不初始化 kinfos，init() 又没有 EXPORT，solve/route
+// 全部空转——这也是 1.9.37 十二拍全败的第二个原因（第一原因是符号确实不在）。
+static KernelPatcher *kcPatchPatcher = nullptr;
+
 static bool apfsHooksComplete = false;
 static uint32_t apfsRetryCount = 0;
 
@@ -1750,6 +1971,21 @@ static bool apfsArmPass(KernelPatcher &patcher) {
             if (patcher.solveSymbol(apfsSymId, apfsSyms[i]))
                 __atomic_fetch_or(&apfsSolveMask, 1u << i, __ATOMIC_RELAXED);
 
+    // 1.9.38: 第三条路 —— 磁盘 KC 符号表按地址挂钩。前两条（APFS kinfo /
+    // KernelID）在 26.7.3 上实证全败（APFS 是 fileset entry，Lilu 解析不到）。
+    // 文件读不开（root 未挂载）属于瞬态，留给下一拍；文件结构不对才标记死。
+    if (!kcSlideOk && !kcParseDead) {
+        if (kcParseSymtab()) {
+            if (kcComputeSlide(patcher))
+                for (size_t i = 0; i < arrsize(apfsSyms); i++)
+                    if (kcFindSym(apfsSyms[i]))
+                        __atomic_fetch_or(&kcSolveMask, 1u << i, __ATOMIC_RELAXED);
+        } else if (kcStatus == 2 || kcStatus == 3) {
+            kcParseDead = true;
+            SYSLOG(MODULE_BTLFX, "kc symtab parse failed permanently (status %u), kc route disabled", kcStatus);
+        }
+    }
+
     // 两条路径都试：先 APFS kinfo 的 id，失败退 KernelID（1.9.8 的路径）。
     auto routeApfs = [&](KernelPatcher::RouteRequest &req) -> bool {
         if (patcher.routeMultipleLong(apfsSymId, &req, 1))
@@ -1766,6 +2002,11 @@ static bool apfsArmPass(KernelPatcher &patcher) {
             apfsVerifyArmed = true;
             __atomic_fetch_or(&symMask, 0x10u, __ATOMIC_RELAXED);
             SYSLOG(MODULE_BTLFX, "apfs_vnop_verify bypass armed%s", apfsRetryCount ? " (deferred re-arm)" : "");
+        } else if (kcSlideOk && kcRouteOne(patcher, "_apfs_vnop_verify", reinterpret_cast<void *>(patched_apfs_vnop_verify), orig_apfs_vnop_verify)) {
+            apfsVerifyArmed = true;
+            __atomic_fetch_or(&symMask, 0x10u, __ATOMIC_RELAXED);
+            __atomic_fetch_or(&kcRouteMask, 1u << 0, __ATOMIC_RELAXED);
+            SYSLOG(MODULE_BTLFX, "apfs_vnop_verify bypass armed via kc address route");
         } else
             done = false;
     }
@@ -1775,6 +2016,11 @@ static bool apfsArmPass(KernelPatcher &patcher) {
             apfsPiBypassArmed = true;
             __atomic_fetch_or(&symMask, 0x20u, __ATOMIC_RELAXED);
             SYSLOG(MODULE_BTLFX, "apfs_pagein_with_verification EBADMSG bypass armed%s", apfsRetryCount ? " (deferred re-arm)" : "");
+        } else if (kcSlideOk && kcRouteOne(patcher, "_apfs_pagein_with_verification", reinterpret_cast<void *>(patched_apfs_pagein_verif), orig_apfs_pagein_verif)) {
+            apfsPiBypassArmed = true;
+            __atomic_fetch_or(&symMask, 0x20u, __ATOMIC_RELAXED);
+            __atomic_fetch_or(&kcRouteMask, 1u << 1, __ATOMIC_RELAXED);
+            SYSLOG(MODULE_BTLFX, "apfs_pagein_with_verification EBADMSG bypass armed via kc address route");
         } else
             done = false;
     }
@@ -1782,20 +2028,30 @@ static bool apfsArmPass(KernelPatcher &patcher) {
         KernelPatcher::RouteRequest req("_apfs_verify_uncompressed_data", patched_apfs_verify_unc, orig_apfs_verify_unc);
         if (routeApfs(req))
             __atomic_fetch_or(&symMask, 0x40u, __ATOMIC_RELAXED);
-        else
+        else if (kcSlideOk && kcRouteOne(patcher, "_apfs_verify_uncompressed_data", reinterpret_cast<void *>(patched_apfs_verify_unc), orig_apfs_verify_unc)) {
+            __atomic_fetch_or(&symMask, 0x40u, __ATOMIC_RELAXED);
+            __atomic_fetch_or(&kcRouteMask, 1u << 2, __ATOMIC_RELAXED);
+        } else
             done = false;
     }
     if ((__atomic_load_n(&symMask, __ATOMIC_RELAXED) & 0x80u) == 0) {
         KernelPatcher::RouteRequest req("_apfs_verify_rangelist", patched_apfs_verify_rl, orig_apfs_verify_rl);
         if (routeApfs(req))
             __atomic_fetch_or(&symMask, 0x80u, __ATOMIC_RELAXED);
-        else
+        else if (kcSlideOk && kcRouteOne(patcher, "_apfs_verify_rangelist", reinterpret_cast<void *>(patched_apfs_verify_rl), orig_apfs_verify_rl)) {
+            __atomic_fetch_or(&symMask, 0x80u, __ATOMIC_RELAXED);
+            __atomic_fetch_or(&kcRouteMask, 1u << 3, __ATOMIC_RELAXED);
+        } else
             done = false;
     }
     return done;
 }
 
-static void processPatcher(KernelPatcher &patcher) {    const bool argOta    = checkKernelArgument("-ibtota");    legacyCsPatching     = checkKernelArgument("-ibtplegacy");
+static void processPatcher(KernelPatcher &patcher) {
+    // 1.9.38: 保存这个长生命周期 patcher（Lilu 的 onPatcherLoad 回调实例），
+    // 供 ibtApfsRetry 的延迟补装复用——见 kcPatchPatcher 处注释。
+    kcPatchPatcher = &patcher;
+    const bool argOta    = checkKernelArgument("-ibtota");    legacyCsPatching     = checkKernelArgument("-ibtplegacy");
     // 1.9.21: 传输死亡自动救砖（wedge 自愈），默认启用；-ibt-norescue 关闭。
     // 判据与流程见 IbtDiag.h；本变量在驱动 start() 里读取。
     gIbtRescueDisabled = checkKernelArgument("-ibt-norescue");
@@ -1917,15 +2173,28 @@ static void processPatcher(KernelPatcher &patcher) {    const bool argOta    = c
 void ibtApfsRetry() {
     if (apfsHooksComplete || disableCsPatching)
         return;
-    if (apfsRetryCount >= 12)
+    if (apfsRetryCount >= 12) {
+        // 1.9.38: 十二拍都没挂齐，符号表缓冲区不再有用，释放。
+        kcFreeBuffers();
         return;
+    }
     apfsRetryCount++;
-    KernelPatcher patcher;
-    apfsHooksComplete = apfsArmPass(patcher);
-    if (apfsRetryCount <= 3 || apfsHooksComplete)
-        SYSLOG(MODULE_BTLFX, "apfs hooks deferred arm pass #%u: %s (solve 0x%x verify=%d pagein=%d)",
-               apfsRetryCount, apfsHooksComplete ? "COMPLETE" : "partial",
-               apfsSolveMask, apfsVerifyArmed, apfsPiBypassArmed);
+    // 1.9.38: 修正 1.9.37 的无效重试——每拍新建的 KernelPatcher 构造函数不
+    // 初始化 kinfos（init() 也没有 EXPORT），solve/route 全部空转。改用
+    // processPatcher 捕获的 Lilu 长生命周期实例。
+    if (!kcPatchPatcher) {
+        SYSLOG(MODULE_BTLFX, "apfs hooks deferred arm: no patcher captured yet, skip");
+        return;
+    }
+    apfsHooksComplete = apfsArmPass(*kcPatchPatcher);
+    if (apfsHooksComplete) {
+        kcFreeBuffers();   // 四条钩子全部在位，符号表缓冲用完即弃
+        SYSLOG(MODULE_BTLFX, "apfs hooks COMPLETE after %u beats (solve 0x%x kcSolve 0x%x kcRoute 0x%x)",
+               apfsRetryCount, apfsSolveMask, kcSolveMask, kcRouteMask);
+    } else if (apfsRetryCount <= 3) {
+        SYSLOG(MODULE_BTLFX, "apfs hooks deferred arm pass #%u: partial (solve 0x%x verify=%d pagein=%d kcStatus=%u)",
+               apfsRetryCount, apfsSolveMask, apfsVerifyArmed, apfsPiBypassArmed, kcStatus);
+    }
 }
 
 #pragma mark - Lilu
@@ -1966,6 +2235,11 @@ void ibtDiagFill(IbtDiagSnapshot *out) {
     out->apfsRlOnBt   = __atomic_load_n(&apfsRlOnBt, __ATOMIC_RELAXED);
     out->apfsSolve    = __atomic_load_n(&apfsSolveMask, __ATOMIC_RELAXED);
     out->apfsRetry    = apfsRetryCount;
+    // 1.9.38: KC 磁盘符号表直读路线的读数
+    out->kcSolve      = __atomic_load_n(&kcSolveMask, __ATOMIC_RELAXED);
+    out->kcRoute      = __atomic_load_n(&kcRouteMask, __ATOMIC_RELAXED);
+    out->kcStatus     = kcStatus;
+    out->kcSlide      = kcSlide;
     out->pmEvents     = 0; // 由驱动层覆盖
     out->patchedPages = __atomic_load_n(&patchedPageCount, __ATOMIC_RELAXED);
     out->lastOffset   = __atomic_load_n(&lastVerifyOffset, __ATOMIC_RELAXED);

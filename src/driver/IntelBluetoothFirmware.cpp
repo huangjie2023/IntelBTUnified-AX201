@@ -109,6 +109,11 @@ void ibtDiagPublishLive()
     svc->setProperty("IBTApfsRlOnBt", (unsigned long long)s.apfsRlOnBt, 32);
     svc->setProperty("IBTApfsSolve", (unsigned long long)s.apfsSolve, 32);
     svc->setProperty("IBTApfsRetry", (unsigned long long)s.apfsRetry, 32);
+    // 1.9.38: KC 磁盘符号表直读路线读数
+    svc->setProperty("IBTKcSolve", (unsigned long long)s.kcSolve, 32);
+    svc->setProperty("IBTKcRoute", (unsigned long long)s.kcRoute, 32);
+    svc->setProperty("IBTKcStatus", (unsigned long long)s.kcStatus, 32);
+    svc->setProperty("IBTKcSlide", (unsigned long long)s.kcSlide, 64);
     svc->setProperty("IBTPmEvents", (unsigned long long)s.pmEvents, 32);
     svc->setProperty("IBTPatchedPages", (unsigned long long)s.patchedPages, 32);
     svc->setProperty("IBTLastOffset", s.lastOffset, 64);
