@@ -1670,8 +1670,8 @@ static int patched_decmpfs_validate(vnode_t vp, off_t offset, uint8_t *buf, size
 // bufsize 未知时传 0，此时页偏移比对退化成"只记 offset"，不影响吞不吞的决定。
 static mach_vm_address_t orig_apfs_vnop_verify {};
 
-static int patched_apfs_vnop_verify(vnode_t vp, off_t offset, void *a3, void *a4, void *a5, void *a6, void *a7, void *a8, void *a9) {
-    int err = FunctionCast(patched_apfs_vnop_verify, orig_apfs_vnop_verify)(vp, offset, a3, a4, a5, a6, a7, a8, a9);
+static int patched_apfs_vnop_verify(vnode_t vp, off_t offset, void *a3, void *a4, void *a5, void *a6, void *a7, void *a8, void *a9, void *a10, void *a11, void *a12, void *a13, void *a14) {
+    int err = FunctionCast(patched_apfs_vnop_verify, orig_apfs_vnop_verify)(vp, offset, a3, a4, a5, a6, a7, a8, a9, a10, a11, a12, a13, a14);
     __atomic_fetch_add(&apfsVerAll, 1, __ATOMIC_RELAXED);
     if (vp == nullptr || disableVerifyBypass || !apfsVerifyArmed)
         return err;
@@ -1692,8 +1692,8 @@ static mach_vm_address_t orig_apfs_pagein_verif {};
 // 1.9.24: 从"只计数"升级为"计数 + 吞错"（理由见 apfsPiBypassArmed 处注释）。
 // 前几版只计数的形态保留在计数器里：apfsPiAll / apfsPiOnBt 语义不变，
 // 吞掉与否由 handleBtVerifyError 的统一判据决定（bt vnode + EBADMSG）。
-static int patched_apfs_pagein_verif(vnode_t vp, off_t offset, void *a3, void *a4, void *a5, void *a6, void *a7, void *a8, void *a9) {
-    int err = FunctionCast(patched_apfs_pagein_verif, orig_apfs_pagein_verif)(vp, offset, a3, a4, a5, a6, a7, a8, a9);
+static int patched_apfs_pagein_verif(vnode_t vp, off_t offset, void *a3, void *a4, void *a5, void *a6, void *a7, void *a8, void *a9, void *a10, void *a11, void *a12, void *a13, void *a14) {
+    int err = FunctionCast(patched_apfs_pagein_verif, orig_apfs_pagein_verif)(vp, offset, a3, a4, a5, a6, a7, a8, a9, a10, a11, a12, a13, a14);
     __atomic_fetch_add(&apfsPiAll, 1, __ATOMIC_RELAXED);
     bool onBt = (vp != nullptr && isBtVnode(vp));
     if (!onBt)
@@ -1707,20 +1707,20 @@ static int patched_apfs_pagein_verif(vnode_t vp, off_t offset, void *a3, void *a
 
 static mach_vm_address_t orig_apfs_verify_unc {};
 
-static int patched_apfs_verify_unc(vnode_t vp, off_t offset, void *a3, void *a4, void *a5, void *a6, void *a7, void *a8, void *a9) {
+static int patched_apfs_verify_unc(vnode_t vp, off_t offset, void *a3, void *a4, void *a5, void *a6, void *a7, void *a8, void *a9, void *a10, void *a11, void *a12, void *a13, void *a14) {
     __atomic_fetch_add(&apfsUncAll, 1, __ATOMIC_RELAXED);
     if (vp != nullptr && isBtVnode(vp))
         __atomic_fetch_add(&apfsUncOnBt, 1, __ATOMIC_RELAXED);
-    return FunctionCast(patched_apfs_verify_unc, orig_apfs_verify_unc)(vp, offset, a3, a4, a5, a6, a7, a8, a9);
+    return FunctionCast(patched_apfs_verify_unc, orig_apfs_verify_unc)(vp, offset, a3, a4, a5, a6, a7, a8, a9, a10, a11, a12, a13, a14);
 }
 
 static mach_vm_address_t orig_apfs_verify_rl {};
 
-static int patched_apfs_verify_rl(vnode_t vp, off_t offset, void *a3, void *a4, void *a5, void *a6, void *a7, void *a8, void *a9) {
+static int patched_apfs_verify_rl(vnode_t vp, off_t offset, void *a3, void *a4, void *a5, void *a6, void *a7, void *a8, void *a9, void *a10, void *a11, void *a12, void *a13, void *a14) {
     __atomic_fetch_add(&apfsRlAll, 1, __ATOMIC_RELAXED);
     if (vp != nullptr && isBtVnode(vp))
         __atomic_fetch_add(&apfsRlOnBt, 1, __ATOMIC_RELAXED);
-    return FunctionCast(patched_apfs_verify_rl, orig_apfs_verify_rl)(vp, offset, a3, a4, a5, a6, a7, a8, a9);
+    return FunctionCast(patched_apfs_verify_rl, orig_apfs_verify_rl)(vp, offset, a3, a4, a5, a6, a7, a8, a9, a10, a11, a12, a13, a14);
 }
 
 // ---------------------------------------------------------------------------
@@ -1878,6 +1878,25 @@ static mach_vm_address_t kcFindSym(const char *name) {
     return 0;
 }
 
+// 路由前的唯一性校验：同一名字在全符号表出现多次说明表结构有歧义，
+// 取第一个匹配太危险，直接放弃。
+static bool kcSymUnique(const char *name) {
+    if (!kcSymBuf || !kcStrBuf)
+        return false;
+    size_t len = strlen(name) + 1;
+    auto nl = reinterpret_cast<nlist_64 *>(kcSymBuf);
+    int found = 0;
+    for (uint32_t i = 0; i < kcNsyms; i++, nl++) {
+        if ((nl->n_type & N_STAB) != 0 || (nl->n_type & N_TYPE) != N_SECT || nl->n_sect == 0)
+            continue;
+        if (nl->n_un.n_strx == 0 || nl->n_un.n_strx + len > kcStrSize)
+            continue;
+        if (memcmp(kcStrBuf + nl->n_un.n_strx, name, len) == 0 && ++found > 1)
+            return false;
+    }
+    return found == 1;
+}
+
 // kernel slide 交叉验证：至少两个参考符号（KernelID 可解析 + 文件表里也有）
 // 独立算出的 slide 完全一致、非零、20 位对齐、< 4GB，才允许用。
 static bool kcComputeSlide(KernelPatcher &patcher) {
@@ -1920,7 +1939,7 @@ static bool kcComputeSlide(KernelPatcher &patcher) {
 // 直接使用预填的 from——这是我们能把文件符号表地址喂给 Lilu 的唯一正门。
 static bool kcRouteOne(KernelPatcher &patcher, const char *sym, void *patchedFn, mach_vm_address_t &origFn) {
     auto val = kcFindSym(sym);
-    if (!val || val < 0xffffff7000000000ull || val > 0xffffffA000000000ull)
+    if (!val || val < 0xffffff7000000000ull || val > 0xffffffA000000000ull || !kcSymUnique(sym))
         return false;
     KernelPatcher::RouteRequest req(nullptr, patchedFn, origFn);
     req.from = val + kcSlide;
@@ -1942,6 +1961,14 @@ static bool kcRouteOne(KernelPatcher &patcher, const char *sym, void *patchedFn,
 // apfsSyms[] 的顺序（vnop_verify / pagein_with_verification / unc / rangelist）。
 static uint32_t kcSolveMask = 0;
 static uint32_t kcRouteMask = 0;
+// 1.9.39: KC 层默认关闭。1.9.38 的教训：KC 钩子在开机中途（diag timer 第
+// 1~2 拍）就挂上了热点 pagein 路径，而 apfs_pagein_with_verification 的真实
+// 参数个数从未验证过（历史上 Solve=0，包装函数从未真实运行过），开机 pagein
+// 全量穿过未实测的包装 → 开机 panic。现在需要 -ibtapfskc 显式开启，且只在
+// 第 8 拍（开机约 2 分钟后）武装：不开机环、错过 pagein 风暴、路由竞态窗口
+// 也大幅缩小。只挂 pagein 一个钩子（真正的崩溃向量）；verify 路径已由内核层
+// _VNOP_VERIFY 钩子（多版本验证在岗）覆盖，不再冒险重复挂。
+static bool kcEnabled = false;
 // Lilu 在 onPatcherLoad 回调里传入的 patcher 是长生命周期对象（kinfos /
 // kernelWriteLock 都在里面），重试补装复用它。1.9.37 每拍新建 KernelPatcher
 // 是无效代码：构造函数不初始化 kinfos，init() 又没有 EXPORT，solve/route
@@ -1971,10 +1998,12 @@ static bool apfsArmPass(KernelPatcher &patcher) {
             if (patcher.solveSymbol(apfsSymId, apfsSyms[i]))
                 __atomic_fetch_or(&apfsSolveMask, 1u << i, __ATOMIC_RELAXED);
 
-    // 1.9.38: 第三条路 —— 磁盘 KC 符号表按地址挂钩。前两条（APFS kinfo /
-    // KernelID）在 26.7.3 上实证全败（APFS 是 fileset entry，Lilu 解析不到）。
-    // 文件读不开（root 未挂载）属于瞬态，留给下一拍；文件结构不对才标记死。
-    if (!kcSlideOk && !kcParseDead) {
+    // 1.9.38/1.9.39: 第三条路 —— 磁盘 KC 符号表按地址挂钩。前两条（APFS
+    // kinfo / KernelID）在 26.7.3 上实证全败（APFS 是 fileset entry，Lilu
+    // 解析不到）。1.9.39 双重门控：-ibtapfskc 显式开启 + 第 8 拍起（开机约
+    // 2 分钟后，见 kcEnabled 处注释）。文件读不开（root 未挂载）属于瞬态，
+    // 留给下一拍；文件结构不对才标记死。
+    if (kcEnabled && !kcSlideOk && !kcParseDead && apfsRetryCount >= 8) {
         if (kcParseSymtab()) {
             if (kcComputeSlide(patcher))
                 for (size_t i = 0; i < arrsize(apfsSyms); i++)
@@ -2002,13 +2031,8 @@ static bool apfsArmPass(KernelPatcher &patcher) {
             apfsVerifyArmed = true;
             __atomic_fetch_or(&symMask, 0x10u, __ATOMIC_RELAXED);
             SYSLOG(MODULE_BTLFX, "apfs_vnop_verify bypass armed%s", apfsRetryCount ? " (deferred re-arm)" : "");
-        } else if (kcSlideOk && kcRouteOne(patcher, "_apfs_vnop_verify", reinterpret_cast<void *>(patched_apfs_vnop_verify), orig_apfs_vnop_verify)) {
-            apfsVerifyArmed = true;
-            __atomic_fetch_or(&symMask, 0x10u, __ATOMIC_RELAXED);
-            __atomic_fetch_or(&kcRouteMask, 1u << 0, __ATOMIC_RELAXED);
-            SYSLOG(MODULE_BTLFX, "apfs_vnop_verify bypass armed via kc address route");
         } else
-            done = false;
+            done = false;   // 1.9.39: verify 路径由内核层 _VNOP_VERIFY 钩子覆盖，KC 不重复挂
     }
     if (!apfsPiBypassArmed) {
         KernelPatcher::RouteRequest req("_apfs_pagein_with_verification", patched_apfs_pagein_verif, orig_apfs_pagein_verif);
@@ -2020,7 +2044,7 @@ static bool apfsArmPass(KernelPatcher &patcher) {
             apfsPiBypassArmed = true;
             __atomic_fetch_or(&symMask, 0x20u, __ATOMIC_RELAXED);
             __atomic_fetch_or(&kcRouteMask, 1u << 1, __ATOMIC_RELAXED);
-            SYSLOG(MODULE_BTLFX, "apfs_pagein_with_verification EBADMSG bypass armed via kc address route");
+            SYSLOG(MODULE_BTLFX, "PRIMARY pagein EBADMSG guard armed via kc address route (beat %u)", apfsRetryCount);
         } else
             done = false;
     }
@@ -2028,21 +2052,15 @@ static bool apfsArmPass(KernelPatcher &patcher) {
         KernelPatcher::RouteRequest req("_apfs_verify_uncompressed_data", patched_apfs_verify_unc, orig_apfs_verify_unc);
         if (routeApfs(req))
             __atomic_fetch_or(&symMask, 0x40u, __ATOMIC_RELAXED);
-        else if (kcSlideOk && kcRouteOne(patcher, "_apfs_verify_uncompressed_data", reinterpret_cast<void *>(patched_apfs_verify_unc), orig_apfs_verify_unc)) {
-            __atomic_fetch_or(&symMask, 0x40u, __ATOMIC_RELAXED);
-            __atomic_fetch_or(&kcRouteMask, 1u << 2, __ATOMIC_RELAXED);
-        } else
-            done = false;
+        else
+            done = false;   // 1.9.39: 探针钩子不走 KC（参数个数未验证，1.9.38 panic 教训）
     }
     if ((__atomic_load_n(&symMask, __ATOMIC_RELAXED) & 0x80u) == 0) {
         KernelPatcher::RouteRequest req("_apfs_verify_rangelist", patched_apfs_verify_rl, orig_apfs_verify_rl);
         if (routeApfs(req))
             __atomic_fetch_or(&symMask, 0x80u, __ATOMIC_RELAXED);
-        else if (kcSlideOk && kcRouteOne(patcher, "_apfs_verify_rangelist", reinterpret_cast<void *>(patched_apfs_verify_rl), orig_apfs_verify_rl)) {
-            __atomic_fetch_or(&symMask, 0x80u, __ATOMIC_RELAXED);
-            __atomic_fetch_or(&kcRouteMask, 1u << 3, __ATOMIC_RELAXED);
-        } else
-            done = false;
+        else
+            done = false;   // 1.9.39: 同上
     }
     return done;
 }
@@ -2060,6 +2078,9 @@ static void processPatcher(KernelPatcher &patcher) {
     // -ibtota desactiva todo, -ibtplegacy usa el modo antiguo incondicional.
     disableCsPatching    = argOta;
     SYSLOG(MODULE_BTLFX, "cs_validate patching: %s", disableCsPatching ? "OFF (-ibtota)" : (legacyCsPatching ? "legacy (unconditional)" : "process-scoped"));
+    // 1.9.39: KC 地址路由层默认关闭，-ibtapfskc 显式开启（1.9.38 开机 panic 教训）。
+    kcEnabled = checkKernelArgument("-ibtapfskc");
+    SYSLOG(MODULE_BTLFX, "kc address route (pagein guard): %s", kcEnabled ? "ON (-ibtapfskc, arms at beat 8)" : "OFF (default)");
     // 1.9.15: 这里原本是 `if (getKernelVersion() >= Sonoma) { 只认 -btlfxboardid }`，
     // 也就是 macOS 14 起自动判定整段被跳过。后果在本机实测到了：
     //   IBTBidArmed=No / IBTPatchMask=45（有 vendor、chipset，没有 bit1/bit7）
@@ -2165,15 +2186,15 @@ static void processPatcher(KernelPatcher &patcher) {
 // ---------------------------------------------------------------------------
 // 1.9.37: APFS 吞错层延迟补装。diag timer（15s/拍）每拍调用：
 //   - 启动时武装完整 → 直接返回，零开销；
-//   - 启动抽签缺席（1.9.25 实测形态）→ 每 15s 重试一次，最多 12 拍（约 3 分钟，
-//     覆盖 APFS kinfo 迟注册的一切现实形态）；
+//   - 启动抽签缺席（1.9.25 实测形态）→ 每 15s 重试一次，最多 24 拍（约 6 分钟）；
+//     KC 地址路线（-ibtapfskc）只从第 8 拍起参与（1.9.38 开机 panic 教训）；
 //   - 每拍只补缺件（幂等），全部武装后自动停手。
 // 吞错层在位与否是"用一会就崩（error 94 穿透）"与"稳定可用"之间唯一的抽签项，
 // 这是 #1821 案例对照审计后确定的必修缺口。
 void ibtApfsRetry() {
     if (apfsHooksComplete || disableCsPatching)
         return;
-    if (apfsRetryCount >= 12) {
+    if (apfsRetryCount >= 24) {
         // 1.9.38: 十二拍都没挂齐，符号表缓冲区不再有用，释放。
         kcFreeBuffers();
         return;
