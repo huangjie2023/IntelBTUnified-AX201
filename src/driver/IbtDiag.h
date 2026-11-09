@@ -48,6 +48,7 @@ struct IbtDiagSnapshot {
     unsigned int apfsRlAll;     // _apfs_verify_rangelist 总调用
     unsigned int apfsRlOnBt;
     unsigned int apfsSolve;     // 1.9.9: 四个 APFS 符号各自是否解析成功（0..3 位），区分"kext 没找到/符号没找到"
+    unsigned int apfsRetry;     // 1.9.37: APFS 吞错层延迟补装的尝试拍数（0=启动即武装完整）
     unsigned int patchedPages;  // 本 boot 记录到的补丁页数（诊断附注，不作判定）
     unsigned long long lastOffset;  // 最后一次被吞的校验起点
     unsigned long long lastSize;    // 最后一次被吞的校验长度
@@ -243,6 +244,9 @@ void ibtWireTeardown();
 // ibtWireProcess()（diag timer，同时被收紧到 1s）会 abort 旧 UPL 并重建，
 // 兜底"睡眠路径让 IO_WIRE 失效但引用还在"的场景。
 void ibtWireRewireRequest();
+// 1.9.37: APFS 吞错层延迟补装。diag timer 每拍调用；启动抽签没武装时
+// 每 15s 重试（幂等补缺），全部武装后停手。
+void ibtApfsRetry();
 
 // ---------------------------------------------------------------------------
 // 1.9.21：传输死亡自动救砖（wedge 自愈）。

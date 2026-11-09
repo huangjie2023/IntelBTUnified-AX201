@@ -108,6 +108,7 @@ void ibtDiagPublishLive()
     svc->setProperty("IBTApfsRlAll", (unsigned long long)s.apfsRlAll, 32);
     svc->setProperty("IBTApfsRlOnBt", (unsigned long long)s.apfsRlOnBt, 32);
     svc->setProperty("IBTApfsSolve", (unsigned long long)s.apfsSolve, 32);
+    svc->setProperty("IBTApfsRetry", (unsigned long long)s.apfsRetry, 32);
     svc->setProperty("IBTPmEvents", (unsigned long long)s.pmEvents, 32);
     svc->setProperty("IBTPatchedPages", (unsigned long long)s.patchedPages, 32);
     svc->setProperty("IBTLastOffset", s.lastOffset, 64);
@@ -328,6 +329,8 @@ void IntelBluetoothFirmware::diagTimerFired()
     // 持有 pager/对象锁，在钩子里建 UPL/fault 页会死锁）。处理完再刷新 ioreg
     // 快照，这样 WireOk/WireActive 与属性表始终同步。
     ibtWireProcess();
+    // 1.9.37: APFS 吞错层延迟补装（启动抽签缺席时每拍重试，全武装后停手）。
+    ibtApfsRetry();
     // 1.9.21：救砖巡检与诊断同节奏（15s 一拍）。探测本身只是 open/close 的
     // 独占性试探，不发起任何 USB 传输，对死控制器也安全。
     if (m_rescueEnabled)

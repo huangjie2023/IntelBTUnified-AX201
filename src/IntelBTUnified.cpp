@@ -1533,7 +1533,11 @@ static int handleBtVerifyError(vnode_t vp, off_t offset, size_t bufsize, int err
         return err;
     }
 
-    if (err != EBADMSG) {
+    // 1.9.37: 兼容负 errno。XNU 公开 KPI 层返回正 errno，但 APFS/decmpfs 内部
+    // 各层实现混杂（部分路径以 -EBADMSG 负值向上传播）。26.7.3 上若补丁页所在
+    // 压缩组的校验错误以 -74 到达本钩子，旧判定 `err != EBADMSG` 会把它当
+    // "其他错误"透传 —— 吞错形同虚设。两个符号值都当 EBADMSG 处理。
+    if (err != EBADMSG && err != -EBADMSG) {
         if (__atomic_fetch_add(&verifyOtherErrors, 1, __ATOMIC_RELAXED) == 0)
             SYSLOG(MODULE_BTLFX, "verify returned %d on %s (not EBADMSG, propagated)", err, path[0] ? path : "<bt vnode>");
         return err;
@@ -1714,6 +1718,83 @@ static int patched_apfs_verify_rl(vnode_t vp, off_t offset, void *a3, void *a4, 
     return FunctionCast(patched_apfs_verify_rl, orig_apfs_verify_rl)(vp, offset, a3, a4, a5, a6, a7, a8, a9);
 }
 
+// ---------------------------------------------------------------------------
+// 1.9.37: APFS 四符号的解析+路由抽成幂等函数。
+//
+// 背景（1.9.25 实测）：IBTApfsSolve 曾整轮为 0 —— APFS kinfo 的加载/解析存在
+// 启动时序抽签，抽不中时 apfs_vnop_verify / apfs_pagein_with_verification 的
+// EBADMSG 吞错整层缺席。而 26.7.3 崩溃死循环（apfs_pagein error 94）恰恰走
+// 这一层：吞错缺席 = error 94 直接穿透 = bluetoothd exec 失败。processPatcher
+// 只跑一次、无重试，这是 1.9.36 的真实缺口。本函数可重复执行：已解析的位
+// 跳过、已路由的钩子跳过，由 ibtApfsRetry() 在 diag timer 里延迟补装。
+static bool apfsHooksComplete = false;
+static uint32_t apfsRetryCount = 0;
+
+static bool apfsArmPass(KernelPatcher &patcher) {
+    static const char *apfsPaths[] { "/System/Library/Extensions/AppleAPFS.kext" };
+    patcher.clearError();
+    size_t apfsId = patcher.loadKinfo("com.apple.filesystems.apfs", apfsPaths, arrsize(apfsPaths), false);
+    bool apfsKext = apfsId < 32;   // INVALID 是 SIZE_MAX，任何真实下标都远小于 32
+    if (apfsKext)
+        __atomic_fetch_or(&symMask, 0x100u, __ATOMIC_RELAXED);
+    size_t apfsSymId = apfsKext ? apfsId : KernelPatcher::KernelID;
+
+    const char *apfsSyms[4] {
+        "_apfs_vnop_verify",
+        "_apfs_pagein_with_verification",
+        "_apfs_verify_uncompressed_data",
+        "_apfs_verify_rangelist",
+    };
+    for (size_t i = 0; i < arrsize(apfsSyms); i++)
+        if (!(apfsSolveMask & (1u << i)))
+            if (patcher.solveSymbol(apfsSymId, apfsSyms[i]))
+                __atomic_fetch_or(&apfsSolveMask, 1u << i, __ATOMIC_RELAXED);
+
+    // 两条路径都试：先 APFS kinfo 的 id，失败退 KernelID（1.9.8 的路径）。
+    auto routeApfs = [&](KernelPatcher::RouteRequest &req) -> bool {
+        if (patcher.routeMultipleLong(apfsSymId, &req, 1))
+            return true;
+        if (apfsKext && apfsSymId != KernelPatcher::KernelID)
+            return patcher.routeMultipleLong(KernelPatcher::KernelID, &req, 1);
+        return false;
+    };
+
+    bool done = true;
+    if (!apfsVerifyArmed) {
+        KernelPatcher::RouteRequest req("_apfs_vnop_verify", patched_apfs_vnop_verify, orig_apfs_vnop_verify);
+        if (routeApfs(req)) {
+            apfsVerifyArmed = true;
+            __atomic_fetch_or(&symMask, 0x10u, __ATOMIC_RELAXED);
+            SYSLOG(MODULE_BTLFX, "apfs_vnop_verify bypass armed%s", apfsRetryCount ? " (deferred re-arm)" : "");
+        } else
+            done = false;
+    }
+    if (!apfsPiBypassArmed) {
+        KernelPatcher::RouteRequest req("_apfs_pagein_with_verification", patched_apfs_pagein_verif, orig_apfs_pagein_verif);
+        if (routeApfs(req)) {
+            apfsPiBypassArmed = true;
+            __atomic_fetch_or(&symMask, 0x20u, __ATOMIC_RELAXED);
+            SYSLOG(MODULE_BTLFX, "apfs_pagein_with_verification EBADMSG bypass armed%s", apfsRetryCount ? " (deferred re-arm)" : "");
+        } else
+            done = false;
+    }
+    if ((__atomic_load_n(&symMask, __ATOMIC_RELAXED) & 0x40u) == 0) {
+        KernelPatcher::RouteRequest req("_apfs_verify_uncompressed_data", patched_apfs_verify_unc, orig_apfs_verify_unc);
+        if (routeApfs(req))
+            __atomic_fetch_or(&symMask, 0x40u, __ATOMIC_RELAXED);
+        else
+            done = false;
+    }
+    if ((__atomic_load_n(&symMask, __ATOMIC_RELAXED) & 0x80u) == 0) {
+        KernelPatcher::RouteRequest req("_apfs_verify_rangelist", patched_apfs_verify_rl, orig_apfs_verify_rl);
+        if (routeApfs(req))
+            __atomic_fetch_or(&symMask, 0x80u, __ATOMIC_RELAXED);
+        else
+            done = false;
+    }
+    return done;
+}
+
 static void processPatcher(KernelPatcher &patcher) {    const bool argOta    = checkKernelArgument("-ibtota");    legacyCsPatching     = checkKernelArgument("-ibtplegacy");
     // 1.9.21: 传输死亡自动救砖（wedge 自愈），默认启用；-ibt-norescue 关闭。
     // 判据与流程见 IbtDiag.h；本变量在驱动 start() 里读取。
@@ -1793,27 +1874,8 @@ static void processPatcher(KernelPatcher &patcher) {    const bool argOta    = c
         decmpfsBypassArmed = true;
     }
 
-    // 1.9.9: 改用 APFS 自己的 kinfo id 解析符号。1.9.8 用 KernelID 试这四条全部失败
-    // （SymMask 没有 bit4~7），而符号确实存在于内核缓存里——差别只在"哪个符号表"。
-    // bit8 记录是否拿到 APFS kinfo；IBTApfsSolve 的 0..3 位记录四个符号各自是否解析成功。
-    static const char *apfsPaths[] { "/System/Library/Extensions/AppleAPFS.kext" };
-    patcher.clearError();
-    size_t apfsId = patcher.loadKinfo("com.apple.filesystems.apfs", apfsPaths, arrsize(apfsPaths), false);
-    bool apfsKext = apfsId < 32;   // INVALID 是 SIZE_MAX，任何真实下标都远小于 32
-    if (apfsKext)
-        __atomic_fetch_or(&symMask, 0x100u, __ATOMIC_RELAXED);
-    size_t apfsSymId = apfsKext ? apfsId : KernelPatcher::KernelID;
-
-    const char *apfsSyms[4] {
-        "_apfs_vnop_verify",
-        "_apfs_pagein_with_verification",
-        "_apfs_verify_uncompressed_data",
-        "_apfs_verify_rangelist",
-    };
-    for (size_t i = 0; i < arrsize(apfsSyms); i++)
-        if (patcher.solveSymbol(apfsSymId, apfsSyms[i]))
-            __atomic_fetch_or(&apfsSolveMask, 1u << i, __ATOMIC_RELAXED);
-
+    // 1.9.37: APFS 四符号的 loadKinfo/solve/route 全部移入幂等函数 apfsArmPass()
+    //（定义在本函数之前）。启动抽签没装上时由 diag timer 延迟补装，见 ibtApfsRetry()。
     // 1.9.16: 探测 wire 路线需要的符号是否真的在内核符号表里。只解析不路由，
     // 不改任何行为——A 类崩溃的修复方案（wire 住被补丁的 16KB 组）依赖
     // _ubc_range_wire，它不在公开 SDK 头文件里，存不存在只能实跑确认。
@@ -1837,40 +1899,33 @@ static void processPatcher(KernelPatcher &patcher) {    const bool argOta    = c
     // ubc_create_upl/ubc_upl_abort 是公开 KPI，恒可链接；门控只看 boot-arg。
     wireArmed = !disableWire;
 
-    // 路由统一走一个小包装：先按 APFS kinfo 的 id 试，失败再退回 KernelID（1.9.8 的路径）。
-    // 两条都失败才算真失败，这样 bit4~7 的含义保持"这条钩子到底装上没有"。
-    auto routeApfs = [&](KernelPatcher::RouteRequest &req) -> bool {
-        if (patcher.routeMultipleLong(apfsSymId, &req, 1))
-            return true;
-        if (apfsKext && apfsSymId != KernelPatcher::KernelID)
-            return patcher.routeMultipleLong(KernelPatcher::KernelID, &req, 1);
-        return false;
-    };
+    // 1.9.37: APFS 吞错层武装（loadKinfo + solve + route 四条），幂等。
+    apfsHooksComplete = apfsArmPass(patcher);
+    SYSLOG(MODULE_BTLFX, "apfs hooks initial arm: %s (solve 0x%x verify=%d pagein=%d)%s",
+           apfsHooksComplete ? "complete" : "partial", apfsSolveMask, apfsVerifyArmed, apfsPiBypassArmed,
+           apfsHooksComplete ? "" : " - deferred re-arm via diag timer");
+}
 
-    KernelPatcher::RouteRequest apfsVerifyRoute("_apfs_vnop_verify", patched_apfs_vnop_verify, orig_apfs_vnop_verify);
-    if (routeApfs(apfsVerifyRoute)) {
-        apfsVerifyArmed = true;
-        __atomic_fetch_or(&symMask, 0x10u, __ATOMIC_RELAXED);
-        SYSLOG(MODULE_BTLFX, "apfs_vnop_verify bypass armed (vnode op table entry, bluetoothd/BlueTool only)");
-    } else {
-        SYSLOG(MODULE_BTLFX, "failed to route apfs_vnop_verify (fallback to _VNOP_VERIFY only)");
-    }
-
-    KernelPatcher::RouteRequest apfsPageinRoute("_apfs_pagein_with_verification", patched_apfs_pagein_verif, orig_apfs_pagein_verif);
-    if (routeApfs(apfsPageinRoute)) {
-        // 1.9.24: 吞错武装（原为纯计数探针）。
-        apfsPiBypassArmed = true;
-        __atomic_fetch_or(&symMask, 0x20u, __ATOMIC_RELAXED);
-        SYSLOG(MODULE_BTLFX, "apfs_pagein_with_verification EBADMSG bypass armed (bluetoothd/BlueTool only)");
-    }
-
-    KernelPatcher::RouteRequest apfsUncRoute("_apfs_verify_uncompressed_data", patched_apfs_verify_unc, orig_apfs_verify_unc);
-    if (routeApfs(apfsUncRoute))
-        __atomic_fetch_or(&symMask, 0x40u, __ATOMIC_RELAXED);
-
-    KernelPatcher::RouteRequest apfsRlRoute("_apfs_verify_rangelist", patched_apfs_verify_rl, orig_apfs_verify_rl);
-    if (routeApfs(apfsRlRoute))
-        __atomic_fetch_or(&symMask, 0x80u, __ATOMIC_RELAXED);
+// ---------------------------------------------------------------------------
+// 1.9.37: APFS 吞错层延迟补装。diag timer（15s/拍）每拍调用：
+//   - 启动时武装完整 → 直接返回，零开销；
+//   - 启动抽签缺席（1.9.25 实测形态）→ 每 15s 重试一次，最多 12 拍（约 3 分钟，
+//     覆盖 APFS kinfo 迟注册的一切现实形态）；
+//   - 每拍只补缺件（幂等），全部武装后自动停手。
+// 吞错层在位与否是"用一会就崩（error 94 穿透）"与"稳定可用"之间唯一的抽签项，
+// 这是 #1821 案例对照审计后确定的必修缺口。
+void ibtApfsRetry() {
+    if (apfsHooksComplete || disableCsPatching)
+        return;
+    if (apfsRetryCount >= 12)
+        return;
+    apfsRetryCount++;
+    KernelPatcher patcher;
+    apfsHooksComplete = apfsArmPass(patcher);
+    if (apfsRetryCount <= 3 || apfsHooksComplete)
+        SYSLOG(MODULE_BTLFX, "apfs hooks deferred arm pass #%u: %s (solve 0x%x verify=%d pagein=%d)",
+               apfsRetryCount, apfsHooksComplete ? "COMPLETE" : "partial",
+               apfsSolveMask, apfsVerifyArmed, apfsPiBypassArmed);
 }
 
 #pragma mark - Lilu
@@ -1910,6 +1965,7 @@ void ibtDiagFill(IbtDiagSnapshot *out) {
     out->apfsRlAll    = __atomic_load_n(&apfsRlAll, __ATOMIC_RELAXED);
     out->apfsRlOnBt   = __atomic_load_n(&apfsRlOnBt, __ATOMIC_RELAXED);
     out->apfsSolve    = __atomic_load_n(&apfsSolveMask, __ATOMIC_RELAXED);
+    out->apfsRetry    = apfsRetryCount;
     out->pmEvents     = 0; // 由驱动层覆盖
     out->patchedPages = __atomic_load_n(&patchedPageCount, __ATOMIC_RELAXED);
     out->lastOffset   = __atomic_load_n(&lastVerifyOffset, __ATOMIC_RELAXED);
